@@ -1,0 +1,54 @@
+version: "3.9"
+
+services:
+  db:
+    image: ankane/pgvector:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: flashback
+      POSTGRES_USER: flashback
+      POSTGRES_PASSWORD: flashback
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flashback"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  sidecar:
+    build:
+      context: ./python-sidecar
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      sidecar:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://flashback:flashback@db:5432/flashback
+      SIDECAR_URL: http://sidecar:8081
+      HOST: 0.0.0.0
+      PORT: 8080
+      RUST_LOG: flashback=info,tower_http=debug
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
