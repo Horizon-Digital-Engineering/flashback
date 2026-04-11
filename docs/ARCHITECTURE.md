@@ -50,8 +50,6 @@ This system maps that hierarchy onto a persistent memory layer for AI assistants
 12. [API Design](#api-design)
 13. [3D Memory Visualization](#3d-memory-visualization)
 14. [Deployment](#deployment)
-15. [Prior Art: Mem0, Zep, Letta](#prior-art-mem0-zep-letta)
-
 ---
 
 ## Memory Hierarchy
@@ -884,60 +882,3 @@ volumes:
 - **Read replicas**: the retrieval path is read-heavy. Route `POST /memory/search` and `POST /context/assemble` to read replicas.
 - **Consolidation jobs**: run on a separate worker process to avoid starving the API under heavy consolidation load.
 
----
-
-## Prior Art: Mem0, Zep, Letta
-
-Understanding what existing tools do — and what they don't — clarifies the design space this system occupies.
-
-### Mem0
-
-Mem0 (mem0.ai) provides a managed memory layer as a hosted API. It extracts facts from conversation and stores them as key-value pairs, returning relevant facts at query time via semantic search.
-
-**What it does well**: low integration friction, managed infrastructure, reasonable retrieval for straightforward factual memory.
-
-**What it lacks**:
-- No temporal graph — no way to express "this was true until X, then changed to Y"
-- No decay model — all memories are treated as equally current
-- No supersede chain — updates overwrite
-- No consolidation pipeline — no promotion from working to long-term
-- No retrieval modes — no distinction between answering a question and reconstructing state
-- Hosted-only — cannot self-host with full control over the data
-
-### Zep
-
-Zep focuses on long-term memory for conversational AI, with a strong emphasis on entity extraction and graph-based storage. It extracts entities and relationships from conversations and maintains a knowledge graph.
-
-**What it does well**: entity and relationship extraction, graph storage, session management, self-hostable.
-
-**What it lacks**:
-- Decay model is limited — no TTL-aware working memory tier
-- No five-type memory taxonomy (episodic/semantic/working/document/procedural)
-- No layered prompt assembly specification
-- No consolidation pipeline with scheduled rollup
-- Visualization is minimal
-- Scoring formula is not exposed — retrieval weighting is opaque
-
-### Letta (formerly MemGPT)
-
-Letta takes a different approach: it gives the LLM explicit tools to read and write its own memory, treating memory management as an agentic capability rather than a retrieval problem.
-
-**What it does well**: fine-grained control, the model can explicitly decide what to remember and how, recursive self-editing.
-
-**What it lacks**:
-- Latency — every memory operation is a tool call, adding round-trips
-- Cost — memory management consumes model tokens
-- Fragility — memory quality depends on the model's in-context decisions, which can drift
-- No scheduled consolidation — no autonomous maintenance
-- No hybrid retrieval — if the model doesn't decide to look something up, it doesn't get looked up
-
-### This System's Position
-
-This system sits between Zep and Letta on the autonomy spectrum. It does not ask the model to manage its own memory (Letta's approach), nor does it treat memory as a pure retrieval index (Mem0). Instead:
-
-- Memory management is automated but structured (consolidation pipeline, decay, supersede chain)
-- Retrieval is transparent (explicit weighted formula, configurable)
-- The model is a consumer of assembled context, not a manager of the raw store
-- The system is self-hostable and schema-open
-
-The goal is a memory layer that feels invisible to the model — like the model simply "knows" things — while remaining fully auditable and controllable to the operator.

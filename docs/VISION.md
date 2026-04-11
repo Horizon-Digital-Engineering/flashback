@@ -66,7 +66,7 @@ The context window is alive. Not a snapshot.
 
 There's a subtler problem with fact-based memory systems: they treat memory as a database of *current facts*.
 
-Mem0 deletes old facts when new ones supersede them. ChatGPT's memory is a small static notepad of current preferences. Most markdown-based memory systems are just append-only logs with no retrieval intelligence.
+Most memory systems delete old facts when new ones supersede them. Others store a small static notepad of current preferences. Most append-only approaches have no retrieval intelligence.
 
 But human memory isn't a database of current facts. It's a **web of episodes**.
 
