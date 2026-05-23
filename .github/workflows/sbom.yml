@@ -50,9 +50,24 @@ jobs:
       # Closes the supply-chain gap where an attacker swaps the SBOM for
       # a stale / lying one.
       - name: Attest SBOM build provenance
+        id: attest
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v3.0.0
         with:
           subject-path: 'flashback-*-sbom.*.json'
+
+      # Copy the attestation bundle (.intoto.jsonl) next to the SBOMs so
+      # we can ship it as a release asset. The default attestation path
+      # is `${{ steps.attest.outputs.bundle-path }}` (a GH-temp path).
+      # Scorecard's Signed-Releases check pattern-matches `.intoto.jsonl`
+      # next to release artifacts — uploading the bundle here is what
+      # flips its "has provenance" sub-check from 0 to credit.
+      - name: Stage attestation bundle as a release asset
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -eo pipefail
+          cp "$BUNDLE_PATH" "flashback-${REF_NAME}-provenance.intoto.jsonl"
+          ls -la flashback-*
 
       # Sigstore keyless cosign signing. No private key — the signing
       # identity IS this workflow's OIDC token (issuer:
@@ -87,8 +102,9 @@ jobs:
             flashback-*-sbom.*.json
             flashback-*-sbom.*.json.sig
             flashback-*-sbom.*.json.pem
+            flashback-*-provenance.intoto.jsonl
 
-      - name: Attach SBOMs + signatures to release
+      - name: Attach SBOMs + signatures + provenance to release
         if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -97,4 +113,5 @@ jobs:
             flashback-*-sbom.*.json \
             flashback-*-sbom.*.json.sig \
             flashback-*-sbom.*.json.pem \
+            flashback-*-provenance.intoto.jsonl \
             --clobber
