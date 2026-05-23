@@ -434,15 +434,25 @@ async fn search(
     auth_user: AuthUser,
     Json(req): Json<SearchRequest>,
 ) -> AppResult<Json<SearchResponse>> {
-    let user_id = auth_user.user_id;
+    Ok(Json(
+        search_memory(&state.pool, &*state.nlp, &auth_user.user_id, req).await?,
+    ))
+}
+
+pub(crate) async fn search_memory(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    req: SearchRequest,
+) -> AppResult<SearchResponse> {
     let mode = req.mode.unwrap_or_default();
     let top_k = req.top_k.unwrap_or(10).clamp(1, 100);
 
     // Embed query if present; extract entities for the entity_overlap term.
     let (embedding, entities) =
         if let Some(q) = req.query.as_deref().filter(|s| !s.trim().is_empty()) {
-            let entities = state.nlp.extract_entities(q);
-            let emb = state.nlp.embed_one(q).await?;
+            let entities = nlp.extract_entities(q);
+            let emb = nlp.embed_one(q).await?;
             (Some(emb), entities)
         } else {
             (None, Vec::new())
@@ -454,7 +464,7 @@ async fn search(
         .map(|v| v.iter().map(String::as_str).collect());
 
     let params = SearchParams {
-        user_id: &user_id,
+        user_id,
         project_id: req.project_id.as_deref(),
         session_id: req.session_id.as_deref(),
         query: req.query.as_deref(),
@@ -468,10 +478,10 @@ async fn search(
         include_superseded: req.include_superseded.unwrap_or(false),
     };
 
-    let scored = retrieval::search(&state.pool, params).await?;
+    let scored = retrieval::search(pool, params).await?;
 
     let ids: Vec<Uuid> = scored.iter().map(|s| s.view.id).collect();
-    retrieval::touch_access(&state.pool, &ids).await?;
+    retrieval::touch_access(pool, &ids).await?;
 
     let total = scored.len();
     let results = scored
@@ -489,14 +499,14 @@ async fn search(
         })
         .collect();
 
-    Ok(Json(SearchResponse {
+    Ok(SearchResponse {
         results,
         mode: match mode {
             Mode::Answer => "answer".to_string(),
             Mode::Manager => "manager".to_string(),
         },
         total,
-    }))
+    })
 }
 
 fn round4(v: f64) -> f64 {
@@ -512,11 +522,21 @@ async fn get_memory(
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<MemoryView>> {
-    let row = fetch_memory(&state.pool, id).await?;
-    if row.user_id != auth_user.user_id {
+    Ok(Json(
+        get_memory_by_id(&state.pool, &auth_user.user_id, id).await?,
+    ))
+}
+
+pub(crate) async fn get_memory_by_id(
+    pool: &PgPool,
+    user_id: &str,
+    id: Uuid,
+) -> AppResult<MemoryView> {
+    let row = fetch_memory(pool, id).await?;
+    if row.user_id != user_id {
         return Err(AppError::not_found(format!("memory {id}")));
     }
-    Ok(Json(MemoryView::from(row)))
+    Ok(MemoryView::from(row))
 }
 
 async fn fetch_memory(pool: &sqlx::PgPool, id: Uuid) -> AppResult<MemoryRow> {
@@ -561,8 +581,20 @@ async fn supersede(
     Path(old_id): Path<Uuid>,
     Json(req): Json<SupersedeRequest>,
 ) -> AppResult<Json<SupersedeResponse>> {
-    let old = fetch_memory(&state.pool, old_id).await?;
-    if old.user_id != auth_user.user_id {
+    Ok(Json(
+        supersede_memory(&state.pool, &*state.nlp, &auth_user.user_id, old_id, req).await?,
+    ))
+}
+
+pub(crate) async fn supersede_memory(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    old_id: Uuid,
+    req: SupersedeRequest,
+) -> AppResult<SupersedeResponse> {
+    let old = fetch_memory(pool, old_id).await?;
+    if old.user_id != user_id {
         return Err(AppError::not_found(format!("memory {old_id}")));
     }
     if old.superseded_by.is_some() {
@@ -581,7 +613,7 @@ async fn supersede(
         x.entities = dedupe(e);
         x
     } else {
-        state.nlp.extract_full(&req.content).await?
+        nlp.extract_full(&req.content).await?
     };
     let entities = if extraction.entities.is_empty() {
         old.entities.clone()
@@ -590,10 +622,10 @@ async fn supersede(
     };
     let extraction_json = serde_json::to_value(&extraction)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("serialize extraction: {e}")))?;
-    let embedding = state.nlp.embed_one(&req.content).await?;
+    let embedding = nlp.embed_one(&req.content).await?;
 
     let new_id = Uuid::new_v4();
-    let mut tx = state.pool.begin().await?;
+    let mut tx = pool.begin().await?;
 
     sqlx::query(
         r#"
@@ -632,10 +664,10 @@ async fn supersede(
 
     tx.commit().await?;
 
-    Ok(Json(SupersedeResponse {
+    Ok(SupersedeResponse {
         new_id,
         superseded_id: old_id,
-    }))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -647,9 +679,15 @@ pub async fn lineage(
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Value>> {
+    Ok(Json(
+        memory_lineage(&state.pool, &auth_user.user_id, id).await?,
+    ))
+}
+
+pub(crate) async fn memory_lineage(pool: &PgPool, user_id: &str, id: Uuid) -> AppResult<Value> {
     // Authorize: the lineage root must belong to the caller.
-    let root = fetch_memory(&state.pool, id).await?;
-    if root.user_id != auth_user.user_id {
+    let root = fetch_memory(pool, id).await?;
+    if root.user_id != user_id {
         return Err(AppError::not_found(format!("memory {id}")));
     }
     let _ = root;
@@ -695,7 +733,7 @@ pub async fn lineage(
         "#,
     )
     .bind(id)
-    .fetch_all(&state.pool)
+    .fetch_all(pool)
     .await?;
 
     if rows.is_empty() {
@@ -708,12 +746,12 @@ pub async fn lineage(
         .find(|v| v.superseded_by.is_none())
         .map(|v| v.id);
 
-    Ok(Json(json!({
+    Ok(json!({
         "root": id,
         "terminal": terminal,
         "length": views.len(),
         "chain": views,
-    })))
+    }))
 }
 
 #[cfg(test)]
@@ -1059,5 +1097,227 @@ mod tests {
         let with_sess = ingest_memory(&pool, &nlp, "alice", req).await.unwrap();
         // Single-entity overlap = jaccard 1/2 = 0.5 ≥ 0.3 threshold, so supersede fires.
         assert_eq!(with_sess.superseded, Some(old_id));
+    }
+
+    // ---- search_memory --------------------------------------------------
+
+    fn search_req() -> SearchRequest {
+        SearchRequest {
+            project_id: None,
+            session_id: None,
+            query: None,
+            memory_types: None,
+            since: None,
+            until: None,
+            mode: None,
+            top_k: None,
+            include_superseded: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_memory_empty_db_returns_no_results(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let resp = search_memory(&pool, &nlp, "alice", search_req())
+            .await
+            .unwrap();
+        assert_eq!(resp.total, 0);
+        assert_eq!(resp.mode, "answer");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_memory_returns_seeded_memories_scoped_to_user(pool: PgPool) {
+        let nlp = StubNlp::new();
+        // Seed alice + bob with one memory each via the production path
+        // so all extraction + embedding + indexing actually runs.
+        ingest_memory(&pool, &nlp, "alice", {
+            let mut r = make_req(Some("alpha"));
+            r.r#type = Some("episodic".into());
+            r
+        })
+        .await
+        .unwrap();
+        ingest_memory(&pool, &nlp, "bob", {
+            let mut r = make_req(Some("beta"));
+            r.r#type = Some("episodic".into());
+            r
+        })
+        .await
+        .unwrap();
+
+        let alice = search_memory(&pool, &nlp, "alice", search_req())
+            .await
+            .unwrap();
+        assert_eq!(alice.total, 1);
+        let bob = search_memory(&pool, &nlp, "bob", search_req())
+            .await
+            .unwrap();
+        assert_eq!(bob.total, 1);
+        let carol = search_memory(&pool, &nlp, "carol", search_req())
+            .await
+            .unwrap();
+        assert_eq!(carol.total, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_memory_clamps_top_k(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let mut req = search_req();
+        req.top_k = Some(0);
+        // top_k clamped to ≥1; not an error.
+        let resp = search_memory(&pool, &nlp, "alice", req).await.unwrap();
+        assert_eq!(resp.total, 0);
+
+        let mut req2 = search_req();
+        req2.top_k = Some(10_000);
+        let resp2 = search_memory(&pool, &nlp, "alice", req2).await.unwrap();
+        assert_eq!(resp2.total, 0); // empty DB but no panic
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_memory_manager_mode_label_is_returned(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let mut req = search_req();
+        req.mode = Some(Mode::Manager);
+        let resp = search_memory(&pool, &nlp, "alice", req).await.unwrap();
+        assert_eq!(resp.mode, "manager");
+    }
+
+    // ---- get_memory_by_id -----------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_memory_by_id_returns_view(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let created = ingest_memory(&pool, &nlp, "alice", make_req(Some("hello")))
+            .await
+            .unwrap();
+
+        let view = get_memory_by_id(&pool, "alice", created.id).await.unwrap();
+        assert_eq!(view.id, created.id);
+        assert_eq!(view.user_id, "alice");
+        assert_eq!(view.content, "hello");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_memory_by_id_rejects_wrong_user(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let created = ingest_memory(&pool, &nlp, "alice", make_req(Some("alice's")))
+            .await
+            .unwrap();
+        let err = get_memory_by_id(&pool, "bob", created.id)
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_memory_by_id_404_when_missing(pool: PgPool) {
+        let err = get_memory_by_id(&pool, "alice", Uuid::new_v4())
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
+
+    // ---- supersede_memory -----------------------------------------------
+
+    fn supersede_req(content: &str) -> SupersedeRequest {
+        SupersedeRequest {
+            content: content.to_string(),
+            importance: None,
+            entities_override: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn supersede_memory_chains_old_and_new(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let old = ingest_memory(&pool, &nlp, "alice", {
+            let mut r = make_req(Some("v1"));
+            r.r#type = Some("episodic".into());
+            r
+        })
+        .await
+        .unwrap();
+
+        let resp = supersede_memory(&pool, &nlp, "alice", old.id, supersede_req("v2"))
+            .await
+            .unwrap();
+        assert_eq!(resp.superseded_id, old.id);
+
+        // Old row's superseded_by now points at the new id.
+        let by: Option<Uuid> =
+            sqlx::query_scalar("SELECT superseded_by FROM memories WHERE id = $1")
+                .bind(old.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(by, Some(resp.new_id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn supersede_memory_rejects_wrong_user(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let old = ingest_memory(&pool, &nlp, "alice", make_req(Some("private")))
+            .await
+            .unwrap();
+        let err = supersede_memory(&pool, &nlp, "bob", old.id, supersede_req("hijack"))
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn supersede_memory_rejects_already_superseded(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let old = ingest_memory(&pool, &nlp, "alice", make_req(Some("v1")))
+            .await
+            .unwrap();
+        supersede_memory(&pool, &nlp, "alice", old.id, supersede_req("v2"))
+            .await
+            .unwrap();
+        // Second supersede on the same row → Conflict.
+        let err = supersede_memory(&pool, &nlp, "alice", old.id, supersede_req("v3"))
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
+
+    // ---- memory_lineage --------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn memory_lineage_returns_chain(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let v1 = ingest_memory(&pool, &nlp, "alice", make_req(Some("v1")))
+            .await
+            .unwrap();
+        let v2 = supersede_memory(&pool, &nlp, "alice", v1.id, supersede_req("v2"))
+            .await
+            .unwrap();
+        let v3 = supersede_memory(&pool, &nlp, "alice", v2.new_id, supersede_req("v3"))
+            .await
+            .unwrap();
+
+        let lineage = memory_lineage(&pool, "alice", v1.id).await.unwrap();
+        assert_eq!(lineage["length"], 3);
+        assert_eq!(lineage["root"], serde_json::json!(v1.id));
+        assert_eq!(lineage["terminal"], serde_json::json!(v3.new_id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn memory_lineage_rejects_wrong_user(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let m = ingest_memory(&pool, &nlp, "alice", make_req(Some("alice's")))
+            .await
+            .unwrap();
+        let err = memory_lineage(&pool, "bob", m.id).await.unwrap_err();
+        let _ = err;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn memory_lineage_404_when_missing(pool: PgPool) {
+        let err = memory_lineage(&pool, "alice", Uuid::new_v4())
+            .await
+            .unwrap_err();
+        let _ = err;
     }
 }
