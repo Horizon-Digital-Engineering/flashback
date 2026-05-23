@@ -314,6 +314,25 @@ pub async fn memory_detail(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Html<String>, super::Error> {
+    let (row, chain_rows, extraction) = load_memory_detail(&state.pool, &user.user_id, id).await?;
+    let chain: Vec<MemoryView> = chain_rows.into_iter().map(MemoryView::from).collect();
+    let view = MemoryView::from(row);
+    Ok(Html(views::memory_detail(
+        &user.user_id,
+        &view,
+        &chain,
+        extraction.as_ref(),
+    )))
+}
+
+/// Load a single memory + its supersede chain + the stored extraction blob.
+/// Returns NotFound if the row is missing or owned by a different user — the
+/// handler turns that into a 404.
+pub(crate) async fn load_memory_detail(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+    id: Uuid,
+) -> Result<(MemoryRow, Vec<MemoryRow>, Option<Value>), super::Error> {
     let row = sqlx::query_as::<_, MemoryRow>(
         r#"
         SELECT id, type, content, embedding, importance, access_count, decay_class,
@@ -324,15 +343,14 @@ pub async fn memory_detail(
         "#,
     )
     .bind(id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(pool)
     .await?
     .ok_or(super::Error::NotFound)?;
 
-    if row.user_id != user.user_id {
+    if row.user_id != user_id {
         return Err(super::Error::NotFound);
     }
 
-    // Lineage walk.
     let chain_rows = sqlx::query_as::<_, MemoryRow>(
         r#"
         WITH RECURSIVE
@@ -363,24 +381,17 @@ pub async fn memory_detail(
         "#,
     )
     .bind(id)
-    .fetch_all(&state.pool)
+    .fetch_all(pool)
     .await?;
 
     let extraction: Option<Value> =
         sqlx::query_scalar("SELECT extraction FROM memories WHERE id = $1")
             .bind(id)
-            .fetch_optional(&state.pool)
+            .fetch_optional(pool)
             .await?
             .flatten();
 
-    let chain: Vec<MemoryView> = chain_rows.into_iter().map(MemoryView::from).collect();
-    let view = MemoryView::from(row);
-    Ok(Html(views::memory_detail(
-        &user.user_id,
-        &view,
-        &chain,
-        extraction.as_ref(),
-    )))
+    Ok((row, chain_rows, extraction))
 }
 
 pub async fn memory_delete(
@@ -429,7 +440,18 @@ pub async fn state_list(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let rows = sqlx::query_as::<_, MemoryRow>(
+    let rows = list_state_objects_for(&state.pool, &user.user_id).await?;
+    let views: Vec<MemoryView> = rows.into_iter().map(MemoryView::from).collect();
+    Ok(Html(views::state_list(&user.user_id, &views)))
+}
+
+/// Fetch terminal (non-superseded) state objects owned by `user_id`, ordered
+/// by most-recently-accessed first.
+pub(crate) async fn list_state_objects_for(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+) -> Result<Vec<MemoryRow>, sqlx::Error> {
+    sqlx::query_as::<_, MemoryRow>(
         r#"
         SELECT id, type, content, embedding, importance, access_count, decay_class,
                user_id, project_id, session_id, entities, superseded_by, supersedes,
@@ -440,11 +462,9 @@ pub async fn state_list(
         ORDER BY last_accessed_at DESC
         "#,
     )
-    .bind(&user.user_id)
-    .fetch_all(&state.pool)
-    .await?;
-    let views: Vec<MemoryView> = rows.into_iter().map(MemoryView::from).collect();
-    Ok(Html(views::state_list(&user.user_id, &views)))
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -455,6 +475,16 @@ pub async fn tokens_list(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
+    let views = load_token_views_for(&state.pool, &user.user_id).await?;
+    Ok(Html(views::tokens_list(&user.user_id, &views)))
+}
+
+/// Fetch every token owned by `user_id` (active + revoked, newest first) and
+/// map into the admin-UI view shape.
+pub(crate) async fn load_token_views_for(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+) -> Result<Vec<views::TokenView>, sqlx::Error> {
     #[derive(sqlx::FromRow)]
     struct Row {
         id: Uuid,
@@ -472,10 +502,10 @@ pub async fn tokens_list(
         ORDER BY created_at DESC
         "#,
     )
-    .bind(&user.user_id)
-    .fetch_all(&state.pool)
+    .bind(user_id)
+    .fetch_all(pool)
     .await?;
-    let views: Vec<views::TokenView> = rows
+    Ok(rows
         .into_iter()
         .map(|r| views::TokenView {
             id: r.id,
@@ -486,8 +516,7 @@ pub async fn tokens_list(
             last_used_at: r.last_used_at,
             revoked_at: r.revoked_at,
         })
-        .collect();
-    Ok(Html(views::tokens_list(&user.user_id, &views)))
+        .collect())
 }
 
 pub async fn token_revoke(
@@ -1115,5 +1144,342 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ConsolidateError::UnknownKind));
+    }
+
+    // ---- fetch_memories / count_memories --------------------------------
+
+    async fn insert_typed(
+        pool: &PgPool,
+        user_id: &str,
+        mtype: &str,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let emb = pgvector::Vector::from(vec![0.0_f32; 384]);
+        sqlx::query(
+            "INSERT INTO memories (id, type, content, embedding, importance, decay_class, user_id, project_id, session_id, entities)
+             VALUES ($1, $2, 'test content', $3, 0.5, 'medium', $4, $5, $6, '{}')",
+        )
+        .bind(id)
+        .bind(mtype)
+        .bind(emb)
+        .bind(user_id)
+        .bind(project_id)
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_memories_empty(pool: PgPool) {
+        let q = MemoryQuery::default();
+        let rows = fetch_memories(&pool, "alice", &q, 200, 0).await.unwrap();
+        assert!(rows.is_empty());
+        let total = count_memories(&pool, "alice", &q).await.unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_memories_filters_by_type(pool: PgPool) {
+        insert_typed(&pool, "alice", "episodic", None, None).await;
+        insert_typed(&pool, "alice", "semantic", None, None).await;
+        insert_typed(&pool, "alice", "semantic", None, None).await;
+
+        let only_semantic = MemoryQuery {
+            r#type: Some("semantic".to_string()),
+            ..MemoryQuery::default()
+        };
+        let rows = fetch_memories(&pool, "alice", &only_semantic, 200, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.r#type == "semantic"));
+
+        let total = count_memories(&pool, "alice", &only_semantic)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_memories_filters_by_project_and_session(pool: PgPool) {
+        insert_typed(&pool, "alice", "episodic", Some("proj-a"), Some("sess-1")).await;
+        insert_typed(&pool, "alice", "episodic", Some("proj-a"), Some("sess-2")).await;
+        insert_typed(&pool, "alice", "episodic", Some("proj-b"), Some("sess-1")).await;
+
+        let proj_a = MemoryQuery {
+            project_id: Some("proj-a".to_string()),
+            ..MemoryQuery::default()
+        };
+        assert_eq!(count_memories(&pool, "alice", &proj_a).await.unwrap(), 2);
+
+        let proj_a_sess_1 = MemoryQuery {
+            project_id: Some("proj-a".to_string()),
+            session_id: Some("sess-1".to_string()),
+            ..MemoryQuery::default()
+        };
+        assert_eq!(
+            count_memories(&pool, "alice", &proj_a_sess_1).await.unwrap(),
+            1
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_memories_excludes_superseded_by_default(pool: PgPool) {
+        let old = insert_typed(&pool, "alice", "episodic", None, None).await;
+        let new = insert_typed(&pool, "alice", "episodic", None, None).await;
+        sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
+            .bind(new)
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let default_q = MemoryQuery::default();
+        assert_eq!(count_memories(&pool, "alice", &default_q).await.unwrap(), 1);
+
+        let with_super = MemoryQuery {
+            include_superseded: Some("1".to_string()),
+            ..MemoryQuery::default()
+        };
+        assert_eq!(count_memories(&pool, "alice", &with_super).await.unwrap(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_memories_scoped_to_user(pool: PgPool) {
+        insert_typed(&pool, "alice", "episodic", None, None).await;
+        insert_typed(&pool, "bob", "episodic", None, None).await;
+        insert_typed(&pool, "bob", "episodic", None, None).await;
+
+        assert_eq!(
+            count_memories(&pool, "alice", &MemoryQuery::default())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            count_memories(&pool, "bob", &MemoryQuery::default())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_memories_respects_limit_offset(pool: PgPool) {
+        for _ in 0..5 {
+            insert_typed(&pool, "alice", "episodic", None, None).await;
+        }
+        let rows = fetch_memories(&pool, "alice", &MemoryQuery::default(), 2, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let page2 = fetch_memories(&pool, "alice", &MemoryQuery::default(), 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        // No overlap.
+        assert!(!rows.iter().any(|r| page2.iter().any(|p| p.id == r.id)));
+    }
+
+    // ---- load_memory_detail ---------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn load_memory_detail_404_when_missing(pool: PgPool) {
+        let err = load_memory_detail(&pool, "alice", Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::super::Error::NotFound));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn load_memory_detail_404_for_other_user(pool: PgPool) {
+        let id = insert_memory_for(&pool, "alice").await;
+        let err = load_memory_detail(&pool, "bob", id).await.unwrap_err();
+        assert!(matches!(err, super::super::Error::NotFound));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn load_memory_detail_returns_singleton_chain(pool: PgPool) {
+        let id = insert_memory_for(&pool, "alice").await;
+        let (row, chain, _extraction) = load_memory_detail(&pool, "alice", id).await.unwrap();
+        assert_eq!(row.id, id);
+        // Chain is just this row (no supersede before/after).
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, id);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn load_memory_detail_walks_supersede_chain(pool: PgPool) {
+        let old = insert_memory_for(&pool, "alice").await;
+        let mid = insert_memory_for(&pool, "alice").await;
+        let new = insert_memory_for(&pool, "alice").await;
+        // old <- mid <- new
+        for (prev, next) in [(old, mid), (mid, new)] {
+            sqlx::query("UPDATE memories SET supersedes = $1 WHERE id = $2")
+                .bind(prev)
+                .bind(next)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
+                .bind(next)
+                .bind(prev)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let (_row, chain, _) = load_memory_detail(&pool, "alice", mid).await.unwrap();
+        // All three nodes should be in the chain, in created_at order.
+        assert_eq!(chain.len(), 3);
+        let ids: Vec<Uuid> = chain.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&old));
+        assert!(ids.contains(&mid));
+        assert!(ids.contains(&new));
+    }
+
+    // ---- list_state_objects_for -----------------------------------------
+
+    async fn insert_state(pool: &PgPool, user_id: &str, kind: &str, key: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let emb = pgvector::Vector::from(vec![0.0_f32; 384]);
+        sqlx::query(
+            "INSERT INTO memories (id, type, content, embedding, importance, decay_class, user_id, entities, state_kind, state_key, state_data)
+             VALUES ($1, 'state_object', $2, $3, 0.5, 'medium', $4, '{}', $5, $6, '{}'::jsonb)",
+        )
+        .bind(id)
+        .bind(format!("{kind}/{key}"))
+        .bind(emb)
+        .bind(user_id)
+        .bind(kind)
+        .bind(key)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_state_objects_empty(pool: PgPool) {
+        let rows = list_state_objects_for(&pool, "alice").await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_state_objects_excludes_episodic(pool: PgPool) {
+        insert_memory_for(&pool, "alice").await; // episodic
+        insert_state(&pool, "alice", "todo", "list-1").await;
+        let rows = list_state_objects_for(&pool, "alice").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].r#type, "state_object");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_state_objects_excludes_superseded(pool: PgPool) {
+        let old = insert_state(&pool, "alice", "todo", "list-1").await;
+        let new = insert_state(&pool, "alice", "todo", "list-1").await;
+        sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
+            .bind(new)
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows = list_state_objects_for(&pool, "alice").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, new);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_state_objects_scoped_to_user(pool: PgPool) {
+        insert_state(&pool, "alice", "todo", "a").await;
+        insert_state(&pool, "bob", "todo", "b").await;
+        assert_eq!(list_state_objects_for(&pool, "alice").await.unwrap().len(), 1);
+        assert_eq!(list_state_objects_for(&pool, "bob").await.unwrap().len(), 1);
+    }
+
+    // ---- load_token_views_for -------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn load_token_views_empty(pool: PgPool) {
+        let v = load_token_views_for(&pool, "alice").await.unwrap();
+        assert!(v.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn load_token_views_includes_revoked(pool: PgPool) {
+        let t = crate::auth::mint_token(&pool, "alice", Some("primary"))
+            .await
+            .unwrap();
+        crate::auth::revoke_token(&pool, t.id).await.unwrap();
+        let v = load_token_views_for(&pool, "alice").await.unwrap();
+        assert_eq!(v.len(), 1);
+        assert!(v[0].revoked_at.is_some());
+        assert_eq!(v[0].name.as_deref(), Some("primary"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn load_token_views_scoped_to_user(pool: PgPool) {
+        crate::auth::mint_token(&pool, "alice", None).await.unwrap();
+        crate::auth::mint_token(&pool, "bob", None).await.unwrap();
+        crate::auth::mint_token(&pool, "bob", None).await.unwrap();
+        assert_eq!(load_token_views_for(&pool, "alice").await.unwrap().len(), 1);
+        assert_eq!(load_token_views_for(&pool, "bob").await.unwrap().len(), 2);
+    }
+
+    // ---- fetch_for_graph + compute_graph --------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_for_graph_empty(pool: PgPool) {
+        let rows = fetch_for_graph(&pool, "alice").await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn fetch_for_graph_scoped_to_user(pool: PgPool) {
+        insert_memory_for(&pool, "alice").await;
+        insert_memory_for(&pool, "bob").await;
+        let alice = fetch_for_graph(&pool, "alice").await.unwrap();
+        let bob = fetch_for_graph(&pool, "bob").await.unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(bob.len(), 1);
+        assert_ne!(alice[0].id, bob[0].id);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn compute_graph_returns_node_per_row(pool: PgPool) {
+        let a = insert_memory_for(&pool, "alice").await;
+        let b = insert_memory_for(&pool, "alice").await;
+        let (nodes, _edges) = compute_graph(&pool, "alice").await.unwrap();
+        assert_eq!(nodes.len(), 2);
+        let ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&a));
+        assert!(ids.contains(&b));
+        // Sanity: nodes carry preview content and type.
+        for n in &nodes {
+            assert_eq!(n.type_, "episodic");
+            assert!(!n.label.is_empty());
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn compute_graph_marks_superseded_nodes(pool: PgPool) {
+        let old = insert_memory_for(&pool, "alice").await;
+        let new = insert_memory_for(&pool, "alice").await;
+        sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
+            .bind(new)
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (nodes, _) = compute_graph(&pool, "alice").await.unwrap();
+        let old_node = nodes.iter().find(|n| n.id == old).unwrap();
+        let new_node = nodes.iter().find(|n| n.id == new).unwrap();
+        assert!(old_node.superseded);
+        assert!(!new_node.superseded);
     }
 }
