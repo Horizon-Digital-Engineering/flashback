@@ -522,3 +522,184 @@ async fn list_users(pool: &PgPool) -> Vec<String> {
 fn _utc() -> chrono::DateTime<chrono::Utc> {
     Utc::now()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(topic: Option<&str>, entities: &[&str]) -> EpisodeRow {
+        EpisodeRow {
+            id: Uuid::new_v4(),
+            content: String::new(),
+            entities: entities.iter().map(|s| s.to_string()).collect(),
+            topic: topic.map(|s| s.to_string()),
+            project_id: None,
+            session_id: None,
+        }
+    }
+
+    // ---- Kind --------------------------------------------------------------
+
+    #[test]
+    fn kind_as_str_round_trip() {
+        assert_eq!(Kind::Daily.as_str(), "daily");
+        assert_eq!(Kind::Weekly.as_str(), "weekly");
+    }
+
+    // ---- jaccard_str -------------------------------------------------------
+
+    #[test]
+    fn jaccard_disjoint_sets_is_zero() {
+        let a = ["x".into(), "y".into()];
+        let b = ["p".into(), "q".into()];
+        assert_eq!(jaccard_str(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn jaccard_identical_sets_is_one() {
+        let a = ["x".into(), "y".into()];
+        assert!((jaccard_str(&a, &a) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn jaccard_both_empty_is_zero() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(jaccard_str(&empty, &empty), 0.0);
+    }
+
+    #[test]
+    fn jaccard_partial_overlap_known_value() {
+        // A ∩ B = {y}, A ∪ B = {x, y, z} → 1/3.
+        let a = ["x".into(), "y".into()];
+        let b = ["y".into(), "z".into()];
+        assert!((jaccard_str(&a, &b) - (1.0 / 3.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn jaccard_dedupes_within_input() {
+        // Same string twice in `a` shouldn't inflate either side.
+        let a = ["x".into(), "x".into(), "y".into()];
+        let b = ["x".into()];
+        // sa={x,y}, sb={x} → intersection={x}, union={x,y} → 1/2
+        assert!((jaccard_str(&a, &b) - 0.5).abs() < 1e-6);
+    }
+
+    // ---- shared_entities ---------------------------------------------------
+
+    #[test]
+    fn shared_entities_empty_input_returns_empty() {
+        let out = shared_entities(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn shared_entities_majority_threshold() {
+        // 3 rows, threshold = ceil(3 * 0.5) = 2.
+        // "common" appears in rows 0 and 1 (count=2 ≥ 2) — keep.
+        // "rare" appears in row 0 only (count=1 < 2) — drop.
+        let rows = vec![
+            row(None, &["common", "rare"]),
+            row(None, &["common"]),
+            row(None, &["other"]),
+        ];
+        let out = shared_entities(&rows);
+        assert!(out.contains(&"common".to_string()));
+        assert!(!out.contains(&"rare".to_string()));
+        assert!(!out.contains(&"other".to_string()));
+    }
+
+    #[test]
+    fn shared_entities_dedupes_within_row() {
+        // Same entity twice in one row should count once for that row.
+        let rows = vec![row(None, &["x", "x", "x"]), row(None, &["y"])];
+        let out = shared_entities(&rows);
+        // x appears in 1 of 2 rows; threshold = ceil(2 * 0.5) = 1 → kept.
+        assert!(out.contains(&"x".to_string()));
+        assert!(out.contains(&"y".to_string()));
+    }
+
+    // ---- clone_row ---------------------------------------------------------
+
+    #[test]
+    fn clone_row_preserves_all_fields() {
+        let original = row(Some("dep target"), &["postgres", "deploy"]);
+        let cloned = clone_row(&original);
+        assert_eq!(cloned.id, original.id);
+        assert_eq!(cloned.content, original.content);
+        assert_eq!(cloned.entities, original.entities);
+        assert_eq!(cloned.topic, original.topic);
+        assert_eq!(cloned.project_id, original.project_id);
+        assert_eq!(cloned.session_id, original.session_id);
+    }
+
+    // ---- cluster_by_topic_and_entities ------------------------------------
+
+    #[test]
+    fn clustering_empty_input_returns_no_clusters() {
+        assert!(cluster_by_topic_and_entities(&[]).is_empty());
+    }
+
+    #[test]
+    fn clustering_groups_by_exact_topic_match() {
+        // Three rows: two share topic "deploy", one has a different topic.
+        // The two-row topic forms one cluster; the singleton doesn't.
+        let rows = vec![
+            row(Some("deploy"), &["postgres"]),
+            row(Some("deploy"), &["docker"]),
+            row(Some("auth"), &["bcrypt"]),
+        ];
+        let clusters = cluster_by_topic_and_entities(&rows);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].dominant_topic.as_deref(), Some("deploy"));
+        assert_eq!(clusters[0].episodes.len(), 2);
+    }
+
+    #[test]
+    fn clustering_normalizes_topic_case() {
+        // Topics differ only by case + whitespace; should still merge.
+        let rows = vec![
+            row(Some("Deploy"), &[]),
+            row(Some("  deploy "), &[]),
+            row(Some("DEPLOY"), &[]),
+        ];
+        let clusters = cluster_by_topic_and_entities(&rows);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].episodes.len(), 3);
+    }
+
+    #[test]
+    fn clustering_falls_back_to_entity_jaccard_for_topicless_rows() {
+        // No topics, but shared entities pass jaccard ≥ 0.4.
+        // Two rows with [a, b] and [a, b, c] → jaccard = 2/3 ≈ 0.67 → cluster.
+        let rows = vec![row(None, &["a", "b"]), row(None, &["a", "b", "c"])];
+        let clusters = cluster_by_topic_and_entities(&rows);
+        assert_eq!(clusters.len(), 1);
+        assert!(clusters[0].dominant_topic.is_none());
+        assert_eq!(clusters[0].episodes.len(), 2);
+    }
+
+    #[test]
+    fn clustering_singleton_topics_dont_become_clusters() {
+        // Each row has a unique topic and no entity overlap → no clusters.
+        let rows = vec![
+            row(Some("auth"), &["a"]),
+            row(Some("deploy"), &["b"]),
+            row(Some("ingest"), &["c"]),
+        ];
+        let clusters = cluster_by_topic_and_entities(&rows);
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn clustering_singleton_topics_can_join_entity_clusters() {
+        // Two rows with unique topics but high entity overlap should still
+        // form an entity-Jaccard cluster after the singleton-topic fallback.
+        let rows = vec![
+            row(Some("topicA"), &["x", "y", "z"]),
+            row(Some("topicB"), &["x", "y", "z"]),
+        ];
+        let clusters = cluster_by_topic_and_entities(&rows);
+        assert_eq!(clusters.len(), 1);
+        assert!(clusters[0].dominant_topic.is_none()); // entity-jaccard branch
+    }
+}

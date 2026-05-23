@@ -340,4 +340,100 @@ mod tests {
         // Short input → just the whole thing.
         assert_eq!(token_prefix("fb_short"), "fb_short");
     }
+
+    // ---- middleware-helper unit tests (no DB / no HTTP) -----------------
+
+    #[test]
+    fn is_exempt_matches_whitelisted_paths() {
+        assert!(is_exempt("/health"));
+        assert!(is_exempt("/admin/login"));
+        assert!(is_exempt("/admin/style.css"));
+        assert!(is_exempt("/favicon.ico"));
+    }
+
+    #[test]
+    fn is_exempt_rejects_everything_else() {
+        assert!(!is_exempt("/memory/ingest"));
+        assert!(!is_exempt("/admin/memories"));
+        assert!(!is_exempt("/healthcheck")); // not literal /health
+        assert!(!is_exempt("/")); // root isn't whitelisted
+        assert!(!is_exempt(""));
+    }
+
+    fn req_with_header(name: &str, value: &str) -> Request<Body> {
+        Request::builder()
+            .header(name, value)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn extract_bearer_pulls_token_after_prefix() {
+        let req = req_with_header("Authorization", "Bearer fb_TOKEN_VALUE");
+        assert_eq!(extract_bearer(&req), Some("fb_TOKEN_VALUE".to_string()));
+    }
+
+    #[test]
+    fn extract_bearer_returns_none_when_no_header() {
+        let req = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(extract_bearer(&req), None);
+    }
+
+    #[test]
+    fn extract_bearer_returns_none_when_not_bearer_scheme() {
+        let req = req_with_header("Authorization", "Basic dXNlcjpwYXNz");
+        assert_eq!(extract_bearer(&req), None);
+    }
+
+    #[test]
+    fn extract_bearer_returns_none_on_empty_token() {
+        let req = req_with_header("Authorization", "Bearer ");
+        assert_eq!(extract_bearer(&req), None);
+    }
+
+    #[test]
+    fn extract_cookie_token_finds_the_flashback_cookie() {
+        let req = req_with_header(
+            "Cookie",
+            "other=value; flashback_token=fb_FROM_COOKIE; another=x",
+        );
+        assert_eq!(
+            extract_cookie_token(&req),
+            Some("fb_FROM_COOKIE".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_cookie_token_returns_none_when_no_flashback_cookie() {
+        let req = req_with_header("Cookie", "other=value; session=abc");
+        assert_eq!(extract_cookie_token(&req), None);
+    }
+
+    #[test]
+    fn extract_cookie_token_returns_none_when_no_cookie_header() {
+        let req = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(extract_cookie_token(&req), None);
+    }
+
+    #[test]
+    fn extract_cookie_token_handles_empty_value() {
+        let req = req_with_header("Cookie", "flashback_token=");
+        assert_eq!(extract_cookie_token(&req), None);
+    }
+
+    #[test]
+    fn unauthorized_redirects_admin_paths_to_login() {
+        let resp = unauthorized("/admin/memories", "bad token");
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            resp.headers().get("Location").unwrap(),
+            "/admin/login?reason=unauth"
+        );
+    }
+
+    #[test]
+    fn unauthorized_returns_json_401_for_api_paths() {
+        let resp = unauthorized("/memory/ingest", "missing token");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
 }

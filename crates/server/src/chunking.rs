@@ -101,3 +101,92 @@ pub fn sha256_hex(text: &str) -> String {
     text.hash(&mut hasher);
     format!("h64:{:016x}", hasher.finish())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixed_text(chars: usize) -> String {
+        "x".repeat(chars)
+    }
+
+    #[test]
+    fn approx_tokens_matches_char_quarter() {
+        // (chars + 3) / 4 rounds up for the partial 4-byte group.
+        assert_eq!(approx_tokens(""), 0);
+        assert_eq!(approx_tokens("a"), 1);
+        assert_eq!(approx_tokens("abcd"), 1);
+        assert_eq!(approx_tokens("abcde"), 2);
+        assert_eq!(approx_tokens(&fixed_text(400)), 100);
+    }
+
+    #[test]
+    fn split_paragraphs_handles_empty_and_single() {
+        assert!(split_paragraphs("").is_empty());
+        let one = split_paragraphs("hello world");
+        assert_eq!(one, vec!["hello world"]);
+    }
+
+    #[test]
+    fn split_paragraphs_splits_on_blank_lines() {
+        let txt = "first para\nstill first\n\nsecond para\n\n  \n\nthird para";
+        assert_eq!(
+            split_paragraphs(txt),
+            vec!["first para\nstill first", "second para", "third para"]
+        );
+    }
+
+    #[test]
+    fn split_paragraphs_trims_trailing_whitespace() {
+        let txt = "alpha  \n  \n  beta  ";
+        let out = split_paragraphs(txt);
+        assert_eq!(out, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn chunk_document_empty_returns_empty() {
+        assert!(chunk_document("").is_empty());
+        assert!(chunk_document("\n\n\n").is_empty());
+    }
+
+    #[test]
+    fn chunk_document_single_short_paragraph_is_one_chunk() {
+        let chunks = chunk_document("just a short note");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].index, 0);
+        assert_eq!(chunks[0].text, "just a short note");
+    }
+
+    #[test]
+    fn chunk_document_indexes_are_sequential() {
+        // Build several oversized paragraphs to force multiple chunks.
+        let big = fixed_text(MAX_TOKENS * 4 + 100); // ~600+ tokens each
+        let txt = format!("{big}\n\n{big}\n\n{big}");
+        let chunks = chunk_document(&txt);
+        assert!(chunks.len() >= 2);
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c.index, i, "chunk index should be sequential");
+        }
+    }
+
+    #[test]
+    fn chunk_document_doesnt_emit_empty_chunks() {
+        let chunks = chunk_document("\n\nhello\n\n\n\nworld\n\n");
+        for c in &chunks {
+            assert!(!c.text.is_empty());
+            assert_eq!(c.text, c.text.trim());
+        }
+    }
+
+    #[test]
+    fn sha256_hex_is_prefixed_and_deterministic() {
+        let h = sha256_hex("anything");
+        assert!(h.starts_with("h64:"), "got {h}");
+        // 4 prefix chars + 16 hex chars
+        assert_eq!(h.len(), 4 + 16);
+        // Deterministic.
+        assert_eq!(sha256_hex("anything"), sha256_hex("anything"));
+        // Different inputs → different outputs.
+        assert_ne!(sha256_hex("a"), sha256_hex("b"));
+    }
+}

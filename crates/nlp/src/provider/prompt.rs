@@ -73,3 +73,81 @@ pub fn build_user_prompt(text: &str, recent: &[String]) -> String {
     out.push_str(text);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_prompt_describes_the_schema() {
+        let p = build_system_prompt();
+        // Spot-check critical schema fields are mentioned by name — guard
+        // against an accidental clobber by a future edit.
+        for field in ["topic", "intent", "operation", "entities", "confidence"] {
+            assert!(p.contains(field), "system prompt missing {field}");
+        }
+        // Intent enum must list each variant.
+        for variant in [
+            "question",
+            "update",
+            "decision",
+            "task",
+            "opinion",
+            "reference",
+        ] {
+            assert!(
+                p.contains(variant),
+                "system prompt missing intent: {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn distill_system_prompt_describes_facts_schema() {
+        let p = build_distill_system_prompt();
+        for field in ["facts", "content", "source_episode_ids", "confidence"] {
+            assert!(p.contains(field), "distill prompt missing {field}");
+        }
+    }
+
+    #[test]
+    fn distill_user_prompt_prefixes_episodes_json() {
+        let p = build_distill_user_prompt(r#"[{"id": "abc"}]"#);
+        assert!(p.starts_with("Episodes:\n"));
+        assert!(p.contains(r#"[{"id": "abc"}]"#));
+    }
+
+    #[test]
+    fn user_prompt_with_no_recent_skips_the_context_block() {
+        let p = build_user_prompt("hello world", &[]);
+        assert!(!p.contains("Recent prior turns"));
+        assert!(p.starts_with("Turn to extract:\n"));
+        assert!(p.ends_with("hello world"));
+    }
+
+    #[test]
+    fn user_prompt_with_recent_includes_them_as_bullets() {
+        let recent = vec!["earlier turn 1".to_string(), "earlier turn 2".to_string()];
+        let p = build_user_prompt("the new turn", &recent);
+        assert!(p.contains("Recent prior turns"));
+        assert!(p.contains("- earlier turn 1"));
+        assert!(p.contains("- earlier turn 2"));
+        assert!(p.ends_with("the new turn"));
+    }
+
+    #[test]
+    fn user_prompt_clamps_recent_to_five() {
+        let recent: Vec<String> = (0..10).map(|i| format!("turn {i}")).collect();
+        let p = build_user_prompt("now", &recent);
+        // First 5 included, last 5 excluded.
+        for i in 0..5 {
+            assert!(p.contains(&format!("turn {i}")), "missing turn {i}");
+        }
+        for i in 5..10 {
+            assert!(
+                !p.contains(&format!("turn {i}")),
+                "should not contain turn {i}"
+            );
+        }
+    }
+}

@@ -108,3 +108,56 @@ pub enum ProviderError {
     #[error("internal: {0}")]
     Internal(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_default_is_all_off() {
+        let c = Capabilities::default();
+        assert!(!c.extraction);
+        assert!(!c.summarization);
+        assert!(!c.fact_distillation);
+        assert_eq!(c.typical_latency_ms, 0);
+        assert_eq!(c.context_window, 0);
+    }
+
+    #[test]
+    fn provider_error_display_includes_payload() {
+        let cases = [
+            (
+                ProviderError::NotConfigured("missing key".into()),
+                "missing key",
+            ),
+            (
+                ProviderError::Upstream("502 bad gateway".into()),
+                "502 bad gateway",
+            ),
+            (ProviderError::BadOutput("not json".into()), "not json"),
+            (ProviderError::Internal("boom".into()), "boom"),
+        ];
+        for (err, expected_fragment) in cases {
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected_fragment),
+                "expected fragment {expected_fragment:?} in {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_timeout_includes_milliseconds() {
+        assert_eq!(
+            ProviderError::Timeout(1500).to_string(),
+            "provider timed out after 1500ms"
+        );
+    }
+
+    #[test]
+    fn extract_context_default_is_empty() {
+        let c = ExtractContext::default();
+        assert!(c.hint.is_none());
+        assert!(c.recent_context.is_empty());
+    }
+}
