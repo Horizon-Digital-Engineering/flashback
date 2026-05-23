@@ -265,3 +265,79 @@ pub async fn revoke_token(pool: &PgPool, id: uuid::Uuid) -> anyhow::Result<bool>
 /// Avoid Arc unused warning for the explicit import path above.
 #[allow(dead_code)]
 fn _arc_marker(_: Arc<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        // RFC test vector for empty string.
+        assert_eq!(
+            sha256_hex(""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // RFC test vector for "abc".
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn sha256_hex_is_64_hex_chars() {
+        let h = sha256_hex("fb_anything_at_all");
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn sha256_hex_is_deterministic() {
+        assert_eq!(sha256_hex("seed"), sha256_hex("seed"));
+        assert_ne!(sha256_hex("a"), sha256_hex("b"));
+    }
+
+    #[test]
+    fn generate_token_has_fb_prefix_and_bounded_length() {
+        let t = generate_token();
+        assert!(t.starts_with(TOKEN_PREFIX), "got {t}");
+        // Body comes from 24 random bytes mapped to alphabet chars and then
+        // truncated to at most TOKEN_RANDOM_LEN. The constant is a cap, not
+        // a guarantee — actual body length = min(24, TOKEN_RANDOM_LEN).
+        let body = &t[TOKEN_PREFIX.len()..];
+        assert!(!body.is_empty());
+        assert!(body.len() <= TOKEN_RANDOM_LEN);
+        assert_eq!(t.len(), TOKEN_PREFIX.len() + body.len());
+    }
+
+    #[test]
+    fn generate_token_body_uses_alphabet_only() {
+        let t = generate_token();
+        let body = &t[TOKEN_PREFIX.len()..];
+        // O / 0 / I / 1 / l intentionally stripped — verify by hand.
+        let forbidden = ['O', '0', 'I', '1', 'l'];
+        for c in body.chars() {
+            assert!(c.is_ascii_alphanumeric(), "non-alphanumeric: {c:?}");
+            assert!(
+                !forbidden.contains(&c),
+                "forbidden char {c:?} in token body {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_token_produces_distinct_values() {
+        // 100 fresh tokens should be all-unique with overwhelming probability.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            assert!(seen.insert(generate_token()));
+        }
+    }
+
+    #[test]
+    fn token_prefix_takes_first_eleven_chars() {
+        assert_eq!(token_prefix("fb_ABCDEFGH123456789"), "fb_ABCDEFGH");
+        // Short input → just the whole thing.
+        assert_eq!(token_prefix("fb_short"), "fb_short");
+    }
+}

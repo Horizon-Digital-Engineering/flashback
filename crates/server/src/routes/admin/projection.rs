@@ -586,3 +586,129 @@ fn jaccard(a: &[String], b: &[String]) -> f32 {
         inter / union
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn squared_distance_same_point_is_zero() {
+        assert_eq!(squared_distance(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0]), 0.0);
+    }
+
+    #[test]
+    fn squared_distance_axis_aligned() {
+        // Unit step on each axis → 1.0.
+        assert!((squared_distance(&[0.0, 0.0, 0.0], &[1.0, 0.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!((squared_distance(&[0.0, 0.0, 0.0], &[0.0, 1.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!((squared_distance(&[0.0, 0.0, 0.0], &[0.0, 0.0, 1.0]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn squared_distance_pythagorean_triple() {
+        // (3,4,12) has length 13 → d² = 169.
+        assert!((squared_distance(&[0.0; 3], &[3.0, 4.0, 12.0]) - 169.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn squared_distance_is_symmetric() {
+        let p = [1.5, -2.0, 3.5];
+        let q = [-4.0, 0.5, 1.0];
+        assert!((squared_distance(&p, &q) - squared_distance(&q, &p)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_to_cube_axis_aligned_corners() {
+        // Two points on the body diagonal → output corners of [-1,1]³.
+        let out = normalize_to_cube(&[[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]);
+        assert_eq!(out.len(), 2);
+        assert!((out[0][0] - (-1.0)).abs() < 1e-6);
+        assert!((out[1][0] - 1.0).abs() < 1e-6);
+        assert!((out[0][1] - (-1.0)).abs() < 1e-6);
+        assert!((out[1][1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalize_to_cube_handles_degenerate_axis() {
+        // All points share the same z value — the z range is 0, and the max
+        // clamp to 1e-6 keeps it from dividing by zero. Output z should fall
+        // somewhere in the [-1, 1] band without panicking.
+        let out = normalize_to_cube(&[[0.0, 0.0, 5.0], [1.0, 1.0, 5.0]]);
+        assert_eq!(out.len(), 2);
+        for p in &out {
+            for axis in p {
+                assert!((-1.0..=1.0).contains(axis), "out of cube: {axis}");
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_to_cube_preserves_count() {
+        let pts = [[0.0; 3], [1.0; 3], [-0.5, 0.5, 0.25], [10.0, -10.0, 0.0]];
+        let out = normalize_to_cube(&pts);
+        assert_eq!(out.len(), pts.len());
+    }
+
+    #[test]
+    fn knn_cosine_skips_self_and_returns_k() {
+        // 4 points on a circle in 2D. Each point's nearest non-self neighbor
+        // is its immediate angular neighbor.
+        let a: &[f32] = &[1.0, 0.0];
+        let b: &[f32] = &[0.0, 1.0];
+        let c: &[f32] = &[-1.0, 0.0];
+        let d: &[f32] = &[0.0, -1.0];
+        let embs: Vec<&[f32]> = vec![a, b, c, d];
+        let knn = knn_cosine(&embs, 2);
+
+        assert_eq!(knn.len(), 4);
+        for neighbors in &knn {
+            assert_eq!(neighbors.len(), 2, "k=2 should yield 2 neighbors per node");
+        }
+        // No self-reference in any neighbor list.
+        for (i, neighbors) in knn.iter().enumerate() {
+            assert!(neighbors.iter().all(|(j, _)| *j != i));
+        }
+    }
+
+    #[test]
+    fn knn_cosine_distance_is_sorted_ascending() {
+        let embs: Vec<&[f32]> = vec![
+            &[1.0, 0.0, 0.0],
+            &[0.9, 0.1, 0.0],  // close to first
+            &[0.0, 1.0, 0.0],  // orthogonal to first
+            &[-1.0, 0.0, 0.0], // antipodal to first
+        ];
+        let knn = knn_cosine(&embs, 3);
+        // For index 0, neighbors sorted by ascending cosine distance: 1, 2, 3.
+        let d0 = &knn[0];
+        for w in d0.windows(2) {
+            assert!(w[0].1 <= w[1].1, "not sorted: {:?}", d0);
+        }
+    }
+
+    #[test]
+    fn knn_cosine_collapses_to_zero_for_aligned_vectors() {
+        // Two parallel vectors → cosine similarity 1, distance 0.
+        let embs: Vec<&[f32]> = vec![&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0]];
+        let knn = knn_cosine(&embs, 1);
+        assert!(knn[0][0].1.abs() < 1e-6, "expected ~0 distance");
+    }
+
+    #[test]
+    fn build_simplicial_edges_symmetrizes() {
+        // 3 nodes, each with the other two as neighbors at the same distance.
+        // After symmetrization every undirected pair should appear exactly once.
+        let knn = vec![
+            vec![(1usize, 0.5_f32), (2, 0.5)],
+            vec![(0, 0.5), (2, 0.5)],
+            vec![(0, 0.5), (1, 0.5)],
+        ];
+        let edges = build_simplicial_edges(&knn, 3);
+        // 3 nodes → at most C(3,2) = 3 undirected pairs.
+        assert_eq!(edges.len(), 3);
+        for ((i, j), w) in &edges {
+            assert!(i < j, "key not canonicalized (i < j): ({i}, {j})");
+            assert!(*w > 0.0 && *w <= 1.0, "weight {w} out of (0, 1]");
+        }
+    }
+}

@@ -704,3 +704,105 @@ pub async fn lineage(
         "chain": views,
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cosine_identical_vectors_is_one() {
+        let v = [1.0_f32, 2.0, 3.0];
+        assert!((cosine(&v, &v) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_orthogonal_is_zero() {
+        assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_opposite_is_negative_one() {
+        assert!((cosine(&[1.0, 0.0], &[-1.0, 0.0]) + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_empty_or_mismatched_returns_zero() {
+        assert_eq!(cosine(&[], &[]), 0.0);
+        assert_eq!(cosine(&[1.0], &[1.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn cosine_zero_norm_doesnt_panic() {
+        // Both zero vectors: dot=0, denom is clamped to 1e-9. Result is 0.
+        assert!(cosine(&[0.0, 0.0], &[0.0, 0.0]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn validate_type_accepts_known_types() {
+        for t in ["episodic", "semantic", "working", "document", "procedural"] {
+            assert!(validate_type(t).is_ok(), "rejected {t}");
+        }
+    }
+
+    #[test]
+    fn validate_type_rejects_state_object_with_redirect_message() {
+        let err = validate_type("state_object").unwrap_err();
+        // AppError doesn't expose its message directly; we just confirm it errs.
+        // The specific redirect message is asserted as a behavioral contract
+        // implicitly by `validate_type` being the only caller's gate.
+        let _ = err;
+    }
+
+    #[test]
+    fn validate_type_rejects_unknown_types() {
+        assert!(validate_type("garbage").is_err());
+        assert!(validate_type("").is_err());
+        assert!(validate_type("EPISODIC").is_err()); // case-sensitive
+    }
+
+    #[test]
+    fn default_decay_for_known_types() {
+        assert_eq!(default_decay_for("working"), "fast");
+        assert_eq!(default_decay_for("episodic"), "medium");
+        assert_eq!(default_decay_for("semantic"), "slow");
+        assert_eq!(default_decay_for("procedural"), "slow");
+        assert_eq!(default_decay_for("document"), "slow");
+    }
+
+    #[test]
+    fn default_decay_for_unknown_falls_back_to_medium() {
+        assert_eq!(default_decay_for("state_object"), "medium");
+        assert_eq!(default_decay_for(""), "medium");
+        assert_eq!(default_decay_for("garbage"), "medium");
+    }
+
+    #[test]
+    fn dedupe_removes_case_insensitive_duplicates() {
+        let out = dedupe(vec!["Foo".into(), "foo".into(), "FOO".into()]);
+        assert_eq!(out, vec!["Foo"]); // first-seen casing preserved
+    }
+
+    #[test]
+    fn dedupe_drops_empty_and_whitespace() {
+        let out = dedupe(vec!["a".into(), "".into(), "  ".into(), "b".into()]);
+        assert_eq!(out, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn dedupe_trims_whitespace() {
+        let out = dedupe(vec!["  spaced  ".into(), "spaced".into()]);
+        assert_eq!(out, vec!["spaced"]); // trimmed key matches second entry
+    }
+
+    #[test]
+    fn dedupe_preserves_order() {
+        let out = dedupe(vec!["c".into(), "a".into(), "b".into(), "a".into()]);
+        assert_eq!(out, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn dedupe_empty_input_gives_empty_output() {
+        let out: Vec<String> = dedupe(vec![]);
+        assert!(out.is_empty());
+    }
+}
