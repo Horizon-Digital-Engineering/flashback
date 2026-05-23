@@ -47,4 +47,4 @@ thiserror.workspace = true
 
 # Embedded LLM dep — heavy, optional. Pinned to 0.7.x; 0.8.x is currently
 # reported broken on crates.io. Bump deliberately, with a smoke test.
-mistralrs = { version = "0.7", optional = true }
+mistralrs = { version = "0.8", optional = true }
