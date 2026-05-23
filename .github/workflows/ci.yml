@@ -45,6 +45,24 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # pgvector-enabled Postgres so #[sqlx::test] integration tests can run
+    # against the real DB (matches what flashback uses in production).
+    services:
+      postgres:
+        image: ankane/pgvector:latest
+        env:
+          POSTGRES_DB: flashback
+          POSTGRES_USER: flashback
+          POSTGRES_PASSWORD: flashback
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U flashback"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+    env:
+      DATABASE_URL: postgres://flashback:flashback@localhost:5432/flashback
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

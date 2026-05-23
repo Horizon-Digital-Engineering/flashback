@@ -436,4 +436,81 @@ mod tests {
         let resp = unauthorized("/memory/ingest", "missing token");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // ---- Integration tests against a real Postgres (via #[sqlx::test]) ---
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mint_then_list_finds_the_token(pool: PgPool) {
+        let minted = mint_token(&pool, "alice", Some("test-token"))
+            .await
+            .unwrap();
+        assert!(minted.plaintext.starts_with("fb_"));
+        assert_eq!(minted.prefix, token_prefix(&minted.plaintext));
+
+        let rows = list_tokens(&pool, Some("alice")).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, minted.id);
+        assert_eq!(rows[0].user_id, "alice");
+        assert_eq!(rows[0].name.as_deref(), Some("test-token"));
+        assert!(rows[0].revoked_at.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_tokens_filters_by_user(pool: PgPool) {
+        mint_token(&pool, "alice", None).await.unwrap();
+        mint_token(&pool, "bob", None).await.unwrap();
+        mint_token(&pool, "alice", None).await.unwrap();
+
+        let alice = list_tokens(&pool, Some("alice")).await.unwrap();
+        assert_eq!(alice.len(), 2);
+        assert!(alice.iter().all(|r| r.user_id == "alice"));
+
+        let all = list_tokens(&pool, None).await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn validate_token_round_trip(pool: PgPool) {
+        let minted = mint_token(&pool, "alice", None).await.unwrap();
+
+        let principal = validate_token(&pool, &minted.plaintext).await.unwrap();
+        assert_eq!(principal.user_id, "alice");
+        assert_eq!(principal.token_id, minted.id);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn validate_token_rejects_bad_input(pool: PgPool) {
+        // Wrong prefix.
+        assert!(validate_token(&pool, "wrong_prefix_token").await.is_err());
+        // Right prefix, never minted.
+        assert!(validate_token(&pool, "fb_NEVER_EXISTED_AAAAAAAA")
+            .await
+            .is_err());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn revoke_token_makes_it_unvalidatable(pool: PgPool) {
+        let minted = mint_token(&pool, "alice", None).await.unwrap();
+        assert!(validate_token(&pool, &minted.plaintext).await.is_ok());
+
+        let revoked = revoke_token(&pool, minted.id).await.unwrap();
+        assert!(revoked, "expected revoke_token to report success");
+
+        // Token no longer validates after revocation.
+        assert!(validate_token(&pool, &minted.plaintext).await.is_err());
+
+        // Revoking an already-revoked token returns false.
+        let revoked_again = revoke_token(&pool, minted.id).await.unwrap();
+        assert!(!revoked_again);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn revoked_tokens_still_listed_with_revoked_at_populated(pool: PgPool) {
+        let minted = mint_token(&pool, "alice", None).await.unwrap();
+        revoke_token(&pool, minted.id).await.unwrap();
+
+        let rows = list_tokens(&pool, Some("alice")).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].revoked_at.is_some());
+    }
 }

@@ -13,6 +13,25 @@ jobs:
   sonarqube:
     name: SonarQube
     runs-on: ubuntu-latest
+    # Postgres + pgvector so #[sqlx::test] tests execute under
+    # `cargo llvm-cov`. The coverage tool doesn't distinguish unit from
+    # integration; same lcov.info, same Sonar metric.
+    services:
+      postgres:
+        image: ankane/pgvector:latest
+        env:
+          POSTGRES_DB: flashback
+          POSTGRES_USER: flashback
+          POSTGRES_PASSWORD: flashback
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U flashback"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+    env:
+      DATABASE_URL: postgres://flashback:flashback@localhost:5432/flashback
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
