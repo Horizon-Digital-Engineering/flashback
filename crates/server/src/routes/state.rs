@@ -16,12 +16,14 @@ use axum::{
 use pgvector::Vector;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
     error::{AppError, AppResult},
     models::{MemoryRow, MemoryView},
+    nlp::NlpService,
     state::StateKind,
     AppState,
 };
@@ -74,7 +76,19 @@ async fn create(
     Path(kind_str): Path<String>,
     Json(req): Json<CreateRequest>,
 ) -> AppResult<Json<StateView>> {
-    let kind = StateKind::parse(&kind_str)?;
+    Ok(Json(
+        create_state(&app.pool, &*app.nlp, &auth_user.user_id, &kind_str, req).await?,
+    ))
+}
+
+pub(crate) async fn create_state(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    kind_str: &str,
+    req: CreateRequest,
+) -> AppResult<StateView> {
+    let kind = StateKind::parse(kind_str)?;
 
     if req.state_key.trim().is_empty() {
         return Err(AppError::bad_request("state_key cannot be empty"));
@@ -88,10 +102,10 @@ async fn create(
         LIMIT 1
         "#,
     )
-    .bind(&auth_user.user_id)
+    .bind(user_id)
     .bind(kind.as_str())
     .bind(&req.state_key)
-    .fetch_optional(&app.pool)
+    .fetch_optional(pool)
     .await?;
 
     if let Some((id,)) = existing {
@@ -108,13 +122,14 @@ async fn create(
     };
 
     let scope = OwnedScope {
-        user_id: auth_user.user_id.clone(),
+        user_id: user_id.to_string(),
         project_id: req.project_id,
         session_id: req.session_id,
     };
 
     let new_id = insert_state(
-        &app,
+        pool,
+        nlp,
         kind,
         &req.state_key,
         &scope,
@@ -124,8 +139,8 @@ async fn create(
     )
     .await?;
 
-    let row = fetch_state(&app.pool, new_id).await?;
-    Ok(Json(to_state_view(kind, row)?))
+    let row = fetch_state(pool, new_id).await?;
+    to_state_view(kind, row)
 }
 
 async fn get_current(
@@ -133,9 +148,20 @@ async fn get_current(
     auth_user: AuthUser,
     Path((kind_str, key)): Path<(String, String)>,
 ) -> AppResult<Json<StateView>> {
-    let kind = StateKind::parse(&kind_str)?;
-    let row = fetch_terminal(&app.pool, &auth_user.user_id, kind, &key).await?;
-    Ok(Json(to_state_view(kind, row)?))
+    Ok(Json(
+        get_state_current(&app.pool, &auth_user.user_id, &kind_str, &key).await?,
+    ))
+}
+
+pub(crate) async fn get_state_current(
+    pool: &PgPool,
+    user_id: &str,
+    kind_str: &str,
+    key: &str,
+) -> AppResult<StateView> {
+    let kind = StateKind::parse(kind_str)?;
+    let row = fetch_terminal(pool, user_id, kind, key).await?;
+    to_state_view(kind, row)
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,9 +180,29 @@ async fn patch(
     Path((kind_str, key)): Path<(String, String)>,
     Json(req): Json<PatchRequest>,
 ) -> AppResult<Json<StateView>> {
-    let kind = StateKind::parse(&kind_str)?;
+    Ok(Json(
+        patch_state(
+            &app.pool,
+            &*app.nlp,
+            &auth_user.user_id,
+            &kind_str,
+            &key,
+            req,
+        )
+        .await?,
+    ))
+}
 
-    let current = fetch_terminal(&app.pool, &auth_user.user_id, kind, &key).await?;
+pub(crate) async fn patch_state(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    kind_str: &str,
+    key: &str,
+    req: PatchRequest,
+) -> AppResult<StateView> {
+    let kind = StateKind::parse(kind_str)?;
+    let current = fetch_terminal(pool, user_id, kind, key).await?;
     let current_data = current
         .state_data
         .clone()
@@ -165,15 +211,16 @@ async fn patch(
     let new_data = kind.apply(&current_data, &req.op)?;
 
     let scope = OwnedScope {
-        user_id: auth_user.user_id.clone(),
+        user_id: user_id.to_string(),
         project_id: req.project_id.or(current.project_id.clone()),
         session_id: req.session_id.or(current.session_id.clone()),
     };
 
     let new_id = insert_state(
-        &app,
+        pool,
+        nlp,
         kind,
-        &key,
+        key,
         &scope,
         &new_data,
         Some(current.importance),
@@ -184,11 +231,11 @@ async fn patch(
     sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
         .bind(new_id)
         .bind(current.id)
-        .execute(&app.pool)
+        .execute(pool)
         .await?;
 
-    let row = fetch_state(&app.pool, new_id).await?;
-    Ok(Json(to_state_view(kind, row)?))
+    let row = fetch_state(pool, new_id).await?;
+    to_state_view(kind, row)
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,20 +255,42 @@ async fn replace(
     Path((kind_str, key)): Path<(String, String)>,
     Json(req): Json<ReplaceRequest>,
 ) -> AppResult<Json<StateView>> {
-    let kind = StateKind::parse(&kind_str)?;
-    let current = fetch_terminal(&app.pool, &auth_user.user_id, kind, &key).await?;
+    Ok(Json(
+        replace_state(
+            &app.pool,
+            &*app.nlp,
+            &auth_user.user_id,
+            &kind_str,
+            &key,
+            req,
+        )
+        .await?,
+    ))
+}
+
+pub(crate) async fn replace_state(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    kind_str: &str,
+    key: &str,
+    req: ReplaceRequest,
+) -> AppResult<StateView> {
+    let kind = StateKind::parse(kind_str)?;
+    let current = fetch_terminal(pool, user_id, kind, key).await?;
     let validated = kind.validate_initial(&req.state_data)?;
 
     let scope = OwnedScope {
-        user_id: auth_user.user_id.clone(),
+        user_id: user_id.to_string(),
         project_id: req.project_id.or(current.project_id.clone()),
         session_id: req.session_id.or(current.session_id.clone()),
     };
 
     let new_id = insert_state(
-        &app,
+        pool,
+        nlp,
         kind,
-        &key,
+        key,
         &scope,
         &validated,
         req.importance.or(Some(current.importance)),
@@ -232,11 +301,11 @@ async fn replace(
     sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
         .bind(new_id)
         .bind(current.id)
-        .execute(&app.pool)
+        .execute(pool)
         .await?;
 
-    let row = fetch_state(&app.pool, new_id).await?;
-    Ok(Json(to_state_view(kind, row)?))
+    let row = fetch_state(pool, new_id).await?;
+    to_state_view(kind, row)
 }
 
 async fn history(
@@ -244,7 +313,18 @@ async fn history(
     auth_user: AuthUser,
     Path((kind_str, key)): Path<(String, String)>,
 ) -> AppResult<Json<Value>> {
-    let kind = StateKind::parse(&kind_str)?;
+    Ok(Json(
+        state_history(&app.pool, &auth_user.user_id, &kind_str, &key).await?,
+    ))
+}
+
+pub(crate) async fn state_history(
+    pool: &PgPool,
+    user_id: &str,
+    kind_str: &str,
+    key: &str,
+) -> AppResult<Value> {
+    let kind = StateKind::parse(kind_str)?;
     let rows: Vec<MemoryRow> = sqlx::query_as::<_, MemoryRow>(
         r#"
         SELECT id, type, content, embedding, importance, access_count, decay_class,
@@ -256,10 +336,10 @@ async fn history(
         ORDER BY created_at ASC
         "#,
     )
-    .bind(&auth_user.user_id)
+    .bind(user_id)
     .bind(kind.as_str())
-    .bind(&key)
-    .fetch_all(&app.pool)
+    .bind(key)
+    .fetch_all(pool)
     .await?;
 
     if rows.is_empty() {
@@ -275,13 +355,13 @@ async fn history(
         .map(|r| r.id);
     let chain: Vec<MemoryView> = rows.into_iter().map(MemoryView::from).collect();
 
-    Ok(Json(json!({
+    Ok(json!({
         "state_kind": kind.as_str(),
         "state_key": key,
         "terminal": terminal,
         "length": chain.len(),
         "chain": chain,
-    })))
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +411,8 @@ async fn fetch_terminal(
 }
 
 async fn insert_state(
-    app: &AppState,
+    pool: &PgPool,
+    nlp: &dyn NlpService,
     kind: StateKind,
     key: &str,
     scope: &OwnedScope,
@@ -340,7 +421,7 @@ async fn insert_state(
     supersedes: Option<Uuid>,
 ) -> AppResult<Uuid> {
     let rendered = kind.render(data, key);
-    let embedding = app.nlp.embed_one(&rendered).await?;
+    let embedding = nlp.embed_one(&rendered).await?;
     let vector = Vector::from(embedding);
 
     let new_id = Uuid::new_v4();
@@ -370,7 +451,7 @@ async fn insert_state(
     .bind(key)
     .bind(data)
     .bind(supersedes)
-    .execute(&app.pool)
+    .execute(pool)
     .await?;
     Ok(new_id)
 }
@@ -434,4 +515,320 @@ pub async fn fetch_active_state_objects(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(MemoryView::from).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+
+    // Minimal NlpService stub — returns zero embeddings + empty extractions.
+    // Used because state ops embed the rendered text on every insert.
+    struct StubNlp;
+
+    #[async_trait]
+    impl NlpService for StubNlp {
+        fn provider_name(&self) -> &'static str {
+            "stub"
+        }
+        fn provider_can_distill(&self) -> bool {
+            false
+        }
+        fn embedder_model_name(&self) -> &str {
+            "stub-embedder"
+        }
+        fn embedder_dimension(&self) -> usize {
+            384
+        }
+        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(vec![0.0_f32; 384])
+        }
+        async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+            Ok((0..texts.len()).map(|_| vec![0.0_f32; 384]).collect())
+        }
+        fn extract_entities(&self, _text: &str) -> Vec<String> {
+            Vec::new()
+        }
+        async fn extract_full(&self, _text: &str) -> Result<Extraction, AppError> {
+            Ok(Extraction::empty())
+        }
+        async fn distill_facts(
+            &self,
+            _episodes: &[EpisodeRef],
+        ) -> Result<Vec<DistilledFact>, ProviderError> {
+            Err(ProviderError::NotConfigured("stub".into()))
+        }
+    }
+
+    fn create_req(key: &str) -> CreateRequest {
+        CreateRequest {
+            state_key: key.to_string(),
+            project_id: None,
+            session_id: None,
+            initial: None,
+            importance: None,
+        }
+    }
+
+    fn patch_op(op: serde_json::Value) -> PatchRequest {
+        PatchRequest {
+            project_id: None,
+            session_id: None,
+            op,
+        }
+    }
+
+    // ---- create_state ----------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_state_inserts_new_state_object(pool: PgPool) {
+        let view = create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+        assert_eq!(view.state_kind, "todo_list");
+        assert_eq!(view.state_key, "today");
+        assert_eq!(view.user_id, "alice");
+        assert!(view.supersedes.is_none());
+        // Default-empty body.
+        assert_eq!(view.state_data, json!({ "items": [] }));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_state_rejects_unknown_kind(pool: PgPool) {
+        let err = create_state(&pool, &StubNlp, "alice", "garbage", create_req("k"))
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_state_rejects_empty_state_key(pool: PgPool) {
+        let err = create_state(&pool, &StubNlp, "alice", "todo_list", create_req(""))
+            .await
+            .unwrap_err();
+        let _ = err;
+        let err2 = create_state(&pool, &StubNlp, "alice", "todo_list", create_req("  "))
+            .await
+            .unwrap_err();
+        let _ = err2;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_state_rejects_duplicate_active_key(pool: PgPool) {
+        create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+        let err = create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_state_scopes_uniqueness_to_user(pool: PgPool) {
+        // Alice and Bob can both have a todo_list named "today" — they're
+        // separate state objects under different user scopes.
+        create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+        create_state(&pool, &StubNlp, "bob", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_state_with_initial_data_validates(pool: PgPool) {
+        let mut req = create_req("today");
+        req.initial = Some(json!({ "items": [{ "text": "first" }] }));
+        let view = create_state(&pool, &StubNlp, "alice", "todo_list", req)
+            .await
+            .unwrap();
+        let items = view.state_data["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["text"], "first");
+        // assign_missing_ids should have populated an id.
+        assert!(items[0]["id"].as_str().unwrap().len() > 0);
+    }
+
+    // ---- get_state_current ----------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_state_current_returns_404_when_missing(pool: PgPool) {
+        let err = get_state_current(&pool, "alice", "todo_list", "nope")
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_state_current_returns_terminal_node(pool: PgPool) {
+        let created = create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+        let fetched = get_state_current(&pool, "alice", "todo_list", "today")
+            .await
+            .unwrap();
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.state_key, "today");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn get_state_current_scopes_to_user(pool: PgPool) {
+        create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+        // Bob can't read alice's todo_list.
+        assert!(get_state_current(&pool, "bob", "todo_list", "today")
+            .await
+            .is_err());
+    }
+
+    // ---- patch_state -----------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_state_appends_via_add_op(pool: PgPool) {
+        let created = create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+
+        let after = patch_state(
+            &pool,
+            &StubNlp,
+            "alice",
+            "todo_list",
+            "today",
+            patch_op(json!({ "op": "add", "text": "buy milk" })),
+        )
+        .await
+        .unwrap();
+
+        // Patch creates a new row that supersedes the previous terminal.
+        assert_ne!(after.id, created.id);
+        assert_eq!(after.supersedes, Some(created.id));
+        let items = after.state_data["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["text"], "buy milk");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_state_marks_old_row_superseded(pool: PgPool) {
+        let created = create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+        let after = patch_state(
+            &pool,
+            &StubNlp,
+            "alice",
+            "todo_list",
+            "today",
+            patch_op(json!({ "op": "add", "text": "x" })),
+        )
+        .await
+        .unwrap();
+
+        // Old row's superseded_by should point at the new id.
+        let row_superseded_by: Option<Uuid> =
+            sqlx::query_scalar("SELECT superseded_by FROM memories WHERE id = $1")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row_superseded_by, Some(after.id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn patch_state_rejects_invalid_op(pool: PgPool) {
+        create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+        let err = patch_state(
+            &pool,
+            &StubNlp,
+            "alice",
+            "todo_list",
+            "today",
+            patch_op(json!({ "op": "garbage" })),
+        )
+        .await
+        .unwrap_err();
+        let _ = err;
+    }
+
+    // ---- replace_state ---------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn replace_state_swaps_full_data_and_supersedes(pool: PgPool) {
+        let created = create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+
+        let replaced = replace_state(
+            &pool,
+            &StubNlp,
+            "alice",
+            "todo_list",
+            "today",
+            ReplaceRequest {
+                project_id: None,
+                session_id: None,
+                state_data: json!({ "items": [{ "text": "new1" }, { "text": "new2" }] }),
+                importance: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(replaced.id, created.id);
+        assert_eq!(replaced.supersedes, Some(created.id));
+        assert_eq!(replaced.state_data["items"].as_array().unwrap().len(), 2);
+    }
+
+    // ---- state_history ---------------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn state_history_returns_supersede_chain(pool: PgPool) {
+        let v1 = create_state(&pool, &StubNlp, "alice", "todo_list", create_req("today"))
+            .await
+            .unwrap();
+        patch_state(
+            &pool,
+            &StubNlp,
+            "alice",
+            "todo_list",
+            "today",
+            patch_op(json!({ "op": "add", "text": "x" })),
+        )
+        .await
+        .unwrap();
+        let v3 = patch_state(
+            &pool,
+            &StubNlp,
+            "alice",
+            "todo_list",
+            "today",
+            patch_op(json!({ "op": "add", "text": "y" })),
+        )
+        .await
+        .unwrap();
+
+        let history = state_history(&pool, "alice", "todo_list", "today")
+            .await
+            .unwrap();
+        assert_eq!(history["state_kind"], "todo_list");
+        assert_eq!(history["state_key"], "today");
+        assert_eq!(history["length"], 3);
+        assert_eq!(history["terminal"], serde_json::json!(v3.id));
+        // Chain ordered by created_at ASC, so v1 first.
+        let chain = history["chain"].as_array().unwrap();
+        assert_eq!(chain[0]["id"], serde_json::json!(v1.id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn state_history_404_when_no_rows(pool: PgPool) {
+        let err = state_history(&pool, "alice", "todo_list", "missing")
+            .await
+            .unwrap_err();
+        let _ = err;
+    }
 }
