@@ -396,3 +396,240 @@ pub fn looks_like_supersede(
     }
     best.map(|(id, _)| id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- looks_like_supersede (pure, no DB) -------------------------------
+
+    fn pair(id: &str, ents: &[&str]) -> (Uuid, Vec<String>) {
+        (
+            Uuid::parse_str(id).unwrap(),
+            ents.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn looks_like_supersede_returns_none_when_no_candidate_clears_threshold() {
+        let candidates = vec![
+            pair("00000000-0000-0000-0000-000000000001", &["x"]),
+            pair("00000000-0000-0000-0000-000000000002", &["y"]),
+        ];
+        let new = vec!["z".into()];
+        // Jaccard with each candidate is 0; threshold 0.3 → no match.
+        assert!(looks_like_supersede(&new, &candidates, 0.3).is_none());
+    }
+
+    #[test]
+    fn looks_like_supersede_picks_best_overlap() {
+        let weak = pair("00000000-0000-0000-0000-000000000001", &["a", "z"]);
+        let strong = pair("00000000-0000-0000-0000-000000000002", &["a", "b"]);
+        let candidates = vec![weak.clone(), strong.clone()];
+        let new = vec!["a".into(), "b".into()];
+        // Strong jaccard = 1.0; weak = 1/3. Strong wins.
+        assert_eq!(looks_like_supersede(&new, &candidates, 0.3), Some(strong.0));
+    }
+
+    #[test]
+    fn looks_like_supersede_respects_threshold() {
+        // 1/3 jaccard — under 0.5, over 0.3.
+        let c = vec![pair("00000000-0000-0000-0000-000000000001", &["x", "y"])];
+        let new = vec!["x".into(), "z".into()];
+        assert!(looks_like_supersede(&new, &c, 0.5).is_none());
+        assert!(looks_like_supersede(&new, &c, 0.3).is_some());
+    }
+
+    #[test]
+    fn approx_tokens_in_retrieval_matches_chunking() {
+        // Sanity-link to the chunking module's same constant.
+        assert_eq!(approx_tokens(""), 0);
+        assert_eq!(approx_tokens("abcd"), 1);
+        assert_eq!(approx_tokens("a".repeat(400).as_str()), 100);
+    }
+
+    // ---- integration tests (real Postgres + pgvector) ---------------------
+
+    use sqlx::PgPool;
+
+    async fn insert_memory(
+        pool: &PgPool,
+        user_id: &str,
+        project_id: Option<&str>,
+        session_id: Option<&str>,
+        mem_type: &str,
+        content: &str,
+        entities: &[&str],
+        importance: f32,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let ents: Vec<String> = entities.iter().map(|s| s.to_string()).collect();
+        // Zero embedding — semantic ranking will be uniform; tests that care
+        // about semantic should pass query_embedding=None to skip that arm.
+        let emb = pgvector::Vector::from(vec![0.0_f32; 384]);
+        sqlx::query(
+            r#"INSERT INTO memories
+               (id, type, content, embedding, importance, decay_class, user_id,
+                project_id, session_id, entities)
+               VALUES ($1, $2, $3, $4, $5, 'medium', $6, $7, $8, $9)"#,
+        )
+        .bind(id)
+        .bind(mem_type)
+        .bind(content)
+        .bind(emb)
+        .bind(importance)
+        .bind(user_id)
+        .bind(project_id)
+        .bind(session_id)
+        .bind(&ents)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    fn base_params(user_id: &str) -> SearchParams<'_> {
+        SearchParams {
+            user_id,
+            project_id: None,
+            session_id: None,
+            query: None,
+            query_embedding: None,
+            query_entities: Vec::new(),
+            memory_types: None,
+            since: None,
+            until: None,
+            mode: Mode::Answer,
+            top_k: 20,
+            include_superseded: false,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_empty_db_returns_no_results(pool: PgPool) {
+        let out = search(&pool, base_params("alice")).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_filters_by_user_id(pool: PgPool) {
+        insert_memory(
+            &pool,
+            "alice",
+            None,
+            None,
+            "episodic",
+            "alice memory",
+            &["x"],
+            0.5,
+        )
+        .await;
+        insert_memory(
+            &pool,
+            "bob",
+            None,
+            None,
+            "episodic",
+            "bob memory",
+            &["y"],
+            0.5,
+        )
+        .await;
+
+        let alice = search(&pool, base_params("alice")).await.unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0].view.user_id, "alice");
+
+        let bob = search(&pool, base_params("bob")).await.unwrap();
+        assert_eq!(bob.len(), 1);
+        assert_eq!(bob[0].view.user_id, "bob");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_filters_by_memory_type(pool: PgPool) {
+        insert_memory(&pool, "alice", None, None, "episodic", "ep1", &[], 0.5).await;
+        insert_memory(&pool, "alice", None, None, "semantic", "se1", &[], 0.5).await;
+        insert_memory(&pool, "alice", None, None, "working", "wk1", &[], 0.5).await;
+
+        let mut params = base_params("alice");
+        params.memory_types = Some(vec!["episodic", "semantic"]);
+        let out = search(&pool, params).await.unwrap();
+        assert_eq!(out.len(), 2);
+        for r in &out {
+            assert!(matches!(r.view.type_.as_str(), "episodic" | "semantic"));
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn search_excludes_superseded_by_default(pool: PgPool) {
+        let old = insert_memory(&pool, "alice", None, None, "episodic", "old", &[], 0.5).await;
+        let new = insert_memory(&pool, "alice", None, None, "episodic", "new", &[], 0.5).await;
+        // Mark old as superseded by new.
+        sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
+            .bind(new)
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let out = search(&pool, base_params("alice")).await.unwrap();
+        // Only the new (terminal) one should show.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].view.id, new);
+
+        let mut with_superseded = base_params("alice");
+        with_superseded.include_superseded = true;
+        let out_all = search(&pool, with_superseded).await.unwrap();
+        assert_eq!(out_all.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn touch_access_increments_count_and_timestamp(pool: PgPool) {
+        let id = insert_memory(&pool, "alice", None, None, "episodic", "to touch", &[], 0.5).await;
+
+        // Initially access_count=0; last_accessed_at defaults to NOW() on insert
+        // (per schema), so we just record it and check touch_access bumps it.
+        let (count_before, ts_before): (i32, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as("SELECT access_count, last_accessed_at FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count_before, 0);
+
+        // Small sleep so the timestamp advance is observable on fast systems.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        touch_access(&pool, &[id]).await.unwrap();
+
+        let (count_after, ts_after): (i32, chrono::DateTime<chrono::Utc>) =
+            sqlx::query_as("SELECT access_count, last_accessed_at FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count_after, 1);
+        assert!(ts_after >= ts_before, "timestamp should advance or hold");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn touch_access_empty_input_is_noop(pool: PgPool) {
+        // Should not error and should not write any rows.
+        touch_access(&pool, &[]).await.unwrap();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn touch_access_handles_multiple_ids(pool: PgPool) {
+        let id1 = insert_memory(&pool, "alice", None, None, "episodic", "one", &[], 0.5).await;
+        let id2 = insert_memory(&pool, "alice", None, None, "episodic", "two", &[], 0.5).await;
+        touch_access(&pool, &[id1, id2]).await.unwrap();
+        for id in [id1, id2] {
+            let c: i32 = sqlx::query_scalar("SELECT access_count FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(c, 1);
+        }
+    }
+}

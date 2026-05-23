@@ -702,4 +702,135 @@ mod tests {
         assert_eq!(clusters.len(), 1);
         assert!(clusters[0].dominant_topic.is_none()); // entity-jaccard branch
     }
+
+    // ---- integration tests: run_daily against a real DB ------------------
+
+    use chrono::Duration;
+
+    /// Insert a working memory with a custom expires_at + entity count + importance,
+    /// returning its id. Embedding is a zero vector since run_daily doesn't read it.
+    async fn insert_working(
+        pool: &sqlx::PgPool,
+        user_id: &str,
+        importance: f32,
+        access_count: i32,
+        entities: &[&str],
+        expires_in_hours: i64,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        let ents: Vec<String> = entities.iter().map(|s| s.to_string()).collect();
+        let emb = pgvector::Vector::from(vec![0.0_f32; 384]);
+        let expires_at = chrono::Utc::now() + Duration::hours(expires_in_hours);
+        sqlx::query(
+            r#"INSERT INTO memories
+               (id, type, content, embedding, importance, access_count, decay_class,
+                user_id, entities, expires_at)
+               VALUES ($1, 'working', $2, $3, $4, $5, 'fast', $6, $7, $8)"#,
+        )
+        .bind(id)
+        .bind(format!("working memory {id}"))
+        .bind(emb)
+        .bind(importance)
+        .bind(access_count)
+        .bind(user_id)
+        .bind(&ents)
+        .bind(expires_at)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn fetch_type(pool: &sqlx::PgPool, id: Uuid) -> String {
+        sqlx::query_scalar("SELECT type FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_daily_no_op_when_nothing_near_expiry(pool: sqlx::PgPool) {
+        // Inserted far past the 6-hour window — should be ignored.
+        insert_working(&pool, "alice", 0.9, 5, &["a", "b"], 48).await;
+
+        let stats = run_daily(&pool, "alice").await;
+        assert_eq!(stats.promoted_count, 0);
+        assert_eq!(stats.expired_count, 0);
+        assert!(stats.error.is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_daily_promotes_high_importance_to_episodic(pool: sqlx::PgPool) {
+        // importance >= 0.6 → promote.
+        let id = insert_working(&pool, "alice", 0.8, 0, &["important"], 1).await;
+        let stats = run_daily(&pool, "alice").await;
+        assert_eq!(stats.promoted_count, 1);
+        assert_eq!(stats.expired_count, 0);
+        assert_eq!(fetch_type(&pool, id).await, "episodic");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_daily_promotes_accessed_medium_importance(pool: sqlx::PgPool) {
+        // importance >= 0.4 AND access_count >= 1 → promote.
+        let id = insert_working(&pool, "alice", 0.5, 2, &["a"], 1).await;
+        let stats = run_daily(&pool, "alice").await;
+        assert_eq!(stats.promoted_count, 1);
+        assert_eq!(fetch_type(&pool, id).await, "episodic");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_daily_promotes_when_two_or_more_entities(pool: sqlx::PgPool) {
+        // Below importance/access thresholds, but >= 2 entities still triggers.
+        let id = insert_working(&pool, "alice", 0.1, 0, &["x", "y", "z"], 1).await;
+        let stats = run_daily(&pool, "alice").await;
+        assert_eq!(stats.promoted_count, 1);
+        assert_eq!(fetch_type(&pool, id).await, "episodic");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_daily_expires_low_signal_memories(pool: sqlx::PgPool) {
+        // Low importance, no accesses, fewer than 2 entities → expire.
+        let id = insert_working(&pool, "alice", 0.1, 0, &["just_one"], 1).await;
+        let stats = run_daily(&pool, "alice").await;
+        assert_eq!(stats.promoted_count, 0);
+        assert_eq!(stats.expired_count, 1);
+        // Type stayed working but expires_at moved into the past.
+        assert_eq!(fetch_type(&pool, id).await, "working");
+        let expires_at: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT expires_at FROM memories WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(expires_at < chrono::Utc::now());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_daily_scopes_to_user_id(pool: sqlx::PgPool) {
+        let alice = insert_working(&pool, "alice", 0.9, 0, &[], 1).await;
+        let bob = insert_working(&pool, "bob", 0.9, 0, &[], 1).await;
+
+        let stats = run_daily(&pool, "alice").await;
+        assert_eq!(stats.promoted_count, 1);
+        // Bob's memory untouched.
+        assert_eq!(fetch_type(&pool, alice).await, "episodic");
+        assert_eq!(fetch_type(&pool, bob).await, "working");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_daily_writes_audit_row(pool: sqlx::PgPool) {
+        insert_working(&pool, "alice", 0.9, 0, &[], 1).await;
+        run_daily(&pool, "alice").await;
+
+        let count: i64 = sqlx::query_scalar(
+            r#"SELECT COUNT(*) FROM consolidation_runs
+               WHERE kind = 'daily' AND user_id = $1 AND finished_at IS NOT NULL"#,
+        )
+        .bind("alice")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
 }
