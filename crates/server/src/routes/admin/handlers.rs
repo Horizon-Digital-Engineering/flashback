@@ -366,29 +366,37 @@ pub async fn memory_delete(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Response, super::Error> {
-    // Ownership check before delete.
+    delete_memory_owned_by(&state.pool, &user.user_id, id).await?;
+    Ok(Redirect::to("/admin/memories").into_response())
+}
+
+/// Hard-delete a memory after verifying it belongs to `user_id`. Nulls out
+/// inbound supersede pointers so the DELETE doesn't violate FK constraints.
+pub(crate) async fn delete_memory_owned_by(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+    id: Uuid,
+) -> Result<(), super::Error> {
     let owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM memories WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(pool)
         .await?;
-    if owner.as_deref() != Some(user.user_id.as_str()) {
+    if owner.as_deref() != Some(user_id) {
         return Err(super::Error::NotFound);
     }
-    // Null out incoming supersede pointers so we don't violate FK,
-    // then hard delete.
     sqlx::query("UPDATE memories SET superseded_by = NULL WHERE superseded_by = $1")
         .bind(id)
-        .execute(&state.pool)
+        .execute(pool)
         .await?;
     sqlx::query("UPDATE memories SET supersedes = NULL WHERE supersedes = $1")
         .bind(id)
-        .execute(&state.pool)
+        .execute(pool)
         .await?;
     sqlx::query("DELETE FROM memories WHERE id = $1")
         .bind(id)
-        .execute(&state.pool)
+        .execute(pool)
         .await?;
-    Ok(Redirect::to("/admin/memories").into_response())
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -465,14 +473,26 @@ pub async fn token_revoke(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Response, super::Error> {
+    revoke_token_owned_by(&state.pool, &user.user_id, id).await?;
+    Ok(Redirect::to("/admin/tokens").into_response())
+}
+
+/// Revoke a token (if currently active) belonging to `user_id`. Returns Ok
+/// even if the row is missing or already revoked — the admin UI just refreshes
+/// the list on success.
+pub(crate) async fn revoke_token_owned_by(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+    id: Uuid,
+) -> Result<(), super::Error> {
     sqlx::query(
         "UPDATE tokens SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
     )
     .bind(id)
-    .bind(&user.user_id)
-    .execute(&state.pool)
+    .bind(user_id)
+    .execute(pool)
     .await?;
-    Ok(Redirect::to("/admin/tokens").into_response())
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -724,3 +744,202 @@ fn preview(s: &str, n: usize) -> String {
 // Suppress unused-headers warning on imports we keep for future use.
 #[allow(dead_code)]
 fn _hdr(_: HeaderMap) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    async fn insert_memory_for(pool: &PgPool, user_id: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let emb = pgvector::Vector::from(vec![0.0_f32; 384]);
+        sqlx::query(
+            "INSERT INTO memories (id, type, content, embedding, importance, decay_class, user_id, entities)
+             VALUES ($1, 'episodic', 'admin test', $2, 0.5, 'medium', $3, '{}')",
+        )
+        .bind(id)
+        .bind(emb)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    // ---- delete_memory_owned_by ------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_memory_owned_by_removes_row(pool: PgPool) {
+        let id = insert_memory_for(&pool, "alice").await;
+        delete_memory_owned_by(&pool, "alice", id).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_memory_owned_by_rejects_wrong_user(pool: PgPool) {
+        let id = insert_memory_for(&pool, "alice").await;
+        let err = delete_memory_owned_by(&pool, "bob", id).await.unwrap_err();
+        assert!(matches!(err, super::super::Error::NotFound));
+        // Row still exists.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_memory_owned_by_404_when_missing(pool: PgPool) {
+        let err = delete_memory_owned_by(&pool, "alice", Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, super::super::Error::NotFound));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_memory_owned_by_nulls_supersede_pointers(pool: PgPool) {
+        let old = insert_memory_for(&pool, "alice").await;
+        let new = insert_memory_for(&pool, "alice").await;
+        // Wire supersede chain: new supersedes old, old.superseded_by = new.
+        sqlx::query("UPDATE memories SET supersedes = $1 WHERE id = $2")
+            .bind(old)
+            .bind(new)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
+            .bind(new)
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Deleting `old` should null the inbound pointer on `new` and not FK-violate.
+        delete_memory_owned_by(&pool, "alice", old).await.unwrap();
+
+        let supersedes_on_new: Option<Uuid> =
+            sqlx::query_scalar("SELECT supersedes FROM memories WHERE id = $1")
+                .bind(new)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(supersedes_on_new.is_none());
+    }
+
+    // ---- revoke_token_owned_by -------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn revoke_token_owned_by_marks_revoked(pool: PgPool) {
+        let minted = crate::auth::mint_token(&pool, "alice", None).await.unwrap();
+        revoke_token_owned_by(&pool, "alice", minted.id)
+            .await
+            .unwrap();
+        let revoked_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM tokens WHERE id = $1")
+                .bind(minted.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(revoked_at.is_some());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn revoke_token_owned_by_doesnt_affect_other_users_tokens(pool: PgPool) {
+        let alice_token = crate::auth::mint_token(&pool, "alice", None).await.unwrap();
+        // Bob tries to revoke alice's token — should silently no-op.
+        revoke_token_owned_by(&pool, "bob", alice_token.id)
+            .await
+            .unwrap();
+        let revoked_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT revoked_at FROM tokens WHERE id = $1")
+                .bind(alice_token.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            revoked_at.is_none(),
+            "bob's call should not revoke alice's token"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn revoke_token_owned_by_unknown_id_is_silent_ok(pool: PgPool) {
+        // No row → no error. This matches the handler's UX contract
+        // (refresh the tokens page either way).
+        revoke_token_owned_by(&pool, "alice", Uuid::new_v4())
+            .await
+            .unwrap();
+    }
+
+    // ---- pure helpers ----------------------------------------------------
+
+    #[test]
+    fn empty_to_none_collapses_whitespace() {
+        assert_eq!(empty_to_none(&"".to_string()), None);
+        assert_eq!(empty_to_none(&"   ".to_string()), None);
+        assert_eq!(empty_to_none(&"abc".to_string()), Some("abc".to_string()));
+        // Trim is applied.
+        assert_eq!(
+            empty_to_none(&"  trimmed  ".to_string()),
+            Some("trimmed".to_string())
+        );
+    }
+
+    #[test]
+    fn memory_query_include_super_truthy_values() {
+        for v in ["1", "true", "on"] {
+            let q = MemoryQuery {
+                include_superseded: Some(v.to_string()),
+                ..MemoryQuery::default()
+            };
+            assert!(q.include_super(), "{v:?} should be truthy");
+        }
+    }
+
+    #[test]
+    fn memory_query_include_super_falsy_and_unset() {
+        let unset = MemoryQuery::default();
+        assert!(!unset.include_super());
+
+        for v in ["", "0", "false", "anything-else"] {
+            let q = MemoryQuery {
+                include_superseded: Some(v.to_string()),
+                ..MemoryQuery::default()
+            };
+            assert!(!q.include_super(), "{v:?} should be falsy");
+        }
+    }
+
+    #[test]
+    fn memory_query_clean_collapses_empties() {
+        let raw = MemoryQuery {
+            r#type: Some("  ".to_string()),
+            project_id: Some("real-project".to_string()),
+            session_id: Some("".to_string()),
+            include_superseded: Some("0".to_string()),
+        };
+        let cleaned = raw.clean();
+        assert_eq!(cleaned.r#type, None);
+        assert_eq!(cleaned.project_id.as_deref(), Some("real-project"));
+        assert_eq!(cleaned.session_id, None);
+        // include_superseded normalized to None when falsy.
+        assert_eq!(cleaned.include_superseded, None);
+    }
+
+    #[test]
+    fn memory_query_clean_preserves_truthy_include_super() {
+        let raw = MemoryQuery {
+            include_superseded: Some("true".to_string()),
+            ..MemoryQuery::default()
+        };
+        let cleaned = raw.clean();
+        // Normalized to canonical "1".
+        assert_eq!(cleaned.include_superseded.as_deref(), Some("1"));
+    }
+}
