@@ -1,0 +1,89 @@
+# DigitalOcean "Deploy to DO" button template — the spec consumed by
+# https://cloud.digitalocean.com/apps/new?repo=... when the button is clicked.
+#
+# Keep in sync with .do/app.yaml. The differences are:
+#   - this file wraps the spec in `spec:` for the deploy URL
+#   - git refs use `repo_clone_url` instead of `github` (works for any visibility)
+
+spec:
+  name: flashback
+  region: nyc
+
+  services:
+
+    - name: server
+      git:
+        branch: main
+        repo_clone_url: https://github.com/Horizon-Digital-Engineering/flashback.git
+      dockerfile_path: Dockerfile
+      source_dir: /
+      http_port: 8080
+      instance_count: 1
+      instance_size_slug: apps-s-1vcpu-1gb
+      routes:
+        - path: /
+      health_check:
+        http_path: /health
+        initial_delay_seconds: 30
+        period_seconds: 10
+        timeout_seconds: 5
+        failure_threshold: 6
+      envs:
+        - key: DATABASE_URL
+          value: ${db.DATABASE_URL}
+          scope: RUN_AND_BUILD_TIME
+        - key: HOST
+          value: "0.0.0.0"
+          scope: RUN_TIME
+        - key: PORT
+          value: "8080"
+          scope: RUN_TIME
+        - key: AUTO_MIGRATE
+          value: "1"
+          scope: RUN_TIME
+        - key: FLASHBACK_FASTEMBED_CACHE
+          value: /opt/flashback/fastembed-cache
+          scope: RUN_TIME
+        - key: RUST_LOG
+          value: flashback=info,tower_http=info
+          scope: RUN_TIME
+
+    - name: mcp
+      git:
+        branch: main
+        repo_clone_url: https://github.com/Horizon-Digital-Engineering/flashback.git
+      dockerfile_path: Dockerfile
+      source_dir: /
+      run_command: ./flashback-mcp
+      http_port: 8082
+      instance_count: 1
+      instance_size_slug: apps-s-1vcpu-1gb
+      routes:
+        - path: /mcp
+      health_check:
+        http_path: /health
+        initial_delay_seconds: 30
+        period_seconds: 10
+        timeout_seconds: 5
+        failure_threshold: 6
+      envs:
+        - key: FLASHBACK_URL
+          value: http://${server.PRIVATE_DOMAIN}:8080
+          scope: RUN_TIME
+        - key: MCP_HOST
+          value: "0.0.0.0"
+          scope: RUN_TIME
+        - key: MCP_PORT
+          value: "8082"
+          scope: RUN_TIME
+        - key: RUST_LOG
+          value: flashback_mcp=info,tower_http=info
+          scope: RUN_TIME
+
+  databases:
+    - name: db
+      engine: PG
+      version: "16"
+      production: false
+      size: db-s-dev-database
+      num_nodes: 1

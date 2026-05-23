@@ -1,0 +1,68 @@
+# cargo-deny config. Schema docs: https://embarkstudios.github.io/cargo-deny/
+#
+# `cargo deny check` runs locally; CI runs `cargo deny check --all-features`
+# via .github/workflows/security.yml. Tighten as findings surface; this is a
+# pragmatic baseline, not a final policy.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "warn"
+# RUSTSEC advisories we accept (with reason). Empty means: any advisory fails.
+ignore = []
+
+[licenses]
+version = 2
+# Allowlist. Add to this list deliberately — never default-allow a new license.
+# Common Rust-ecosystem licenses (matches what 95% of crates use). All
+# permissive or weak-copyleft (MPL-2.0); no GPL/AGPL/LGPL allowed.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+# Per-crate license overrides — only for crates whose declared license
+# can't be auto-detected. Keep this list short and reviewed.
+exceptions = []
+
+[[licenses.clarify]]
+# The `ring` crate's license is a fused mix (ISC + MIT + OpenSSL) that
+# cargo-deny can't auto-detect. This clarification matches the upstream
+# guidance from briansmith/ring.
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+# Crates we explicitly never want pulled in.
+deny = []
+# Versions we allow even when `multiple-versions` would fire.
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Only crates.io. Add internal mirrors here if/when we have any.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

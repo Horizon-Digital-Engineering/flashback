@@ -1,0 +1,101 @@
+# DigitalOcean App Platform spec — one-click deploy.
+#
+# Click the badge in the README, or run:
+#   doctl apps create --spec .do/app.yaml
+#
+# After the app comes up, mint your first bearer token from the App console
+# or via doctl:
+#   doctl apps list                          # find your app id
+#   doctl apps exec <app-id> server \
+#       -- ./flashback token mint --user=admin --name=initial
+#
+# The MCP URL is then https://<app>.ondigitalocean.app/mcp with the bearer
+# pasted into your Claude Desktop / Cursor / Claude Code config.
+
+name: flashback
+region: nyc
+
+# Public-facing services. Routing is longest-prefix-match — `/mcp` wins over `/`.
+services:
+
+  # REST API. Embeddings + entity extraction run in-process (fastembed-rs
+  # + rule-based extractor) — no Python sidecar in Phase 2.
+  # AUTO_MIGRATE=1 so the first boot creates the schema.
+  - name: server
+    dockerfile_path: Dockerfile
+    source_dir: /
+    http_port: 8080
+    instance_count: 1
+    # The fastembed ONNX model lives in the image (built into the
+    # /opt/flashback/fastembed-cache path during docker build). 1 GB RAM is
+    # enough at idle; bump if you switch to a larger embedding model.
+    instance_size_slug: apps-s-1vcpu-1gb
+    routes:
+      - path: /
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 30
+      period_seconds: 10
+      timeout_seconds: 5
+      failure_threshold: 6
+    envs:
+      - key: DATABASE_URL
+        value: ${db.DATABASE_URL}
+        scope: RUN_AND_BUILD_TIME
+      - key: HOST
+        value: "0.0.0.0"
+        scope: RUN_TIME
+      - key: PORT
+        value: "8080"
+        scope: RUN_TIME
+      - key: AUTO_MIGRATE
+        value: "1"
+        scope: RUN_TIME
+      - key: FLASHBACK_FASTEMBED_CACHE
+        value: /opt/flashback/fastembed-cache
+        scope: RUN_TIME
+      - key: RUST_LOG
+        value: flashback=info,tower_http=info
+        scope: RUN_TIME
+
+  # MCP wrapper. Same image as `server` — both binaries are baked in.
+  # `run_command` overrides the Dockerfile CMD to start the MCP binary.
+  - name: mcp
+    dockerfile_path: Dockerfile
+    source_dir: /
+    run_command: ./flashback-mcp
+    http_port: 8082
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-1gb
+    routes:
+      - path: /mcp
+    health_check:
+      http_path: /health
+      initial_delay_seconds: 30
+      period_seconds: 10
+      timeout_seconds: 5
+      failure_threshold: 6
+    envs:
+      - key: FLASHBACK_URL
+        value: http://${server.PRIVATE_DOMAIN}:8080
+        scope: RUN_TIME
+      - key: MCP_HOST
+        value: "0.0.0.0"
+        scope: RUN_TIME
+      - key: MCP_PORT
+        value: "8082"
+        scope: RUN_TIME
+      - key: RUST_LOG
+        value: flashback_mcp=info,tower_http=info
+        scope: RUN_TIME
+
+# Managed Postgres. The dev tier is cheapest; bump `size` for production.
+# pgvector is supported on DO managed Postgres — our migration calls
+# CREATE EXTENSION IF NOT EXISTS vector, which DO permits on managed clusters.
+databases:
+  - name: db
+    engine: PG
+    version: "16"
+    production: false
+    size: db-s-dev-database
+    num_nodes: 1

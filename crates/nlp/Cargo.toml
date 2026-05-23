@@ -1,0 +1,50 @@
+[package]
+name = "flashback-nlp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "flashback-nlp-prefetch"
+path = "src/bin/prefetch.rs"
+
+[features]
+default = []
+# OFF by default — pulls in mistralrs which is a large dep (~10-15 min cold
+# compile, +200 MB target dir). Build with `--features embedded-llm` only
+# when you actually need in-process LLM inference (DGX Spark, Mac Studio,
+# air-gapped). For the 90% case use PROVIDER=remote pointing at Ollama /
+# Anthropic / a LAN AI box — no rebuild required.
+embedded-llm = ["dep:mistralrs"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+once_cell.workspace = true
+regex.workspace = true
+uuid.workspace = true
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Use rustls-only features so we don't need the system OpenSSL toolchain.
+# fastembed's default features pull `hf-hub` + `ort` with native-tls; we swap
+# both to rustls. Keeps the build hermetic on slim docker images and lets us
+# build on hosts without libssl-dev installed.
+fastembed = { version = "5", default-features = false, features = [
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+    "image-models",
+] }
+parking_lot = "0.12"
+thiserror.workspace = true
+
+# Embedded LLM dep — heavy, optional. Pinned to 0.7.x; 0.8.x is currently
+# reported broken on crates.io. Bump deliberately, with a smoke test.
+mistralrs = { version = "0.7", optional = true }

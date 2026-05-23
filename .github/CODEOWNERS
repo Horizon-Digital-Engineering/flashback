@@ -1,0 +1,9 @@
+# Single owner for the whole repo today. Split per-path when contributors join.
+*       @lgutschow
+
+# Touching auth surface / security infra requires the same review explicitly.
+/.github/                 @lgutschow
+/SECURITY.md              @lgutschow
+/deny.toml                @lgutschow
+/migrations/              @lgutschow
+/crates/server/src/auth/  @lgutschow

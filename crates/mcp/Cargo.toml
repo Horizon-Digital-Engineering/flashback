@@ -1,0 +1,34 @@
+[package]
+name = "flashback-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "flashback-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dotenvy.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+# rmcp uses axum 0.8 internally; we match it in this crate so nest_service
+# composes correctly. (crates/server stays on axum 0.7.)
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+schemars = "1.0"
+rmcp = { version = "1.7", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+    "schemars",
+] }

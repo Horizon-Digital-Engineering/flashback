@@ -1,0 +1,39 @@
+name: Bug report
+description: Something that worked before now doesn't, or behaves wrong.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you do, and what did you expect vs. see?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: flashback version
+      description: Output of `flashback --version` or the git SHA you're running.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        `docker compose logs flashback --tail 200`, server stderr, or
+        client-side trace. Redact tokens/embeddings/PII.
+      render: shell
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - HTTP API
+        - MCP server
+        - NLP / embeddings
+        - Storage / migrations
+        - Docker / compose
+        - Other
+    validations:
+      required: true

@@ -1,0 +1,120 @@
+services:
+  db:
+    image: ankane/pgvector:latest
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: flashback
+      POSTGRES_USER: flashback
+      # Dev default. In production set POSTGRES_PASSWORD in .env (the bootstrap
+      # script does this automatically) — DATABASE_URL below uses the same var.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flashback}
+    ports:
+      # Localhost-only — internal docker network reaches db:5432 directly.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flashback"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: flashback-server
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgres://flashback:flashback@db:5432/flashback}
+      HOST: 0.0.0.0
+      PORT: 8080
+      AUTO_MIGRATE: "1"
+      FLASHBACK_FASTEMBED_CACHE: /opt/flashback/fastembed-cache
+      # DEV MODE: bypass auth, treat every request as user_id=dev.
+      # Loud warnings everywhere when on. NEVER set in production.
+      FLASHBACK_DEV_MODE: ${FLASHBACK_DEV_MODE:-0}
+      # AI provider — set PROVIDER=remote in .env and provide an API key to
+      # use Claude / GPT / etc for richer extraction. Defaults to heuristic
+      # so the stack works out-of-the-box with no API keys.
+      PROVIDER: ${PROVIDER:-heuristic}
+      PROVIDER_FALLBACK: ${PROVIDER_FALLBACK:-fail}
+      PROVIDER_REMOTE_PROVIDER: ${PROVIDER_REMOTE_PROVIDER:-openrouter}
+      PROVIDER_REMOTE_MODEL: ${PROVIDER_REMOTE_MODEL:-anthropic/claude-haiku-4-5}
+      PROVIDER_REMOTE_API_KEY: ${PROVIDER_REMOTE_API_KEY:-}
+      # Override the backend base URL — point at a local Ollama / LiteLLM /
+      # vLLM / any OpenAI-compatible endpoint. Leave empty to use the
+      # backend's official URL (api.openai.com, openrouter.ai/api/v1, …).
+      PROVIDER_REMOTE_API_BASE: ${PROVIDER_REMOTE_API_BASE:-}
+      # Per-role model tiering — see docs/MODEL-TIERING.md. Each falls back
+      # to PROVIDER_REMOTE_MODEL above (and the matching non-role-specific
+      # max_tokens / timeout) if left unset.
+      PROVIDER_REMOTE_EXTRACT_MODEL: ${PROVIDER_REMOTE_EXTRACT_MODEL:-}
+      PROVIDER_REMOTE_DISTILL_MODEL: ${PROVIDER_REMOTE_DISTILL_MODEL:-}
+      PROVIDER_REMOTE_EXTRACT_MAX_TOKENS: ${PROVIDER_REMOTE_EXTRACT_MAX_TOKENS:-}
+      PROVIDER_REMOTE_DISTILL_MAX_TOKENS: ${PROVIDER_REMOTE_DISTILL_MAX_TOKENS:-}
+      PROVIDER_REMOTE_EXTRACT_TIMEOUT_MS: ${PROVIDER_REMOTE_EXTRACT_TIMEOUT_MS:-}
+      PROVIDER_REMOTE_DISTILL_TIMEOUT_MS: ${PROVIDER_REMOTE_DISTILL_TIMEOUT_MS:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RUST_LOG: flashback=info,tower_http=debug
+    ports:
+      # Bearer-auth protected. Bind to 0.0.0.0 so it's reachable from outside
+      # the host — your TLS terminator (caddy/nginx) talks to this directly.
+      - "8080:8080"
+
+  mcp:
+    # Reuses the image built for `server` — both binaries are baked in.
+    image: flashback-server
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_started
+    environment:
+      FLASHBACK_URL: http://server:8080
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8082
+      RUST_LOG: flashback_mcp=info,tower_http=debug
+    command: ["./flashback-mcp"]
+    ports:
+      - "8082:8082"
+
+  ollama:
+    # ROCm variant ships its own ROCm userland — host needs only the amdgpu
+    # kernel module loaded (i.e. /dev/kfd present). For NVIDIA hosts, swap
+    # the image tag to `ollama/ollama:latest` and replace devices/group_add
+    # with `deploy.resources.reservations.devices` for nvidia.
+    image: ollama/ollama:rocm
+    restart: unless-stopped
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # Numeric GIDs — docker's `group_add` resolves NAMES against the
+    # container's /etc/group (which the slim ollama:rocm image lacks),
+    # so we pass the host's render/video GIDs directly. Override via
+    # .env on machines where these differ — `getent group render video`
+    # to find yours.
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-992}"
+    environment:
+      # RDNA3 cards below the RX 7900 (e.g. RX 7800 XT / 7700 XT, gfx1101)
+      # aren't on ROCm's official supported list. The override tells the
+      # runtime to treat the card as gfx1100, which works in practice.
+      # Harmless on cards that already match (RX 7900 family).
+      HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      # Loopback-only — Flashback talks to ollama:11434 over the docker
+      # network; the published port is just for `ollama` CLI / curl
+      # debugging from the host.
+      - "127.0.0.1:11434:11434"
+
+volumes:
+  pgdata:
+  ollama:
