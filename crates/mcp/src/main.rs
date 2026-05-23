@@ -174,6 +174,9 @@ pub struct StatePatchArgs {
 pub struct Flashback {
     flashback_url: Arc<String>,
     http: Client,
+    // Consumed by the #[tool_router] macro below via method dispatch the
+    // compiler can't see directly; not dead code despite what -D warnings says.
+    #[allow(dead_code)]
     tool_router: ToolRouter<Flashback>,
 }
 
