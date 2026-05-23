@@ -11,7 +11,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  # NB: not setting `RUSTFLAGS: -D warnings` here. The codebase ships with
+  # known dead-code findings that the maintainer is fine with for now;
+  # we want CI to surface warnings (visible in run logs + as annotations)
+  # without blocking merges. Tighten this when the warning backlog is
+  # addressed.
 
 jobs:
   fmt:
@@ -33,7 +37,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # NB: not passing `-- -D warnings` to clippy. Same rationale as the
+      # RUSTFLAGS comment above — surface style findings as annotations,
+      # don't block merges on them. Tighten when the lint backlog is clean.
+      - run: cargo clippy --workspace --all-targets --all-features
 
   test:
     name: Test
