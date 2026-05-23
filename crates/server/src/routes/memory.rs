@@ -203,8 +203,28 @@ async fn find_supersede_target(
     new_entities: &[String],
     new_topic: Option<&str>,
 ) -> AppResult<Option<Uuid>> {
-    // Pull recent candidates with their entities + topic (extraction->>topic).
-    let candidates: Vec<(Uuid, Vec<String>, Option<String>)> =
+    let candidates = load_supersede_candidates(state, user_id, project_id, session_id).await?;
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(id) = match_by_topic_cosine(state, &candidates, new_topic).await? {
+        return Ok(Some(id));
+    }
+
+    Ok(match_by_entity_jaccard(candidates, new_entities))
+}
+
+/// Recent unsuperseded working/episodic memories in the same session, with
+/// their entities + extracted topic — the candidate set both supersede
+/// strategies operate on.
+async fn load_supersede_candidates(
+    state: &crate::AppState,
+    user_id: &str,
+    project_id: Option<&str>,
+    session_id: &str,
+) -> AppResult<Vec<(Uuid, Vec<String>, Option<String>)>> {
+    let rows: Vec<(Uuid, Vec<String>, Option<String>)> =
         sqlx::query_as::<_, (Uuid, Vec<String>, Option<String>)>(
             r#"
             SELECT id, entities, (extraction ->> 'topic') AS topic
@@ -224,71 +244,77 @@ async fn find_supersede_target(
         .bind(project_id)
         .fetch_all(&state.pool)
         .await?;
+    Ok(rows)
+}
 
-    if candidates.is_empty() {
+/// Phase-1 supersede strategy: case-insensitive string match on extracted
+/// topic, falling back to cosine similarity (≥0.85) on topic embeddings.
+async fn match_by_topic_cosine(
+    state: &crate::AppState,
+    candidates: &[(Uuid, Vec<String>, Option<String>)],
+    new_topic: Option<&str>,
+) -> AppResult<Option<Uuid>> {
+    let Some(nt) = new_topic.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let with_topics: Vec<(Uuid, &str)> = candidates
+        .iter()
+        .filter_map(|(id, _, t)| {
+            t.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|t| (*id, t))
+        })
+        .collect();
+    if with_topics.is_empty() {
         return Ok(None);
     }
 
-    // 1. Try topic-cosine if the new turn has a topic AND any candidate does.
-    if let Some(nt) = new_topic.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let with_topics: Vec<(Uuid, &str)> = candidates
-            .iter()
-            .filter_map(|(id, _, t)| {
-                t.as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|t| (*id, t))
-            })
-            .collect();
-        if !with_topics.is_empty() {
-            // Quick string-equality short-circuit (case-insensitive).
-            let nt_low = nt.to_lowercase();
-            for (id, t) in &with_topics {
-                if t.to_lowercase() == nt_low {
-                    return Ok(Some(*id));
-                }
-            }
-            // Embed all topics in a single batch + cosine compare.
-            let mut texts: Vec<String> = vec![nt.to_string()];
-            texts.extend(with_topics.iter().map(|(_, t)| t.to_string()));
-            let embeddings = state
-                .nlp
-                .embedder()
-                .embed(texts)
-                .await
-                .map_err(|e| AppError::Internal(anyhow::anyhow!("embed topics: {e}")))?;
-
-            if embeddings.len() == with_topics.len() + 1 {
-                let new_vec = &embeddings[0];
-                let mut best: Option<(Uuid, f32)> = None;
-                for (i, (id, _)) in with_topics.iter().enumerate() {
-                    let cand_vec = &embeddings[i + 1];
-                    let sim = cosine(new_vec, cand_vec);
-                    if sim >= 0.85 && best.map(|(_, s)| sim > s).unwrap_or(true) {
-                        best = Some((*id, sim));
-                    }
-                }
-                if let Some((id, _)) = best {
-                    return Ok(Some(id));
-                }
-            }
-        }
+    // Cheap exact-match short-circuit before paying for embeddings.
+    let nt_low = nt.to_lowercase();
+    if let Some((id, _)) = with_topics.iter().find(|(_, t)| t.to_lowercase() == nt_low) {
+        return Ok(Some(*id));
     }
 
-    // 2. Fallback: entity-Jaccard (legacy Phase 2a behavior). Catches the
-    // case where heuristic provider didn't populate a topic.
+    let mut texts: Vec<String> = vec![nt.to_string()];
+    texts.extend(with_topics.iter().map(|(_, t)| t.to_string()));
+    let embeddings = state
+        .nlp
+        .embedder()
+        .embed(texts)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("embed topics: {e}")))?;
+
+    if embeddings.len() != with_topics.len() + 1 {
+        return Ok(None);
+    }
+    let new_vec = &embeddings[0];
+    let best = with_topics
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (id, _))| {
+            let sim = cosine(new_vec, &embeddings[i + 1]);
+            (sim >= 0.85).then_some((*id, sim))
+        })
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(best.map(|(id, _)| id))
+}
+
+/// Phase-2a fallback: pre-LLM entity-overlap heuristic. Used when the topic
+/// strategy returns nothing (no topic on the new turn or no topic-bearing
+/// candidates).
+fn match_by_entity_jaccard(
+    candidates: Vec<(Uuid, Vec<String>, Option<String>)>,
+    new_entities: &[String],
+) -> Option<Uuid> {
     if new_entities.is_empty() {
-        return Ok(None);
+        return None;
     }
     let entity_only: Vec<(Uuid, Vec<String>)> = candidates
         .into_iter()
         .map(|(id, ents, _)| (id, ents))
         .collect();
-    Ok(retrieval::looks_like_supersede(
-        new_entities,
-        &entity_only,
-        0.3,
-    ))
+    retrieval::looks_like_supersede(new_entities, &entity_only, 0.3)
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {

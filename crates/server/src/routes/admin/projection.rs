@@ -65,18 +65,40 @@ fn umap_refine_3d(
     items: &[GraphInput],
     seed: &HashMap<Uuid, (f32, f32, f32)>,
 ) -> HashMap<Uuid, (f32, f32, f32)> {
+    let Some((ids, embs, mut positions)) = collect_umap_inputs(items, seed) else {
+        return seed.clone();
+    };
+    let m = ids.len();
+
+    let k = std::cmp::min(15, m - 1);
+    let knn = knn_cosine(&embs, k);
+    let edges = build_simplicial_edges(&knn, m);
+
+    optimize_layout_sgd(&edges, &mut positions, m);
+
+    let mut out: HashMap<Uuid, (f32, f32, f32)> = seed.clone();
+    for (id, p) in ids.iter().zip(normalize_to_cube(&positions).iter()) {
+        out.insert(*id, (p[0], p[1], p[2]));
+    }
+    out
+}
+
+/// Filter to the embedding-bearing subset and pair each one with its PCA-seed
+/// position. Returns `None` if fewer than 4 items survive (UMAP needs a
+/// minimum to do anything useful; caller falls back to the raw seed).
+fn collect_umap_inputs<'a>(
+    items: &'a [GraphInput],
+    seed: &HashMap<Uuid, (f32, f32, f32)>,
+) -> Option<(Vec<Uuid>, Vec<&'a [f32]>, Vec<[f32; 3]>)> {
     let n = items.len();
     if n < 4 {
-        // Not enough data for UMAP to do anything useful — just return seed.
-        return seed.clone();
+        return None;
     }
-    // Collect embeddings + ids in stable order.
     let mut ids: Vec<Uuid> = Vec::with_capacity(n);
     let mut embs: Vec<&[f32]> = Vec::with_capacity(n);
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(n);
     for it in items {
         if it.embedding.is_empty() {
-            // Skip embedding-less rows from UMAP; keep their seed positions.
             continue;
         }
         ids.push(it.id);
@@ -84,20 +106,17 @@ fn umap_refine_3d(
         let p = seed.get(&it.id).copied().unwrap_or((0.0, 0.0, 0.0));
         positions.push([p.0, p.1, p.2]);
     }
-    let m = ids.len();
-    if m < 4 {
-        return seed.clone();
+    if ids.len() < 4 {
+        return None;
     }
+    Some((ids, embs, positions))
+}
 
-    // 1. Build k-NN graph on cosine distance. k=min(15, m-1).
-    let k = std::cmp::min(15, m - 1);
-    let knn = knn_cosine(&embs, k);
-
-    // 2. Fuzzy simplicial set — for each neighbor edge, compute a weight
-    //    p_ij = exp(-(d_ij - rho_i) / sigma_i). For simplicity we set
-    //    sigma_i = mean(d for neighbors of i) and rho_i = min(d) (so the
-    //    nearest neighbor gets weight ≈ 1). Then symmetrize via
-    //    p_ij ∪ p_ji = p_ij + p_ji - p_ij*p_ji.
+/// Fuzzy simplicial set construction. For each k-NN edge compute
+/// `p_ij = exp(-(d_ij - rho_i) / sigma_i)` with `rho_i = nearest-neighbor
+/// distance`, `sigma_i = mean(d_neighbors_of_i)`. Symmetrize the directed
+/// graph via the probabilistic-OR `p_ij ∪ p_ji = p_ij + p_ji - p_ij*p_ji`.
+fn build_simplicial_edges(knn: &[Vec<(usize, f32)>], m: usize) -> HashMap<(usize, usize), f32> {
     let mut edges: HashMap<(usize, usize), f32> = HashMap::new();
     for i in 0..m {
         let neighbors = &knn[i];
@@ -110,17 +129,22 @@ fn umap_refine_3d(
         for &(j, d) in neighbors {
             let w = ((-(d - rho).max(0.0) / sigma).exp()).clamp(0.0, 1.0);
             let key = if i < j { (i, j) } else { (j, i) };
-            // OR-combine when edge already exists (from the other direction).
             let combined = edges.get(&key).copied().unwrap_or(0.0);
             let merged = combined + w - combined * w;
             edges.insert(key, merged);
         }
     }
+    edges
+}
 
-    // 3. SGD over edges. Standard UMAP a/b are ~1.93 / 0.79 for min_dist=0.1;
-    //    we use slightly looser values to keep clusters visually distinct.
+/// Stochastic-gradient descent over the symmetric edge set. Attractive force
+/// pulls connected nodes together; negative sampling pushes each node away
+/// from `neg_samples` random others. Standard UMAP a/b for min_dist=0.1 are
+/// ~1.93 / 0.79; we use slightly looser values (1.8 / 0.8) to keep clusters
+/// visually distinct. Mutates `positions` in place.
+fn optimize_layout_sgd(edges: &HashMap<(usize, usize), f32>, positions: &mut [[f32; 3]], m: usize) {
     let edge_list: Vec<(usize, usize, f32)> =
-        edges.into_iter().map(|((i, j), w)| (i, j, w)).collect();
+        edges.iter().map(|((i, j), w)| (*i, *j, *w)).collect();
     let n_epochs = 200usize;
     let initial_lr = 1.0f32;
     let a = 1.8f32;
@@ -133,66 +157,99 @@ fn umap_refine_3d(
     for epoch in 0..n_epochs {
         let lr = initial_lr * (1.0 - (epoch as f32 / n_epochs as f32));
         for &(i, j, weight) in &edge_list {
-            // Attractive force.
-            let mut d2 = 0.0f32;
-            for k in 0..3 {
-                let diff = positions[i][k] - positions[j][k];
-                d2 += diff * diff;
-            }
-            // grad of cross-entropy term wrt distance² ≈ -2ab d² / (1 + a d²ᵇ)
-            let grad_coef = (-2.0 * a * b * d2.powf(b - 1.0)) / (1.0 + a * d2.powf(b));
-            for k in 0..3 {
-                let diff = positions[i][k] - positions[j][k];
-                let g = (grad_coef * diff * weight).clamp(-4.0, 4.0);
-                positions[i][k] += g * lr;
-                positions[j][k] -= g * lr;
-            }
-
-            // Negative sampling: push i away from neg_samples random others.
-            for _ in 0..neg_samples {
-                let rj = next_rand(&mut rng_state) as usize % m;
-                if rj == i {
-                    continue;
-                }
-                let mut d2 = 0.0f32;
-                for k in 0..3 {
-                    let diff = positions[i][k] - positions[rj][k];
-                    d2 += diff * diff;
-                }
-                if d2 < 1e-6 {
-                    continue;
-                }
-                let grad_coef = (2.0 * b) / ((0.001 + d2) * (1.0 + a * d2.powf(b)));
-                for k in 0..3 {
-                    let diff = positions[i][k] - positions[rj][k];
-                    let g = (grad_coef * diff).clamp(-4.0, 4.0);
-                    positions[i][k] += g * lr;
-                }
-            }
+            apply_attractive_force(positions, i, j, weight, a, b, lr);
+            apply_negative_sampling(positions, i, m, neg_samples, a, b, lr, &mut rng_state);
         }
     }
+}
 
-    // 4. Re-normalize to [-1, 1] cube so the map renderer doesn't have to
-    //    adjust camera.
+/// Attractive force: gradient of the cross-entropy term wrt distance²
+/// pulls connected nodes closer with strength proportional to edge weight.
+fn apply_attractive_force(
+    positions: &mut [[f32; 3]],
+    i: usize,
+    j: usize,
+    weight: f32,
+    a: f32,
+    b: f32,
+    lr: f32,
+) {
+    let d2 = squared_distance(&positions[i], &positions[j]);
+    let grad_coef = (-2.0 * a * b * d2.powf(b - 1.0)) / (1.0 + a * d2.powf(b));
+    for k in 0..3 {
+        let diff = positions[i][k] - positions[j][k];
+        let g = (grad_coef * diff * weight).clamp(-4.0, 4.0);
+        positions[i][k] += g * lr;
+        positions[j][k] -= g * lr;
+    }
+}
+
+/// Negative sampling: push `i` away from `neg_samples` randomly-chosen other
+/// nodes. Skip self-pairs and degenerate near-zero distances.
+fn apply_negative_sampling(
+    positions: &mut [[f32; 3]],
+    i: usize,
+    m: usize,
+    neg_samples: usize,
+    a: f32,
+    b: f32,
+    lr: f32,
+    rng_state: &mut u64,
+) {
+    for _ in 0..neg_samples {
+        let rj = next_rand(rng_state) as usize % m;
+        if rj == i {
+            continue;
+        }
+        let d2 = squared_distance(&positions[i], &positions[rj]);
+        if d2 < 1e-6 {
+            continue;
+        }
+        let grad_coef = (2.0 * b) / ((0.001 + d2) * (1.0 + a * d2.powf(b)));
+        for k in 0..3 {
+            let diff = positions[i][k] - positions[rj][k];
+            let g = (grad_coef * diff).clamp(-4.0, 4.0);
+            positions[i][k] += g * lr;
+        }
+    }
+}
+
+fn squared_distance(p: &[f32; 3], q: &[f32; 3]) -> f32 {
+    let mut s = 0.0f32;
+    for k in 0..3 {
+        let d = p[k] - q[k];
+        s += d * d;
+    }
+    s
+}
+
+/// Re-scale a 3D point cloud into the [-1, 1] cube on all axes so the map
+/// renderer doesn't have to adjust the camera. Returns a new Vec rather than
+/// mutating in place to keep the orchestrator's data flow legible.
+fn normalize_to_cube(positions: &[[f32; 3]]) -> Vec<[f32; 3]> {
     let mut mins = [f32::INFINITY; 3];
     let mut maxs = [f32::NEG_INFINITY; 3];
-    for p in &positions {
+    for p in positions {
         for k in 0..3 {
             mins[k] = mins[k].min(p[k]);
             maxs[k] = maxs[k].max(p[k]);
         }
     }
-    let mut out: HashMap<Uuid, (f32, f32, f32)> = seed.clone();
-    for (id, p) in ids.iter().zip(positions.iter()) {
-        let rx = (maxs[0] - mins[0]).max(1e-6);
-        let ry = (maxs[1] - mins[1]).max(1e-6);
-        let rz = (maxs[2] - mins[2]).max(1e-6);
-        let x = ((p[0] - mins[0]) / rx) * 2.0 - 1.0;
-        let y = ((p[1] - mins[1]) / ry) * 2.0 - 1.0;
-        let z = ((p[2] - mins[2]) / rz) * 2.0 - 1.0;
-        out.insert(*id, (x, y, z));
-    }
-    out
+    let ranges = [
+        (maxs[0] - mins[0]).max(1e-6),
+        (maxs[1] - mins[1]).max(1e-6),
+        (maxs[2] - mins[2]).max(1e-6),
+    ];
+    positions
+        .iter()
+        .map(|p| {
+            [
+                ((p[0] - mins[0]) / ranges[0]) * 2.0 - 1.0,
+                ((p[1] - mins[1]) / ranges[1]) * 2.0 - 1.0,
+                ((p[2] - mins[2]) / ranges[2]) * 2.0 - 1.0,
+            ]
+        })
+        .collect()
 }
 
 /// k-nearest neighbors by cosine DISTANCE (1 - cosine similarity). Returns
