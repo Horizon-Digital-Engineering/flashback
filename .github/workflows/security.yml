@@ -86,17 +86,11 @@ jobs:
           path: gitleaks.sarif
           if-no-files-found: ignore
 
-  cargo-audit:
-    name: Dependency audit (cargo-audit)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write  # rustsec/audit-check posts findings as check-run annotations
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+  # NB: a standalone cargo-audit (rustsec/audit-check) job lived here briefly.
+  # Removed because `cargo deny check advisories` already runs against the same
+  # RustSec advisory DB, with the ignore-list policy expressed once in
+  # deny.toml. Keeping both forced double-maintenance of the ignore list and
+  # the rustsec/audit-check action has no native ignore-list support.
 
   cargo-deny:
     name: License + supply-chain (cargo-deny)
