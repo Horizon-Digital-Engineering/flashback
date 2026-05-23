@@ -9,8 +9,6 @@ pub async fn health_check(State(state): State<AppState>) -> Json<Value> {
         .await
         .is_ok();
 
-    let embedder = state.nlp.embedder();
-
     Json(json!({
         "status": if db_ok { "ok" } else { "degraded" },
         "service": "flashback",
@@ -19,8 +17,8 @@ pub async fn health_check(State(state): State<AppState>) -> Json<Value> {
         "nlp": {
             "embedder": {
                 "loaded": true,
-                "name": embedder.model_name(),
-                "dimension": embedder.dimension(),
+                "name": state.nlp.embedder_model_name(),
+                "dimension": state.nlp.embedder_dimension(),
             },
             "extractor": {
                 "provider": state.nlp.provider_name(),

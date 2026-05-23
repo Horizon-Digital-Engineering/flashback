@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use flashback_nlp::provider::{
     EmbeddedLlmConfig, EmbeddedLlmProvider, RemoteLlmConfig, RemoteLlmProvider,
 };
@@ -197,5 +198,65 @@ pub struct Config {
     pub cache_dir: Option<std::path::PathBuf>,
 }
 
-/// Arc-shareable handle for `AppState`. Cheap to clone.
-pub type SharedNlp = Arc<Nlp>;
+/// The trait handlers depend on. `Nlp` (the production type) implements it
+/// directly; tests construct stubs that implement it without spinning up
+/// fastembed or a real provider.
+#[async_trait]
+pub trait NlpService: Send + Sync {
+    fn provider_name(&self) -> &'static str;
+    fn provider_can_distill(&self) -> bool;
+    fn embedder_model_name(&self) -> &str;
+    fn embedder_dimension(&self) -> usize;
+    async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError>;
+    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError>;
+    fn extract_entities(&self, text: &str) -> Vec<String>;
+    async fn extract_full(&self, text: &str) -> Result<Extraction, AppError>;
+    /// Forwarded to the underlying AiProvider. Heuristic-only providers
+    /// return `Err(NotConfigured)`; consolidation worker checks
+    /// `provider_can_distill()` before calling.
+    async fn distill_facts(
+        &self,
+        episodes: &[flashback_nlp::EpisodeRef],
+    ) -> Result<Vec<flashback_nlp::DistilledFact>, ProviderError>;
+}
+
+#[async_trait]
+impl NlpService for Nlp {
+    fn provider_name(&self) -> &'static str {
+        Nlp::provider_name(self)
+    }
+    fn provider_can_distill(&self) -> bool {
+        Nlp::provider_can_distill(self)
+    }
+    fn embedder_model_name(&self) -> &str {
+        self.embedder.model_name()
+    }
+    fn embedder_dimension(&self) -> usize {
+        self.embedder.dimension()
+    }
+    async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+        Nlp::embed_one(self, text).await
+    }
+    async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+        self.embedder
+            .embed(texts)
+            .await
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("embed batch: {e}")))
+    }
+    fn extract_entities(&self, text: &str) -> Vec<String> {
+        Nlp::extract_entities(self, text)
+    }
+    async fn extract_full(&self, text: &str) -> Result<Extraction, AppError> {
+        Nlp::extract_full(self, text).await
+    }
+    async fn distill_facts(
+        &self,
+        episodes: &[flashback_nlp::EpisodeRef],
+    ) -> Result<Vec<flashback_nlp::DistilledFact>, ProviderError> {
+        self.provider.distill_facts(episodes).await
+    }
+}
+
+/// Arc-shareable handle for `AppState`. Cheap to clone. Stored as a trait
+/// object so tests can inject stubs without booting fastembed.
+pub type SharedNlp = Arc<dyn NlpService>;

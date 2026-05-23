@@ -148,8 +148,8 @@ pub async fn dashboard(
         state_objects,
         tokens_active,
         provider: state.nlp.provider_name().to_string(),
-        embedder_model: state.nlp.embedder().model_name().to_string(),
-        embedder_dim: state.nlp.embedder().dimension(),
+        embedder_model: state.nlp.embedder_model_name().to_string(),
+        embedder_dim: state.nlp.embedder_dimension(),
     };
     let recent: Vec<MemoryView> = recent_rows.into_iter().map(MemoryView::from).collect();
     Ok(Html(views::dashboard(&user.user_id, stats, &recent)))

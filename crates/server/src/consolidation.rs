@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use flashback_nlp::{AiProvider, EpisodeRef};
 
-use crate::nlp::Nlp;
+use crate::nlp::NlpService;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -136,7 +136,7 @@ pub async fn run_daily(pool: &PgPool, user_id: &str) -> RunStats {
 /// Run the weekly job for a single user. Requires an AiProvider with the
 /// fact_distillation capability; falls through to a no-op (with a logged
 /// warning) when only heuristic is available.
-pub async fn run_weekly(pool: &PgPool, nlp: &Arc<Nlp>, user_id: &str) -> RunStats {
+pub async fn run_weekly(pool: &PgPool, nlp: &Arc<dyn NlpService>, user_id: &str) -> RunStats {
     let started = Instant::now();
     let run_id = open_run(pool, "weekly", "scheduled", Some(user_id)).await;
     let mut stats = RunStats {
@@ -205,7 +205,7 @@ pub async fn run_weekly(pool: &PgPool, nlp: &Arc<Nlp>, user_id: &str) -> RunStat
             })
             .collect();
 
-        let facts = match nlp.provider().distill_facts(&episodes).await {
+        let facts = match nlp.distill_facts(&episodes).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!(
@@ -501,7 +501,7 @@ pub async fn run_daily_all_users(pool: &PgPool) -> Vec<RunStats> {
     out
 }
 
-pub async fn run_weekly_all_users(pool: &PgPool, nlp: &Arc<Nlp>) -> Vec<RunStats> {
+pub async fn run_weekly_all_users(pool: &PgPool, nlp: &Arc<dyn NlpService>) -> Vec<RunStats> {
     let users = list_users(pool).await;
     let mut out = Vec::new();
     for u in users {

@@ -278,12 +278,7 @@ async fn match_by_topic_cosine(
 
     let mut texts: Vec<String> = vec![nt.to_string()];
     texts.extend(with_topics.iter().map(|(_, t)| t.to_string()));
-    let embeddings = state
-        .nlp
-        .embedder()
-        .embed(texts)
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("embed topics: {e}")))?;
+    let embeddings = state.nlp.embed_batch(texts).await?;
 
     if embeddings.len() != with_topics.len() + 1 {
         return Ok(None);
