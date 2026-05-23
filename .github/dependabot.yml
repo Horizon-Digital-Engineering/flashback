@@ -5,12 +5,18 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-    open-pull-requests-limit: 10
+    # Lowered from 10 → 5 after the first weekly batch burned ~200 Actions-min
+    # in 10 min on the fresh repo. Combined with the `major` group below this
+    # caps the worst case at ~2 PRs per ecosystem per week.
+    open-pull-requests-limit: 5
     groups:
       minor-and-patch:
         update-types:
           - "minor"
           - "patch"
+      major:
+        update-types:
+          - "major"
     labels:
       - "deps"
 
