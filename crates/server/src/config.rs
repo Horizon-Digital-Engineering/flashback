@@ -217,3 +217,275 @@ impl Config {
         url.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Env-var reads are process-global. Tests that mutate env need to be
+    // serialized against each other; pure-method tests below don't need it.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn cfg(database_url: &str, host: &str, port: u16) -> Config {
+        Config {
+            database_url: database_url.to_string(),
+            host: host.to_string(),
+            port,
+            auto_migrate: false,
+            fastembed_cache_dir: None,
+            provider: ProviderConfig {
+                kind: ProviderKind::Heuristic,
+                fallback: FallbackPolicy::Fail,
+                remote: RemoteProviderConfig {
+                    backend: "openrouter".into(),
+                    api_key: String::new(),
+                    api_base: None,
+                    prompt_cache: true,
+                    extract_model: "m".into(),
+                    extract_max_tokens: 0,
+                    extract_timeout_ms: 0,
+                    distill_model: "m".into(),
+                    distill_max_tokens: 0,
+                    distill_timeout_ms: 0,
+                },
+                embedded: EmbeddedProviderConfig {
+                    model: "m".into(),
+                    context_size: 0,
+                    max_tokens: 0,
+                },
+            },
+            dev_mode: false,
+        }
+    }
+
+    // ---- listen_addr ------------------------------------------------------
+
+    #[test]
+    fn listen_addr_joins_host_and_port() {
+        let c = cfg("postgres://x@y/z", "127.0.0.1", 8080);
+        assert_eq!(c.listen_addr(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn listen_addr_handles_ipv4_anyhost_and_named_host() {
+        assert_eq!(cfg("p", "0.0.0.0", 80).listen_addr(), "0.0.0.0:80");
+        assert_eq!(cfg("p", "::1", 9090).listen_addr(), "::1:9090");
+    }
+
+    // ---- database_url_safe ------------------------------------------------
+
+    #[test]
+    fn database_url_safe_redacts_password() {
+        let c = cfg("postgres://flashback:supersecret@localhost:5432/db", "h", 1);
+        assert_eq!(
+            c.database_url_safe(),
+            "postgres://flashback:***@localhost:5432/db"
+        );
+    }
+
+    #[test]
+    fn database_url_safe_keeps_url_without_password() {
+        // No `user:pass@` segment → URL passes through unchanged.
+        let c = cfg("postgres://localhost:5432/db", "h", 1);
+        assert_eq!(c.database_url_safe(), "postgres://localhost:5432/db");
+    }
+
+    #[test]
+    fn database_url_safe_keeps_url_with_only_username() {
+        // `user@host` (no password) is left alone — the redaction only
+        // triggers on `user:pass@`.
+        let c = cfg("postgres://alice@localhost/db", "h", 1);
+        assert_eq!(c.database_url_safe(), "postgres://alice@localhost/db");
+    }
+
+    #[test]
+    fn database_url_safe_passes_through_garbage() {
+        let c = cfg("not even a url", "h", 1);
+        assert_eq!(c.database_url_safe(), "not even a url");
+    }
+
+    // ---- dev_mode_from_env_or_args ----------------------------------------
+
+    fn clear_dev_env() {
+        // SAFETY: tests hold ENV_LOCK while mutating these.
+        unsafe { std::env::remove_var("FLASHBACK_DEV_MODE") };
+    }
+    fn set_dev_env(value: &str) {
+        unsafe { std::env::set_var("FLASHBACK_DEV_MODE", value) };
+    }
+
+    #[test]
+    fn dev_mode_unset_returns_false() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_dev_env();
+        assert!(!dev_mode_from_env_or_args());
+    }
+
+    #[test]
+    fn dev_mode_truthy_env_returns_true() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for v in ["1", "true", "TRUE", "yes"] {
+            set_dev_env(v);
+            assert!(
+                dev_mode_from_env_or_args(),
+                "value {v} should turn dev mode on"
+            );
+        }
+        clear_dev_env();
+    }
+
+    #[test]
+    fn dev_mode_falsy_env_returns_false() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for v in ["0", "false", "no", "anything-else"] {
+            set_dev_env(v);
+            assert!(
+                !dev_mode_from_env_or_args(),
+                "value {v} should leave dev mode off"
+            );
+        }
+        clear_dev_env();
+    }
+
+    // ---- ProviderConfig::from_env -----------------------------------------
+
+    /// Snapshot of every env var ProviderConfig reads, so a test can swap
+    /// the environment and restore it.
+    fn snapshot_provider_env() -> Vec<(&'static str, Option<String>)> {
+        let keys = [
+            "PROVIDER",
+            "PROVIDER_FALLBACK",
+            "PROVIDER_REMOTE_PROVIDER",
+            "PROVIDER_REMOTE_MODEL",
+            "PROVIDER_REMOTE_API_KEY",
+            "PROVIDER_REMOTE_API_BASE",
+            "PROVIDER_REMOTE_TIMEOUT_MS",
+            "PROVIDER_REMOTE_PROMPT_CACHE",
+            "PROVIDER_REMOTE_EXTRACT_MODEL",
+            "PROVIDER_REMOTE_DISTILL_MODEL",
+            "PROVIDER_REMOTE_EXTRACT_MAX_TOKENS",
+            "PROVIDER_REMOTE_DISTILL_MAX_TOKENS",
+            "PROVIDER_REMOTE_EXTRACT_TIMEOUT_MS",
+            "PROVIDER_REMOTE_DISTILL_TIMEOUT_MS",
+            "PROVIDER_EMBEDDED_MODEL",
+            "PROVIDER_EMBEDDED_CONTEXT_SIZE",
+            "PROVIDER_EMBEDDED_MAX_TOKENS",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+        ];
+        let snap: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        for k in &keys {
+            unsafe { std::env::remove_var(k) };
+        }
+        snap
+    }
+
+    fn restore_env(snap: Vec<(&'static str, Option<String>)>) {
+        for (k, v) in snap {
+            match v {
+                Some(val) => unsafe { std::env::set_var(k, val) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+    }
+
+    #[test]
+    fn provider_from_env_defaults_to_heuristic_fail() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshot_provider_env();
+        let p = ProviderConfig::from_env();
+        assert_eq!(p.kind, ProviderKind::Heuristic);
+        assert_eq!(p.fallback, FallbackPolicy::Fail);
+        assert_eq!(p.remote.backend, "openrouter");
+        assert_eq!(p.remote.api_base, None);
+        assert!(p.remote.prompt_cache); // on by default
+        restore_env(snap);
+    }
+
+    #[test]
+    fn provider_from_env_recognizes_remote_and_embedded_kinds() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshot_provider_env();
+
+        unsafe { std::env::set_var("PROVIDER", "remote") };
+        assert_eq!(ProviderConfig::from_env().kind, ProviderKind::Remote);
+
+        unsafe { std::env::set_var("PROVIDER", "embedded") };
+        assert_eq!(ProviderConfig::from_env().kind, ProviderKind::Embedded);
+
+        unsafe { std::env::set_var("PROVIDER", "garbage") };
+        assert_eq!(ProviderConfig::from_env().kind, ProviderKind::Heuristic);
+
+        restore_env(snap);
+    }
+
+    #[test]
+    fn provider_from_env_picks_up_fallback_heuristic() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshot_provider_env();
+        unsafe { std::env::set_var("PROVIDER_FALLBACK", "heuristic") };
+        assert_eq!(
+            ProviderConfig::from_env().fallback,
+            FallbackPolicy::Heuristic
+        );
+        unsafe { std::env::set_var("PROVIDER_FALLBACK", "fail") };
+        assert_eq!(ProviderConfig::from_env().fallback, FallbackPolicy::Fail);
+        restore_env(snap);
+    }
+
+    #[test]
+    fn provider_from_env_resolves_backend_specific_api_keys() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshot_provider_env();
+
+        unsafe { std::env::set_var("PROVIDER_REMOTE_PROVIDER", "anthropic") };
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "ak-anthropic") };
+        assert_eq!(ProviderConfig::from_env().remote.api_key, "ak-anthropic");
+
+        // Generic key wins over backend-specific.
+        unsafe { std::env::set_var("PROVIDER_REMOTE_API_KEY", "generic-wins") };
+        assert_eq!(ProviderConfig::from_env().remote.api_key, "generic-wins");
+
+        restore_env(snap);
+    }
+
+    #[test]
+    fn provider_from_env_per_role_model_falls_back_to_default_model() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshot_provider_env();
+
+        unsafe { std::env::set_var("PROVIDER_REMOTE_MODEL", "default-model") };
+        let p = ProviderConfig::from_env();
+        assert_eq!(p.remote.extract_model, "default-model");
+        assert_eq!(p.remote.distill_model, "default-model");
+
+        // Override only extract; distill still falls back to default.
+        unsafe { std::env::set_var("PROVIDER_REMOTE_EXTRACT_MODEL", "fast-model") };
+        let p = ProviderConfig::from_env();
+        assert_eq!(p.remote.extract_model, "fast-model");
+        assert_eq!(p.remote.distill_model, "default-model");
+
+        restore_env(snap);
+    }
+
+    #[test]
+    fn provider_from_env_prompt_cache_off_when_explicitly_falsy() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshot_provider_env();
+
+        for v in ["0", "false", "no"] {
+            unsafe { std::env::set_var("PROVIDER_REMOTE_PROMPT_CACHE", v) };
+            assert!(
+                !ProviderConfig::from_env().remote.prompt_cache,
+                "value {v} should disable prompt cache"
+            );
+        }
+        // Any other value (or unset) → cache on.
+        unsafe { std::env::set_var("PROVIDER_REMOTE_PROMPT_CACHE", "on") };
+        assert!(ProviderConfig::from_env().remote.prompt_cache);
+
+        restore_env(snap);
+    }
+}
