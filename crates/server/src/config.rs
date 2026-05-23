@@ -277,7 +277,14 @@ mod tests {
 
     #[test]
     fn database_url_safe_redacts_password() {
-        let c = cfg("postgres://flashback:supersecret@localhost:5432/db", "h", 1);
+        // The literal between `:` and `@` is the fixture being redacted;
+        // intentionally NOT a real-looking secret so Sonar's secrets:S6698
+        // scanner doesn't flag this test file.
+        let c = cfg(
+            "postgres://flashback:PLACEHOLDER_REDACT_ME@localhost:5432/db",
+            "h",
+            1,
+        );
         assert_eq!(
             c.database_url_safe(),
             "postgres://flashback:***@localhost:5432/db"
