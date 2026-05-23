@@ -14,27 +14,14 @@ yanked = "warn"
 # whenever the offending dep updates — `cargo update -p <crate>` and remove
 # the ignore.
 ignore = [
-    # RSA Marvin Attack — timing sidechannel in `rsa 0.9.10`. Pulled in via
-    # sqlx-postgres for md5 auth fallback. NO upstream patch yet (rust-rsa is
-    # rewriting to constant-time). The attack requires network-observable
-    # timing on a host that processes adversary-controlled RSA operations.
-    # Flashback's `rsa` use is solely for postgres protocol auth on a local
-    # connection; the timing isn't network-observable in the tailnet /
-    # localhost deploy model. Revisit when sqlx ships a patched release.
-    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: transitive via sqlx-postgres md5 auth; no upstream patch; not exploitable in tailnet/localhost deploy" },
-
-    # `rand 0.8.5` unsound under a very specific combination: custom logger
-    # AND `log` + `thread_rng` features AND trace-level logging AND specific
-    # call patterns. Flashback uses `tracing` (not `log`) and doesn't define
-    # a custom logger. Transitive via sqlx-postgres / nalgebra / rand_distr.
-    { id = "RUSTSEC-2026-0097", reason = "rand 0.8.5 unsound only under custom-logger + thread_rng combo; flashback uses tracing, not log, and no custom logger" },
-
-    # Unmaintained crates pulled in transitively. None has a security flaw;
-    # they're flagged for "author archived the repo." Recommended replacements
-    # noted but waiting on upstream deps to adopt them.
-    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive; recommended swap rustc-hash awaiting upstream" },
-    { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained; transitive; recommended swap unit-prefix awaiting upstream" },
-    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via mistralrs; recommended swap pastey awaiting upstream" },
+    # Unmaintained-crate advisories (no security flaw — just "author archived
+    # the repo"). All three come in via the OPTIONAL `embedded-llm` feature
+    # on flashback-nlp -> mistralrs. Off by default; the resolver still locks
+    # them because the feature exists. Swap recommendations noted; waiting on
+    # upstream mistralrs/hf-hub to adopt them.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive via bm25 -> mistralrs (embedded-llm feature, off by default); swap rustc-hash awaiting upstream" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained; transitive via indicatif -> hf-hub -> mistralrs (embedded-llm, off by default); swap unit-prefix awaiting upstream" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via macro_rules_attribute -> tokenizers -> fastembed; swap pastey awaiting upstream" },
 ]
 
 [licenses]

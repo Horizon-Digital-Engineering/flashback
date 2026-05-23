@@ -5,12 +5,16 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write  # needed to attach the SBOM to the release
+  contents: read
 
 jobs:
   sbom:
     name: Generate + attach SBOM
     runs-on: ubuntu-latest
+    # contents: write scoped to the one job that needs it (release upload).
+    # Scorecard's Token-Permissions check flags top-level write tokens.
+    permissions:
+      contents: write
     env:
       # Hoisted out of `run:` interpolation per semgrep's
       # github-actions.security.run-shell-injection rule: github.* context
