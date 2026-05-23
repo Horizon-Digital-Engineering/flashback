@@ -1,6 +1,6 @@
 # Build stage — builds the whole workspace, prefetches the embedding model,
 # and copies out the binaries we need.
-FROM rust:1.95-slim AS builder
+FROM rust:1.95-slim@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da6880141f7c0 AS builder
 
 # g++ provides libstdc++ which `onig-sys` (a transitive dep of fastembed →
 # tokenizers) wants at link time. Cheaper than dropping the onig backend.
@@ -47,7 +47,7 @@ RUN mkdir -p $FLASHBACK_FASTEMBED_CACHE \
     && ./target/release/flashback-nlp-prefetch
 
 # Runtime stage — small image with just the binaries + cached model.
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8
 
 # Match the builder's Debian version (rust:1.95-slim is Debian trixie, glibc 2.41).
 # Runtime needs libstdc++6 for `onig`'s C extension that gets dynamically linked.

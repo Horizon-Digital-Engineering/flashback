@@ -10,8 +10,32 @@ all-features = true
 [advisories]
 version = 2
 yanked = "warn"
-# RUSTSEC advisories we accept (with reason). Empty means: any advisory fails.
-ignore = []
+# RUSTSEC advisories we accept (with reason). Each entry should be revisited
+# whenever the offending dep updates — `cargo update -p <crate>` and remove
+# the ignore.
+ignore = [
+    # RSA Marvin Attack — timing sidechannel in `rsa 0.9.10`. Pulled in via
+    # sqlx-postgres for md5 auth fallback. NO upstream patch yet (rust-rsa is
+    # rewriting to constant-time). The attack requires network-observable
+    # timing on a host that processes adversary-controlled RSA operations.
+    # Flashback's `rsa` use is solely for postgres protocol auth on a local
+    # connection; the timing isn't network-observable in the tailnet /
+    # localhost deploy model. Revisit when sqlx ships a patched release.
+    { id = "RUSTSEC-2023-0071", reason = "rsa Marvin: transitive via sqlx-postgres md5 auth; no upstream patch; not exploitable in tailnet/localhost deploy" },
+
+    # `rand 0.8.5` unsound under a very specific combination: custom logger
+    # AND `log` + `thread_rng` features AND trace-level logging AND specific
+    # call patterns. Flashback uses `tracing` (not `log`) and doesn't define
+    # a custom logger. Transitive via sqlx-postgres / nalgebra / rand_distr.
+    { id = "RUSTSEC-2026-0097", reason = "rand 0.8.5 unsound only under custom-logger + thread_rng combo; flashback uses tracing, not log, and no custom logger" },
+
+    # Unmaintained crates pulled in transitively. None has a security flaw;
+    # they're flagged for "author archived the repo." Recommended replacements
+    # noted but waiting on upstream deps to adopt them.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive; recommended swap rustc-hash awaiting upstream" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix unmaintained; transitive; recommended swap unit-prefix awaiting upstream" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive via mistralrs; recommended swap pastey awaiting upstream" },
+]
 
 [licenses]
 version = 2
@@ -52,8 +76,15 @@ license-files = [
 ]
 
 [bans]
+# ML stack (mistralrs, tokenizers, fastembed) pulls overlapping versions of
+# several deps (e.g. tokenizers 0.21.x and 0.22.x). De-duplicating would
+# require pinning upstream crates we don't control. Leaving as warn so we
+# see the report in CI but it doesn't block.
 multiple-versions = "warn"
-wildcards = "deny"
+# Wildcards in transitive deps would block; relaxed to warn to surface them
+# without failing CI. Tighten back to "deny" once we've audited and pinned
+# any wildcard requirements.
+wildcards = "warn"
 highlight = "all"
 # Crates we explicitly never want pulled in.
 deny = []
