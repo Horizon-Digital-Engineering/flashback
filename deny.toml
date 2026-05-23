@@ -34,6 +34,7 @@ allow = [
     "BSL-1.0",
     "CDLA-Permissive-2.0",
     "NCSA",   # libfuzzer-sys (image → fastembed); OSI/FSF approved, MIT-equivalent
+    "BUSL-1.1",  # this project's own license; needed so cargo-deny accepts flashback's workspace crates
 ]
 confidence-threshold = 0.93
 # Per-crate license overrides — only for crates whose declared license

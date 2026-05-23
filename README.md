@@ -447,4 +447,4 @@ If the thesis resonates, watch the repo. Contributions and feedback welcome — 
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Business Source License 1.1 — see [LICENSE](LICENSE). Auto-converts to Apache 2.0 on 2030-05-23 (or 4 years after each version's first publication, whichever is earlier). Source-available; non-production use is freely permitted. Production use is permitted except for offering Flashback as a hosted/managed service that competes with one offered by the Licensor.
