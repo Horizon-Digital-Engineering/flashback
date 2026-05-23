@@ -18,6 +18,7 @@ use crate::{
     auth::AuthUser,
     error::AppResult,
     models::{MemoryRow, MemoryView},
+    nlp::NlpService,
     retrieval::{self, approx_tokens, Mode, SearchParams},
     routes::state::fetch_active_state_objects,
     AppState,
@@ -72,31 +73,42 @@ async fn assemble(
     auth_user: AuthUser,
     Json(req): Json<AssembleRequest>,
 ) -> AppResult<Json<AssembleResponse>> {
-    let user_id = auth_user.user_id;
+    Ok(Json(
+        assemble_context(&app.pool, &*app.nlp, &auth_user.user_id, req).await?,
+    ))
+}
+
+pub(crate) async fn assemble_context(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    req: AssembleRequest,
+) -> AppResult<AssembleResponse> {
     let mode = if req.query.is_some() {
         Mode::Answer
     } else {
         Mode::Manager
     };
 
-    let layer1 = render_procedural(&app.pool, &user_id, req.project_id.as_deref()).await?;
+    let layer1 = render_procedural(pool, user_id, req.project_id.as_deref()).await?;
     let layer1 = truncate_to_budget(layer1, BUDGET_PROCEDURAL);
 
     let layer2 = render_project_context(
-        &app.pool,
-        &user_id,
+        pool,
+        user_id,
         req.project_id.as_deref(),
         req.session_id.as_deref(),
     )
     .await?;
     let layer2 = truncate_to_budget(layer2, BUDGET_PROJECT);
 
-    let (layer3, layer3_query_embedding) = render_top_memories(&app, &user_id, &req, mode).await?;
+    let (layer3, layer3_query_embedding) =
+        render_top_memories(pool, nlp, user_id, &req, mode).await?;
     let layer3 = truncate_to_budget(layer3, BUDGET_MEMORIES);
 
     let layer4 = render_documents(
-        &app,
-        &user_id,
+        pool,
+        user_id,
         req.project_id.as_deref(),
         req.query.as_deref(),
         layer3_query_embedding.as_deref(),
@@ -106,7 +118,7 @@ async fn assemble(
 
     let floor = req.recent_turns_floor.unwrap_or(DEFAULT_TURN_FLOOR);
     let layer5 =
-        render_recent_conversation(&app.pool, &user_id, req.session_id.as_deref(), floor).await?;
+        render_recent_conversation(pool, user_id, req.session_id.as_deref(), floor).await?;
     let layer5 = truncate_protecting_floor(layer5, BUDGET_CONVERSATION, floor);
 
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -117,7 +129,7 @@ async fn assemble(
     counts.insert("recent_conversation".to_string(), approx_tokens(&layer5));
     let total: usize = counts.values().sum();
 
-    Ok(Json(AssembleResponse {
+    Ok(AssembleResponse {
         layers: Layers {
             procedural: layer1,
             project_context: layer2,
@@ -131,7 +143,7 @@ async fn assemble(
             Mode::Answer => "answer".to_string(),
             Mode::Manager => "manager".to_string(),
         },
-    }))
+    })
 }
 
 async fn render_procedural(
@@ -240,15 +252,16 @@ async fn render_project_context(
 }
 
 async fn render_top_memories(
-    app: &AppState,
+    pool: &PgPool,
+    nlp: &dyn NlpService,
     user_id: &str,
     req: &AssembleRequest,
     mode: Mode,
 ) -> AppResult<(String, Option<Vec<f32>>)> {
     let (embedding, entities) =
         if let Some(q) = req.query.as_deref().filter(|s| !s.trim().is_empty()) {
-            let entities = app.nlp.extract_entities(q);
-            let emb = app.nlp.embed_one(q).await?;
+            let entities = nlp.extract_entities(q);
+            let emb = nlp.embed_one(q).await?;
             (Some(emb), entities)
         } else {
             (None, Vec::new())
@@ -270,9 +283,9 @@ async fn render_top_memories(
         include_superseded: false,
     };
 
-    let scored = retrieval::search(&app.pool, params).await?;
+    let scored = retrieval::search(pool, params).await?;
     let ids: Vec<Uuid> = scored.iter().map(|s| s.view.id).collect();
-    retrieval::touch_access(&app.pool, &ids).await?;
+    retrieval::touch_access(pool, &ids).await?;
 
     if scored.is_empty() {
         return Ok((String::new(), embedding));
@@ -286,7 +299,7 @@ async fn render_top_memories(
 }
 
 async fn render_documents(
-    app: &AppState,
+    pool: &PgPool,
     user_id: &str,
     project_id: Option<&str>,
     query: Option<&str>,
@@ -306,7 +319,7 @@ async fn render_documents(
         top_k: 6,
         include_superseded: false,
     };
-    let scored = retrieval::search(&app.pool, params).await?;
+    let scored = retrieval::search(pool, params).await?;
     if scored.is_empty() {
         return Ok(String::new());
     }
@@ -402,4 +415,126 @@ fn truncate_protecting_floor(s: String, budget: usize, floor: usize) -> String {
         working = candidate;
     }
     working
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+
+    use crate::error::AppError;
+    use crate::nlp::NlpService;
+
+    struct StubNlp;
+
+    #[async_trait]
+    impl NlpService for StubNlp {
+        fn provider_name(&self) -> &'static str {
+            "stub"
+        }
+        fn provider_can_distill(&self) -> bool {
+            false
+        }
+        fn embedder_model_name(&self) -> &str {
+            "stub"
+        }
+        fn embedder_dimension(&self) -> usize {
+            384
+        }
+        async fn embed_one(&self, _: &str) -> Result<Vec<f32>, AppError> {
+            Ok(vec![0.0_f32; 384])
+        }
+        async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+            Ok((0..texts.len()).map(|_| vec![0.0_f32; 384]).collect())
+        }
+        fn extract_entities(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        async fn extract_full(&self, _: &str) -> Result<Extraction, AppError> {
+            Ok(Extraction::empty())
+        }
+        async fn distill_facts(
+            &self,
+            _: &[EpisodeRef],
+        ) -> Result<Vec<DistilledFact>, ProviderError> {
+            Err(ProviderError::NotConfigured("stub".into()))
+        }
+    }
+
+    fn req(query: Option<&str>) -> AssembleRequest {
+        AssembleRequest {
+            project_id: None,
+            session_id: None,
+            query: query.map(|s| s.to_string()),
+            token_budget: None,
+            recent_turns_floor: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn assemble_empty_db_returns_empty_layers_with_token_counts(pool: PgPool) {
+        let resp = assemble_context(&pool, &StubNlp, "alice", req(None))
+            .await
+            .unwrap();
+        assert!(resp.layers.procedural.is_empty());
+        assert!(resp.layers.project_context.is_empty());
+        assert!(resp.layers.memories.is_empty());
+        assert!(resp.layers.document_chunks.is_empty());
+        assert!(resp.layers.recent_conversation.is_empty());
+        // Even empty layers register a zero in the count map.
+        assert_eq!(resp.token_counts.len(), 5);
+        assert_eq!(resp.total_tokens, 0);
+        // No query → manager mode.
+        assert_eq!(resp.mode, "manager");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn assemble_with_query_uses_answer_mode(pool: PgPool) {
+        let resp = assemble_context(&pool, &StubNlp, "alice", req(Some("what about X?")))
+            .await
+            .unwrap();
+        assert_eq!(resp.mode, "answer");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn assemble_scopes_to_user_id(pool: PgPool) {
+        // Seed a core memory for alice via direct insert (cheap; no API).
+        sqlx::query(
+            "INSERT INTO core_memory (id, user_id, content, importance) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind("alice")
+        .bind("alice's core fact")
+        .bind(0.9_f32)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let alice = assemble_context(&pool, &StubNlp, "alice", req(None))
+            .await
+            .unwrap();
+        assert!(alice.layers.project_context.contains("alice's core fact"));
+
+        let bob = assemble_context(&pool, &StubNlp, "bob", req(None))
+            .await
+            .unwrap();
+        assert!(!bob.layers.project_context.contains("alice's core fact"));
+    }
+
+    // ---- truncate helpers (pure) ----------------------------------------
+
+    #[test]
+    fn truncate_to_budget_passes_through_when_under() {
+        let s = "hello world".to_string();
+        assert_eq!(truncate_to_budget(s.clone(), 1000), s);
+    }
+
+    #[test]
+    fn truncate_to_budget_cuts_when_over() {
+        // ~100 chars ≈ 25 tokens. Budget of 5 → should truncate.
+        let s = "x".repeat(100);
+        let out = truncate_to_budget(s, 5);
+        assert!(approx_tokens(&out) <= 5);
+    }
 }
