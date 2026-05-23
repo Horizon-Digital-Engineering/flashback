@@ -105,13 +105,8 @@ async fn assemble(
     let layer4 = truncate_to_budget(layer4, BUDGET_DOCUMENTS);
 
     let floor = req.recent_turns_floor.unwrap_or(DEFAULT_TURN_FLOOR);
-    let layer5 = render_recent_conversation(
-        &app.pool,
-        &user_id,
-        req.session_id.as_deref(),
-        floor,
-    )
-    .await?;
+    let layer5 =
+        render_recent_conversation(&app.pool, &user_id, req.session_id.as_deref(), floor).await?;
     let layer5 = truncate_protecting_floor(layer5, BUDGET_CONVERSATION, floor);
 
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -317,7 +312,11 @@ async fn render_documents(
     }
     let mut out = String::from("# Document chunks\n");
     for s in scored {
-        let label = s.view.source_path.clone().unwrap_or_else(|| "doc".to_string());
+        let label = s
+            .view
+            .source_path
+            .clone()
+            .unwrap_or_else(|| "doc".to_string());
         out.push_str(&format!("## {label}\n{}\n\n", s.view.content));
     }
     Ok(out.trim_end().to_string())

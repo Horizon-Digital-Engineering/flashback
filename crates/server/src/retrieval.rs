@@ -195,7 +195,11 @@ pub async fn search(pool: &PgPool, params: SearchParams<'_>) -> AppResult<Vec<Sc
         .map(|c| score_candidate(c, &params, weights))
         .collect();
 
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let scored = diversity_rerank(scored, params.top_k);
     Ok(scored)

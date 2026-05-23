@@ -519,8 +519,7 @@ async fn decode_resp(resp: reqwest::Response, path: &str) -> Result<Value, McpEr
     if text.is_empty() {
         return Ok(Value::Null);
     }
-    serde_json::from_str(&text)
-        .map_err(|e| internal(format!("decode response from {path}: {e}")))
+    serde_json::from_str(&text).map_err(|e| internal(format!("decode response from {path}: {e}")))
 }
 
 fn result_ok(value: Value) -> Result<CallToolResult, McpError> {

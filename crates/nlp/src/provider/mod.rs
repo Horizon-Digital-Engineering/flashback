@@ -46,11 +46,7 @@ pub trait AiProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn capabilities(&self) -> Capabilities;
 
-    async fn extract(
-        &self,
-        text: &str,
-        ctx: &ExtractContext,
-    ) -> Result<Extraction, ProviderError>;
+    async fn extract(&self, text: &str, ctx: &ExtractContext) -> Result<Extraction, ProviderError>;
 
     /// Given a cluster of related episodic memories, return one or more
     /// distilled semantic facts. Default impl returns `NotConfigured` —

@@ -16,8 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::prompt::{
-    build_distill_system_prompt, build_distill_user_prompt, build_system_prompt,
-    build_user_prompt,
+    build_distill_system_prompt, build_distill_user_prompt, build_system_prompt, build_user_prompt,
 };
 use super::{
     AiProvider, Capabilities, DistillResponse, DistilledFact, EpisodeRef, ExtractContext,
@@ -94,11 +93,14 @@ impl RemoteLlmProvider {
     }
 
     fn base_url(&self) -> &str {
-        self.config.api_base.as_deref().unwrap_or(match self.config.backend {
-            RemoteBackend::OpenRouter => "https://openrouter.ai/api/v1",
-            RemoteBackend::Anthropic => "https://api.anthropic.com",
-            RemoteBackend::OpenAI => "https://api.openai.com/v1",
-        })
+        self.config
+            .api_base
+            .as_deref()
+            .unwrap_or(match self.config.backend {
+                RemoteBackend::OpenRouter => "https://openrouter.ai/api/v1",
+                RemoteBackend::Anthropic => "https://api.anthropic.com",
+                RemoteBackend::OpenAI => "https://api.openai.com/v1",
+            })
     }
 }
 
@@ -122,11 +124,7 @@ impl AiProvider for RemoteLlmProvider {
         }
     }
 
-    async fn extract(
-        &self,
-        text: &str,
-        ctx: &ExtractContext,
-    ) -> Result<Extraction, ProviderError> {
+    async fn extract(&self, text: &str, ctx: &ExtractContext) -> Result<Extraction, ProviderError> {
         let system = build_system_prompt();
         let user = build_user_prompt(text, &ctx.recent_context);
 
@@ -136,10 +134,12 @@ impl AiProvider for RemoteLlmProvider {
 
         let raw_json = match self.config.backend {
             RemoteBackend::OpenRouter | RemoteBackend::OpenAI => {
-                self.call_openai_compatible(system, &user, model, max_tokens, timeout_ms).await?
+                self.call_openai_compatible(system, &user, model, max_tokens, timeout_ms)
+                    .await?
             }
             RemoteBackend::Anthropic => {
-                self.call_anthropic(system, &user, model, max_tokens, timeout_ms).await?
+                self.call_anthropic(system, &user, model, max_tokens, timeout_ms)
+                    .await?
             }
         };
 
@@ -164,10 +164,12 @@ impl AiProvider for RemoteLlmProvider {
 
         let raw_json = match self.config.backend {
             RemoteBackend::OpenRouter | RemoteBackend::OpenAI => {
-                self.call_openai_compatible(system, &user, model, max_tokens, timeout_ms).await?
+                self.call_openai_compatible(system, &user, model, max_tokens, timeout_ms)
+                    .await?
             }
             RemoteBackend::Anthropic => {
-                self.call_anthropic(system, &user, model, max_tokens, timeout_ms).await?
+                self.call_anthropic(system, &user, model, max_tokens, timeout_ms)
+                    .await?
             }
         };
 
@@ -206,7 +208,10 @@ impl RemoteLlmProvider {
         // OpenRouter accepts (and recommends) HTTP-Referer + X-Title for
         // attribution. Harmless on OpenAI direct.
         req = req
-            .header("HTTP-Referer", "https://github.com/Horizon-Digital-Engineering/flashback")
+            .header(
+                "HTTP-Referer",
+                "https://github.com/Horizon-Digital-Engineering/flashback",
+            )
             .header("X-Title", "flashback");
 
         let resp = req
@@ -291,7 +296,13 @@ impl RemoteLlmProvider {
         parsed
             .content
             .into_iter()
-            .filter_map(|b| if b.r#type == "text" { Some(b.text) } else { None })
+            .filter_map(|b| {
+                if b.r#type == "text" {
+                    Some(b.text)
+                } else {
+                    None
+                }
+            })
             .next()
             .ok_or_else(|| ProviderError::BadOutput("no text block in anthropic response".into()))
     }

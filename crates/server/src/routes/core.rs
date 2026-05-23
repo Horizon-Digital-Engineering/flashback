@@ -44,10 +44,7 @@ pub struct ListResponse {
     pub count: usize,
 }
 
-async fn list(
-    State(app): State<AppState>,
-    auth_user: AuthUser,
-) -> AppResult<Json<ListResponse>> {
+async fn list(State(app): State<AppState>, auth_user: AuthUser) -> AppResult<Json<ListResponse>> {
     let items: Vec<CoreMemoryRow> = sqlx::query_as::<_, CoreMemoryRow>(
         r#"SELECT id, user_id, content, importance, pinned_at, updated_at
            FROM core_memory WHERE user_id = $1
@@ -99,7 +96,8 @@ async fn get_one(
     .bind(&auth_user.user_id)
     .fetch_optional(&app.pool)
     .await?;
-    row.map(Json).ok_or_else(|| AppError::not_found(format!("core memory {id}")))
+    row.map(Json)
+        .ok_or_else(|| AppError::not_found(format!("core memory {id}")))
 }
 
 async fn update(

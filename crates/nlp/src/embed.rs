@@ -57,8 +57,7 @@ pub struct Embedder {
 impl Embedder {
     pub fn new(cfg: EmbedderConfig) -> Result<Self, EmbedError> {
         let model_name = model_name_for(&cfg.model);
-        let mut opts =
-            InitOptions::new(cfg.model).with_show_download_progress(cfg.show_progress);
+        let mut opts = InitOptions::new(cfg.model).with_show_download_progress(cfg.show_progress);
         if let Some(dir) = cfg.cache_dir {
             opts = opts.with_cache_dir(dir);
         }
@@ -69,9 +68,10 @@ impl Embedder {
         let probe = model
             .embed(vec!["probe"], None)
             .map_err(|e| EmbedError::Init(format!("probe failed: {e}")))?;
-        let dimension = probe.first().map(|v| v.len()).ok_or_else(|| {
-            EmbedError::Init("probe returned no embeddings".to_string())
-        })?;
+        let dimension = probe
+            .first()
+            .map(|v| v.len())
+            .ok_or_else(|| EmbedError::Init("probe returned no embeddings".to_string()))?;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(model)),

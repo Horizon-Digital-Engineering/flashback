@@ -66,7 +66,10 @@ impl IntoResponse for Error {
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/", get(handlers::dashboard))
-        .route("/login", get(handlers::login_form).post(handlers::login_submit))
+        .route(
+            "/login",
+            get(handlers::login_form).post(handlers::login_submit),
+        )
         .route("/logout", get(handlers::logout))
         .route("/style.css", get(handlers::style_css))
         .route("/memories", get(handlers::memories_list))

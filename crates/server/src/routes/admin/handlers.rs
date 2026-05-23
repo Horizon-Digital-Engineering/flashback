@@ -60,10 +60,7 @@ pub struct LoginForm {
     pub token: String,
 }
 
-pub async fn login_submit(
-    State(state): State<AppState>,
-    Form(form): Form<LoginForm>,
-) -> Response {
+pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
     let token = form.token.trim();
     if token.is_empty() {
         return Redirect::to("/admin/login?reason=bad-token").into_response();
@@ -87,9 +84,8 @@ pub async fn login_submit(
         return Redirect::to("/admin/login?reason=bad-token").into_response();
     }
 
-    let cookie = format!(
-        "flashback_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000"
-    );
+    let cookie =
+        format!("flashback_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000");
     (
         StatusCode::SEE_OTHER,
         [
@@ -120,10 +116,11 @@ pub async fn dashboard(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let memories_total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE user_id = $1")
-        .bind(&user.user_id)
-        .fetch_one(&state.pool)
-        .await?;
+    let memories_total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE user_id = $1")
+            .bind(&user.user_id)
+            .fetch_one(&state.pool)
+            .await?;
     let memories_terminal: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND superseded_by IS NULL",
     )
@@ -136,21 +133,14 @@ pub async fn dashboard(
     .bind(&user.user_id)
     .fetch_one(&state.pool)
     .await?;
-    let tokens_active: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tokens WHERE user_id = $1 AND revoked_at IS NULL",
-    )
-    .bind(&user.user_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let tokens_active: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE user_id = $1 AND revoked_at IS NULL")
+            .bind(&user.user_id)
+            .fetch_one(&state.pool)
+            .await?;
 
-    let recent_rows = fetch_memories(
-        &state.pool,
-        &user.user_id,
-        &MemoryQuery::default(),
-        10,
-        0,
-    )
-    .await?;
+    let recent_rows =
+        fetch_memories(&state.pool, &user.user_id, &MemoryQuery::default(), 10, 0).await?;
 
     let stats = views::DashboardStats {
         memories_total,
@@ -354,11 +344,12 @@ pub async fn memory_detail(
     .fetch_all(&state.pool)
     .await?;
 
-    let extraction: Option<Value> = sqlx::query_scalar("SELECT extraction FROM memories WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?
-        .flatten();
+    let extraction: Option<Value> =
+        sqlx::query_scalar("SELECT extraction FROM memories WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+            .flatten();
 
     let chain: Vec<MemoryView> = chain_rows.into_iter().map(MemoryView::from).collect();
     let view = MemoryView::from(row);
@@ -508,11 +499,7 @@ pub async fn map_data(
         .iter()
         .map(|r| GraphInput {
             id: r.id,
-            embedding: r
-                .embedding
-                .as_ref()
-                .map(|v| v.to_vec())
-                .unwrap_or_default(),
+            embedding: r.embedding.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
             entities: r.entities.clone(),
             session_id: r.session_id.clone(),
             supersedes: r.supersedes,
@@ -640,11 +627,7 @@ async fn compute_graph(
         .iter()
         .map(|r| GraphInput {
             id: r.id,
-            embedding: r
-                .embedding
-                .as_ref()
-                .map(|v| v.to_vec())
-                .unwrap_or_default(),
+            embedding: r.embedding.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
             entities: r.entities.clone(),
             session_id: r.session_id.clone(),
             supersedes: r.supersedes,

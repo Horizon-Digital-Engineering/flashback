@@ -69,8 +69,9 @@ pub async fn run_daily(pool: &PgPool, user_id: &str) -> RunStats {
 
     // Working memories with an expires_at in the next 6 hours OR already
     // past — promote if they look high-signal, otherwise let TTL expire.
-    let rows: Vec<(Uuid, f32, i32, Vec<String>)> = match sqlx::query_as::<_, (Uuid, f32, i32, Vec<String>)>(
-        r#"
+    let rows: Vec<(Uuid, f32, i32, Vec<String>)> =
+        match sqlx::query_as::<_, (Uuid, f32, i32, Vec<String>)>(
+            r#"
         SELECT id, importance, access_count, entities
         FROM memories
         WHERE user_id = $1
@@ -81,25 +82,24 @@ pub async fn run_daily(pool: &PgPool, user_id: &str) -> RunStats {
         ORDER BY expires_at ASC
         LIMIT 500
         "#,
-    )
-    .bind(user_id)
-    .fetch_all(pool)
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            stats.error = Some(format!("query candidates: {e}"));
-            close_run(pool, run_id, &stats, started).await;
-            return stats;
-        }
-    };
+        )
+        .bind(user_id)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                stats.error = Some(format!("query candidates: {e}"));
+                close_run(pool, run_id, &stats, started).await;
+                return stats;
+            }
+        };
 
     for (id, importance, access_count, entities) in rows {
         // Promotion rule: importance ≥ 0.6 OR (importance ≥ 0.4 AND been accessed ≥ 1)
         // OR has ≥ 2 entities (signal of "meaningful content").
-        let promote = importance >= 0.6
-            || (importance >= 0.4 && access_count >= 1)
-            || entities.len() >= 2;
+        let promote =
+            importance >= 0.6 || (importance >= 0.4 && access_count >= 1) || entities.len() >= 2;
 
         if promote {
             let result = sqlx::query(
@@ -247,10 +247,7 @@ pub async fn run_weekly(pool: &PgPool, nlp: &Arc<Nlp>, user_id: &str) -> RunStat
             });
 
             // Insert as semantic memory.
-            let project_id = cluster
-                .episodes
-                .iter()
-                .find_map(|e| e.project_id.clone());
+            let project_id = cluster.episodes.iter().find_map(|e| e.project_id.clone());
             let session_id: Option<String> = None; // semantic facts aren't session-scoped
 
             let insert = sqlx::query(
@@ -343,10 +340,7 @@ fn cluster_by_topic_and_entities(rows: &[EpisodeRow]) -> Vec<Cluster> {
     let mut clusters: Vec<Cluster> = Vec::new();
     for (topic, idxs) in by_topic {
         if idxs.len() >= 2 {
-            let episodes: Vec<EpisodeRow> = idxs
-                .iter()
-                .map(|&i| clone_row(&rows[i]))
-                .collect();
+            let episodes: Vec<EpisodeRow> = idxs.iter().map(|&i| clone_row(&rows[i])).collect();
             let shared = shared_entities(&episodes);
             clusters.push(Cluster {
                 episodes,
@@ -408,7 +402,8 @@ fn shared_entities(rows: &[EpisodeRow]) -> Vec<String> {
     }
     let mut counts: HashMap<String, usize> = HashMap::new();
     for r in rows {
-        let unique: std::collections::HashSet<&str> = r.entities.iter().map(|s| s.as_str()).collect();
+        let unique: std::collections::HashSet<&str> =
+            r.entities.iter().map(|s| s.as_str()).collect();
         for e in unique {
             *counts.entry(e.to_string()).or_insert(0) += 1;
         }
@@ -516,12 +511,10 @@ pub async fn run_weekly_all_users(pool: &PgPool, nlp: &Arc<Nlp>) -> Vec<RunStats
 }
 
 async fn list_users(pool: &PgPool) -> Vec<String> {
-    sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT user_id FROM memories ORDER BY user_id",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default()
+    sqlx::query_scalar::<_, String>("SELECT DISTINCT user_id FROM memories ORDER BY user_id")
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
 }
 
 // Avoid the unused `Utc` warning until we add scheduling timestamp fields.

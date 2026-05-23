@@ -130,11 +130,16 @@ pub struct DashboardStats {
 }
 
 pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[MemoryView]) -> String {
-    let mut recent_html = String::from(r#"<div class="card"><h2 style="margin-top:0">Recent memories</h2>"#);
+    let mut recent_html =
+        String::from(r#"<div class="card"><h2 style="margin-top:0">Recent memories</h2>"#);
     if recent.is_empty() {
-        recent_html.push_str(r#"<p class="muted">No memories yet. Ingest some via POST /memory/ingest.</p>"#);
+        recent_html.push_str(
+            r#"<p class="muted">No memories yet. Ingest some via POST /memory/ingest.</p>"#,
+        );
     } else {
-        recent_html.push_str("<table><thead><tr><th>type</th><th>content</th><th>created</th></tr></thead><tbody>");
+        recent_html.push_str(
+            "<table><thead><tr><th>type</th><th>content</th><th>created</th></tr></thead><tbody>",
+        );
         for m in recent {
             recent_html.push_str(&format!(
                 r#"<tr><td>{ty}</td><td><a href="/admin/memories/{id}"><div class="content-preview">{content}</div></a></td><td class="mono muted">{when}</td></tr>"#,
@@ -344,7 +349,9 @@ pub fn memory_detail(
             r#"<pre class="json">{}</pre>"#,
             esc(&serde_json::to_string_pretty(v).unwrap_or_default())
         ),
-        None => r#"<p class="muted">No structured extraction recorded for this memory.</p>"#.to_string(),
+        None => {
+            r#"<p class="muted">No structured extraction recorded for this memory.</p>"#.to_string()
+        }
     };
     let entities_html = if m.entities.is_empty() {
         "<span class=\"muted\">—</span>".to_string()
@@ -411,13 +418,27 @@ pub fn memory_detail(
         imp = m.importance,
         decay = esc(&m.decay_class),
         sup = if let Some(s) = m.superseded_by {
-            format!(" · superseded by <a href=\"/admin/memories/{s}\">{}</a>", short_id(s))
+            format!(
+                " · superseded by <a href=\"/admin/memories/{s}\">{}</a>",
+                short_id(s)
+            )
         } else {
             String::new()
         },
         ents = entities_html,
-        project = m.project_id.as_deref().map(|p| format!(r#"<p class="muted" style="margin-top:6px">project: <code>{}</code></p>"#, esc(p))).unwrap_or_default(),
-        session = m.session_id.as_deref().map(|s| format!(r#"<p class="muted">session: <code>{}</code></p>"#, esc(s))).unwrap_or_default(),
+        project = m
+            .project_id
+            .as_deref()
+            .map(|p| format!(
+                r#"<p class="muted" style="margin-top:6px">project: <code>{}</code></p>"#,
+                esc(p)
+            ))
+            .unwrap_or_default(),
+        session = m
+            .session_id
+            .as_deref()
+            .map(|s| format!(r#"<p class="muted">session: <code>{}</code></p>"#, esc(s)))
+            .unwrap_or_default(),
         extraction_html = extraction_html,
         state_block = state_block,
         n = chain.len(),
@@ -436,9 +457,17 @@ fn render_chain(chain: &[MemoryView], terminal_id: Option<Uuid>, current_id: Uui
     for (i, m) in chain.iter().enumerate() {
         let is_terminal = terminal_id == Some(m.id);
         let is_current = current_id == m.id;
-        let cls = if is_terminal { "chain-node terminal" } else { "chain-node" };
+        let cls = if is_terminal {
+            "chain-node terminal"
+        } else {
+            "chain-node"
+        };
         let marker = if is_current { " (this memory)" } else { "" };
-        let terminal_label = if is_terminal { r#" <span class="pill t-semantic">current</span>"# } else { "" };
+        let terminal_label = if is_terminal {
+            r#" <span class="pill t-semantic">current</span>"#
+        } else {
+            ""
+        };
         out.push_str(&format!(
             r#"<div class="{cls}">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
@@ -514,7 +543,9 @@ pub fn tokens_list(user_id: &str, tokens: &[TokenView]) -> String {
     let mut rows = String::new();
     for t in tokens {
         let status = match (t.revoked_at, t.last_used_at) {
-            (Some(_), _) => r#"<span class="pill" style="color:var(--bad)">revoked</span>"#.to_string(),
+            (Some(_), _) => {
+                r#"<span class="pill" style="color:var(--bad)">revoked</span>"#.to_string()
+            }
             (None, Some(u)) => format!(
                 r#"<span class="pill" style="color:var(--good)">active</span> <span class="muted mono">used {}</span>"#,
                 format_when(u)
@@ -621,16 +652,22 @@ pub fn consolidate_view(
         let trigger = r.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
         let started = r.get("started_at").and_then(|v| v.as_str()).unwrap_or("?");
         let finished = r.get("finished_at").and_then(|v| v.as_str()).unwrap_or("—");
-        let promoted = r.get("promoted_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let promoted = r
+            .get("promoted_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let expired = r.get("expired_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let distilled = r.get("distilled_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let user = r
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let distilled = r
+            .get("distilled_count")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let user = r.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
         let err = r.get("error").and_then(|v| v.as_str()).unwrap_or("");
         let status = if !err.is_empty() {
-            format!(r#"<span class="pill" style="color:var(--bad)">error</span> <span class="muted">{}</span>"#, esc(err))
+            format!(
+                r#"<span class="pill" style="color:var(--bad)">error</span> <span class="muted">{}</span>"#,
+                esc(err)
+            )
         } else if finished == "—" {
             r#"<span class="pill" style="color:var(--warn)">running</span>"#.to_string()
         } else {

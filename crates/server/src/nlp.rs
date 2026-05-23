@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
+use flashback_nlp::provider::{
+    EmbeddedLlmConfig, EmbeddedLlmProvider, RemoteLlmConfig, RemoteLlmProvider,
+};
 use flashback_nlp::{
     embed::EmbedderConfig, provider::RemoteBackend, AiProvider, Embedder, ExtractContext,
     Extraction, HeuristicProvider, ProviderError,
-};
-use flashback_nlp::provider::{
-    EmbeddedLlmConfig, EmbeddedLlmProvider, RemoteLlmConfig, RemoteLlmProvider,
 };
 
 use crate::config::{FallbackPolicy, ProviderConfig as SrvProviderConfig, ProviderKind};

@@ -105,8 +105,8 @@ fn umap_refine_3d(
             continue;
         }
         let rho = neighbors[0].1.max(1e-6);
-        let sigma = (neighbors.iter().map(|(_, d)| *d).sum::<f32>() / (neighbors.len() as f32))
-            .max(1e-6);
+        let sigma =
+            (neighbors.iter().map(|(_, d)| *d).sum::<f32>() / (neighbors.len() as f32)).max(1e-6);
         for &(j, d) in neighbors {
             let w = ((-(d - rho).max(0.0) / sigma).exp()).clamp(0.0, 1.0);
             let key = if i < j { (i, j) } else { (j, i) };

@@ -94,8 +94,8 @@ impl ProviderConfig {
             _ => FallbackPolicy::Fail,
         };
 
-        let backend = std::env::var("PROVIDER_REMOTE_PROVIDER")
-            .unwrap_or_else(|_| "openrouter".to_string());
+        let backend =
+            std::env::var("PROVIDER_REMOTE_PROVIDER").unwrap_or_else(|_| "openrouter".to_string());
         let model = std::env::var("PROVIDER_REMOTE_MODEL").unwrap_or_else(|_| {
             match backend.as_str() {
                 "anthropic" => "claude-haiku-4-5".to_string(),
@@ -124,10 +124,10 @@ impl ProviderConfig {
         // Per-role overrides (extract vs distill). When unset, fall back to
         // the non-role-specific values above so existing single-model
         // configs keep working unchanged.
-        let extract_model = std::env::var("PROVIDER_REMOTE_EXTRACT_MODEL")
-            .unwrap_or_else(|_| model.clone());
-        let distill_model = std::env::var("PROVIDER_REMOTE_DISTILL_MODEL")
-            .unwrap_or_else(|_| model.clone());
+        let extract_model =
+            std::env::var("PROVIDER_REMOTE_EXTRACT_MODEL").unwrap_or_else(|_| model.clone());
+        let distill_model =
+            std::env::var("PROVIDER_REMOTE_DISTILL_MODEL").unwrap_or_else(|_| model.clone());
         let extract_max_tokens = std::env::var("PROVIDER_REMOTE_EXTRACT_MAX_TOKENS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -210,12 +210,7 @@ impl Config {
             let rest = &url[start + 3..];
             if let Some(at) = rest.find('@') {
                 if let Some(colon) = rest[..at].find(':') {
-                    return format!(
-                        "{}://{}:***{}",
-                        &url[..start],
-                        &rest[..colon],
-                        &rest[at..]
-                    );
+                    return format!("{}://{}:***{}", &url[..start], &rest[..colon], &rest[at..]);
                 }
             }
         }

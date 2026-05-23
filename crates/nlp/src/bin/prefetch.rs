@@ -7,11 +7,10 @@
 //! Pin the cache via the env var `FLASHBACK_FASTEMBED_CACHE`. The runtime
 //! image must use the same path for the cache to be picked up.
 
-use flashback_nlp::{Embedder, embed::EmbedderConfig};
+use flashback_nlp::{embed::EmbedderConfig, Embedder};
 
 fn main() {
-    let cache_dir = std::env::var_os("FLASHBACK_FASTEMBED_CACHE")
-        .map(std::path::PathBuf::from);
+    let cache_dir = std::env::var_os("FLASHBACK_FASTEMBED_CACHE").map(std::path::PathBuf::from);
     let cfg = EmbedderConfig {
         show_progress: true,
         cache_dir,

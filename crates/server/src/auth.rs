@@ -41,16 +41,12 @@ where
     type Rejection = (StatusCode, Json<serde_json::Value>);
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        parts
-            .extensions
-            .get::<AuthUser>()
-            .cloned()
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({ "error": "unauthenticated" })),
-                )
-            })
+        parts.extensions.get::<AuthUser>().cloned().ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "unauthenticated" })),
+            )
+        })
     }
 }
 
@@ -82,9 +78,9 @@ pub async fn require_bearer(
         .or_else(|| extract_cookie_token(&req))
         .ok_or_else(|| unauthorized(path, "missing or malformed token"))?;
 
-    let principal = validate_token(&state.pool, &token).await.map_err(|_| {
-        unauthorized(path, "invalid or revoked token")
-    })?;
+    let principal = validate_token(&state.pool, &token)
+        .await
+        .map_err(|_| unauthorized(path, "invalid or revoked token"))?;
 
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
@@ -98,7 +94,11 @@ fn is_exempt(path: &str) -> bool {
 }
 
 fn extract_cookie_token(req: &Request<Body>) -> Option<String> {
-    let cookies = req.headers().get(axum::http::header::COOKIE)?.to_str().ok()?;
+    let cookies = req
+        .headers()
+        .get(axum::http::header::COOKIE)?
+        .to_str()
+        .ok()?;
     for kv in cookies.split(';') {
         let kv = kv.trim();
         if let Some(rest) = kv.strip_prefix("flashback_token=") {
@@ -124,11 +124,7 @@ fn unauthorized(path: &str, msg: &str) -> Response {
             .unwrap()
             .into_response();
     }
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": msg })),
-    )
-        .into_response()
+    (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
 }
 
 fn extract_bearer(req: &Request<Body>) -> Option<String> {
@@ -178,8 +174,7 @@ pub fn generate_token() -> String {
     let body: String = bytes
         .iter()
         .map(|b| {
-            const ALPHABET: &[u8] =
-                b"ABCDEFGHJKMNPQRSTUVWXYZ23456789abcdefghjkmnpqrstuvwxyz"; // O/0/I/1/l stripped
+            const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789abcdefghjkmnpqrstuvwxyz"; // O/0/I/1/l stripped
             ALPHABET[(*b as usize) % ALPHABET.len()] as char
         })
         .collect();
@@ -238,7 +233,10 @@ pub struct TokenListRow {
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-pub async fn list_tokens(pool: &PgPool, user_id: Option<&str>) -> anyhow::Result<Vec<TokenListRow>> {
+pub async fn list_tokens(
+    pool: &PgPool,
+    user_id: Option<&str>,
+) -> anyhow::Result<Vec<TokenListRow>> {
     let rows = sqlx::query_as::<_, TokenListRow>(
         r#"
         SELECT id, token_prefix, user_id, name, created_at, last_used_at, revoked_at

@@ -280,9 +280,15 @@ async fn find_supersede_target(
     if new_entities.is_empty() {
         return Ok(None);
     }
-    let entity_only: Vec<(Uuid, Vec<String>)> =
-        candidates.into_iter().map(|(id, ents, _)| (id, ents)).collect();
-    Ok(retrieval::looks_like_supersede(new_entities, &entity_only, 0.3))
+    let entity_only: Vec<(Uuid, Vec<String>)> = candidates
+        .into_iter()
+        .map(|(id, ents, _)| (id, ents))
+        .collect();
+    Ok(retrieval::looks_like_supersede(
+        new_entities,
+        &entity_only,
+        0.3,
+    ))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -396,17 +402,19 @@ async fn search(
     let top_k = req.top_k.unwrap_or(10).clamp(1, 100);
 
     // Embed query if present; extract entities for the entity_overlap term.
-    let (embedding, entities) = if let Some(q) = req.query.as_deref().filter(|s| !s.trim().is_empty()) {
-        let entities = state.nlp.extract_entities(q);
-        let emb = state.nlp.embed_one(q).await?;
-        (Some(emb), entities)
-    } else {
-        (None, Vec::new())
-    };
+    let (embedding, entities) =
+        if let Some(q) = req.query.as_deref().filter(|s| !s.trim().is_empty()) {
+            let entities = state.nlp.extract_entities(q);
+            let emb = state.nlp.embed_one(q).await?;
+            (Some(emb), entities)
+        } else {
+            (None, Vec::new())
+        };
 
     let mem_types_owned: Option<Vec<String>> = req.memory_types.clone();
-    let mem_types_borrowed: Option<Vec<&str>> =
-        mem_types_owned.as_ref().map(|v| v.iter().map(String::as_str).collect());
+    let mem_types_borrowed: Option<Vec<&str>> = mem_types_owned
+        .as_ref()
+        .map(|v| v.iter().map(String::as_str).collect());
 
     let params = SearchParams {
         user_id: &user_id,
