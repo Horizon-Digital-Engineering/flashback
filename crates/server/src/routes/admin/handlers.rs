@@ -116,43 +116,65 @@ pub async fn dashboard(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let memories_total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE user_id = $1")
-            .bind(&user.user_id)
-            .fetch_one(&state.pool)
-            .await?;
-    let memories_terminal: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND superseded_by IS NULL",
-    )
-    .bind(&user.user_id)
-    .fetch_one(&state.pool)
-    .await?;
-    let state_objects: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND type = 'state_object' AND superseded_by IS NULL",
-    )
-    .bind(&user.user_id)
-    .fetch_one(&state.pool)
-    .await?;
-    let tokens_active: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE user_id = $1 AND revoked_at IS NULL")
-            .bind(&user.user_id)
-            .fetch_one(&state.pool)
-            .await?;
-
+    let counts = dashboard_counts(&state.pool, &user.user_id).await?;
     let recent_rows =
         fetch_memories(&state.pool, &user.user_id, &MemoryQuery::default(), 10, 0).await?;
-
     let stats = views::DashboardStats {
-        memories_total,
-        memories_terminal,
-        state_objects,
-        tokens_active,
+        memories_total: counts.memories_total,
+        memories_terminal: counts.memories_terminal,
+        state_objects: counts.state_objects,
+        tokens_active: counts.tokens_active,
         provider: state.nlp.provider_name().to_string(),
         embedder_model: state.nlp.embedder_model_name().to_string(),
         embedder_dim: state.nlp.embedder_dimension(),
     };
     let recent: Vec<MemoryView> = recent_rows.into_iter().map(MemoryView::from).collect();
     Ok(Html(views::dashboard(&user.user_id, stats, &recent)))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DashboardCounts {
+    pub memories_total: i64,
+    pub memories_terminal: i64,
+    pub state_objects: i64,
+    pub tokens_active: i64,
+}
+
+/// The four `SELECT COUNT(*)` queries that feed the dashboard sidebar.
+/// Extracted so the dashboard summary is unit-testable without rendering
+/// HTML or constructing an AppState — call with a pool + user_id.
+pub(crate) async fn dashboard_counts(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+) -> Result<DashboardCounts, super::Error> {
+    let memories_total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memories WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+    let memories_terminal: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND superseded_by IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    let state_objects: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memories WHERE user_id = $1 AND type = 'state_object' AND superseded_by IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    let tokens_active: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE user_id = $1 AND revoked_at IS NULL")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(DashboardCounts {
+        memories_total,
+        memories_terminal,
+        state_objects,
+        tokens_active,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -613,15 +635,36 @@ pub async fn consolidate_trigger(
     user: AuthUser,
     Path(kind): Path<String>,
 ) -> Result<Response, super::Error> {
-    let stats = match kind.as_str() {
-        "daily" => consolidation::run_daily(&state.pool, &user.user_id).await,
-        "weekly" => consolidation::run_weekly(&state.pool, &state.nlp, &user.user_id).await,
-        _ => {
-            return Ok((StatusCode::BAD_REQUEST, "kind must be daily|weekly").into_response());
+    match run_consolidate_kind(&state.pool, &state.nlp, &user.user_id, &kind).await {
+        Ok(stats) => {
+            tracing::info!(?stats, "manual consolidation run complete");
+            Ok(Redirect::to("/admin/consolidate").into_response())
         }
-    };
-    tracing::info!(?stats, "manual consolidation run complete");
-    Ok(Redirect::to("/admin/consolidate").into_response())
+        Err(ConsolidateError::UnknownKind) => {
+            Ok((StatusCode::BAD_REQUEST, "kind must be daily|weekly").into_response())
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ConsolidateError {
+    UnknownKind,
+}
+
+/// Dispatches a manual consolidation run for the given kind. Pulled out of
+/// the handler so it's testable without the HTML redirect or AppState.
+/// Takes the Arc directly so it can forward into `run_weekly`'s signature.
+pub(crate) async fn run_consolidate_kind(
+    pool: &sqlx::PgPool,
+    nlp: &std::sync::Arc<dyn crate::nlp::NlpService>,
+    user_id: &str,
+    kind: &str,
+) -> Result<consolidation::RunStats, ConsolidateError> {
+    match kind {
+        "daily" => Ok(consolidation::run_daily(pool, user_id).await),
+        "weekly" => Ok(consolidation::run_weekly(pool, nlp, user_id).await),
+        _ => Err(ConsolidateError::UnknownKind),
+    }
 }
 
 struct MapNode {
@@ -941,5 +984,136 @@ mod tests {
         let cleaned = raw.clean();
         // Normalized to canonical "1".
         assert_eq!(cleaned.include_superseded.as_deref(), Some("1"));
+    }
+
+    // ---- dashboard_counts -----------------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn dashboard_counts_empty_db(pool: PgPool) {
+        let c = dashboard_counts(&pool, "alice").await.unwrap();
+        assert_eq!(c.memories_total, 0);
+        assert_eq!(c.memories_terminal, 0);
+        assert_eq!(c.state_objects, 0);
+        assert_eq!(c.tokens_active, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn dashboard_counts_includes_only_user_rows(pool: PgPool) {
+        insert_memory_for(&pool, "alice").await;
+        insert_memory_for(&pool, "alice").await;
+        insert_memory_for(&pool, "bob").await;
+        crate::auth::mint_token(&pool, "alice", None).await.unwrap();
+        crate::auth::mint_token(&pool, "bob", None).await.unwrap();
+
+        let alice = dashboard_counts(&pool, "alice").await.unwrap();
+        assert_eq!(alice.memories_total, 2);
+        assert_eq!(alice.memories_terminal, 2);
+        assert_eq!(alice.tokens_active, 1);
+
+        let bob = dashboard_counts(&pool, "bob").await.unwrap();
+        assert_eq!(bob.memories_total, 1);
+        assert_eq!(bob.tokens_active, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn dashboard_counts_terminal_excludes_superseded(pool: PgPool) {
+        let old = insert_memory_for(&pool, "alice").await;
+        let new = insert_memory_for(&pool, "alice").await;
+        sqlx::query("UPDATE memories SET superseded_by = $1 WHERE id = $2")
+            .bind(new)
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let c = dashboard_counts(&pool, "alice").await.unwrap();
+        assert_eq!(c.memories_total, 2);
+        assert_eq!(c.memories_terminal, 1, "superseded row should not count");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn dashboard_counts_tokens_active_excludes_revoked(pool: PgPool) {
+        let t1 = crate::auth::mint_token(&pool, "alice", None).await.unwrap();
+        crate::auth::mint_token(&pool, "alice", None).await.unwrap();
+        crate::auth::revoke_token(&pool, t1.id).await.unwrap();
+
+        let c = dashboard_counts(&pool, "alice").await.unwrap();
+        assert_eq!(c.tokens_active, 1);
+    }
+
+    // ---- run_consolidate_kind -------------------------------------------
+
+    use async_trait::async_trait;
+    use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+
+    struct StubNlp;
+
+    #[async_trait]
+    impl crate::nlp::NlpService for StubNlp {
+        fn provider_name(&self) -> &'static str {
+            "stub"
+        }
+        fn provider_can_distill(&self) -> bool {
+            false
+        }
+        fn embedder_model_name(&self) -> &str {
+            "stub"
+        }
+        fn embedder_dimension(&self) -> usize {
+            384
+        }
+        async fn embed_one(&self, _: &str) -> Result<Vec<f32>, crate::error::AppError> {
+            Ok(vec![0.0_f32; 384])
+        }
+        async fn embed_batch(
+            &self,
+            t: Vec<String>,
+        ) -> Result<Vec<Vec<f32>>, crate::error::AppError> {
+            Ok((0..t.len()).map(|_| vec![0.0_f32; 384]).collect())
+        }
+        fn extract_entities(&self, _: &str) -> Vec<String> {
+            Vec::new()
+        }
+        async fn extract_full(&self, _: &str) -> Result<Extraction, crate::error::AppError> {
+            Ok(Extraction::empty())
+        }
+        async fn distill_facts(
+            &self,
+            _: &[EpisodeRef],
+        ) -> Result<Vec<DistilledFact>, ProviderError> {
+            Err(ProviderError::NotConfigured("stub".into()))
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_consolidate_kind_daily_runs(pool: PgPool) {
+        let nlp: std::sync::Arc<dyn crate::nlp::NlpService> = std::sync::Arc::new(StubNlp);
+        let stats = run_consolidate_kind(&pool, &nlp, "alice", "daily")
+            .await
+            .unwrap();
+        // Empty DB so no promotions / expirations; just an audit row.
+        assert_eq!(stats.promoted_count, 0);
+        assert_eq!(stats.expired_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_consolidate_kind_weekly_runs(pool: PgPool) {
+        let nlp: std::sync::Arc<dyn crate::nlp::NlpService> = std::sync::Arc::new(StubNlp);
+        let stats = run_consolidate_kind(&pool, &nlp, "alice", "weekly")
+            .await
+            .unwrap();
+        // Heuristic provider can't distill — the weekly run logs a warning
+        // and reports zero distillations. The fact that this returned Ok
+        // (not the UnknownKind error) is the assertion.
+        assert_eq!(stats.distilled_count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_consolidate_kind_rejects_unknown(pool: PgPool) {
+        let nlp: std::sync::Arc<dyn crate::nlp::NlpService> = std::sync::Arc::new(StubNlp);
+        let err = run_consolidate_kind(&pool, &nlp, "alice", "monthly")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConsolidateError::UnknownKind));
     }
 }
