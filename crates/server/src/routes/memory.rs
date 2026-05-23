@@ -7,12 +7,14 @@ use chrono::{DateTime, Duration, Utc};
 use pgvector::Vector;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
     error::{AppError, AppResult},
     models::{MemoryRow, MemoryView},
+    nlp::NlpService,
     retrieval::{self, Mode, SearchParams},
     AppState,
 };
@@ -71,7 +73,19 @@ async fn ingest(
     auth_user: AuthUser,
     Json(req): Json<IngestRequest>,
 ) -> AppResult<Json<IngestResponse>> {
-    let user_id = auth_user.user_id;
+    let out = ingest_memory(&state.pool, &*state.nlp, &auth_user.user_id, req).await?;
+    Ok(Json(out))
+}
+
+/// Inner logic of the `/memory/ingest` handler. Takes the bare resources it
+/// needs (pool + NlpService) so it's directly unit-testable with a stub
+/// NLP and an `#[sqlx::test]` pool — no AppState, no axum, no fastembed.
+pub(crate) async fn ingest_memory(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    req: IngestRequest,
+) -> AppResult<IngestResponse> {
     let (content, extraction_text) = match (
         req.content.as_deref(),
         req.user_turn.as_deref(),
@@ -114,12 +128,12 @@ async fn ingest(
         x.entities = dedupe(e);
         x
     } else {
-        state.nlp.extract_full(&extraction_text).await?
+        nlp.extract_full(&extraction_text).await?
     };
     let entities = extraction.entities.clone();
     let extraction_json = serde_json::to_value(&extraction)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("serialize extraction: {e}")))?;
-    let embedding = state.nlp.embed_one(&content).await?;
+    let embedding = nlp.embed_one(&content).await?;
 
     // Supersede detection: scoped to same user + session + project, last 24h.
     // If the configured AI provider produced a `topic`, we prefer semantic
@@ -129,8 +143,9 @@ async fn ingest(
     let supersede_target = if let Some(session_id) = req.session_id.as_deref() {
         let new_topic = extraction.topic.as_deref();
         find_supersede_target(
-            &state,
-            &user_id,
+            pool,
+            nlp,
+            user_id,
             req.project_id.as_deref(),
             session_id,
             &entities,
@@ -141,7 +156,7 @@ async fn ingest(
         None
     };
 
-    let mut tx = state.pool.begin().await?;
+    let mut tx = pool.begin().await?;
 
     let new_id = Uuid::new_v4();
     let vector = Vector::from(embedding);
@@ -165,7 +180,7 @@ async fn ingest(
     .bind(vector)
     .bind(importance)
     .bind(decay_class)
-    .bind(&user_id)
+    .bind(user_id)
     .bind(&req.project_id)
     .bind(&req.session_id)
     .bind(&entities)
@@ -185,30 +200,31 @@ async fn ingest(
 
     tx.commit().await?;
 
-    Ok(Json(IngestResponse {
+    Ok(IngestResponse {
         id: new_id,
         r#type: mem_type,
         entities,
         superseded: supersede_target,
         extraction: extraction_json,
-        provider: state.nlp.provider_name().to_string(),
-    }))
+        provider: nlp.provider_name().to_string(),
+    })
 }
 
 async fn find_supersede_target(
-    state: &crate::AppState,
+    pool: &PgPool,
+    nlp: &dyn NlpService,
     user_id: &str,
     project_id: Option<&str>,
     session_id: &str,
     new_entities: &[String],
     new_topic: Option<&str>,
 ) -> AppResult<Option<Uuid>> {
-    let candidates = load_supersede_candidates(state, user_id, project_id, session_id).await?;
+    let candidates = load_supersede_candidates(pool, user_id, project_id, session_id).await?;
     if candidates.is_empty() {
         return Ok(None);
     }
 
-    if let Some(id) = match_by_topic_cosine(state, &candidates, new_topic).await? {
+    if let Some(id) = match_by_topic_cosine(nlp, &candidates, new_topic).await? {
         return Ok(Some(id));
     }
 
@@ -219,7 +235,7 @@ async fn find_supersede_target(
 /// their entities + extracted topic — the candidate set both supersede
 /// strategies operate on.
 async fn load_supersede_candidates(
-    state: &crate::AppState,
+    pool: &PgPool,
     user_id: &str,
     project_id: Option<&str>,
     session_id: &str,
@@ -242,7 +258,7 @@ async fn load_supersede_candidates(
         .bind(user_id)
         .bind(session_id)
         .bind(project_id)
-        .fetch_all(&state.pool)
+        .fetch_all(pool)
         .await?;
     Ok(rows)
 }
@@ -250,7 +266,7 @@ async fn load_supersede_candidates(
 /// Phase-1 supersede strategy: case-insensitive string match on extracted
 /// topic, falling back to cosine similarity (≥0.85) on topic embeddings.
 async fn match_by_topic_cosine(
-    state: &crate::AppState,
+    nlp: &dyn NlpService,
     candidates: &[(Uuid, Vec<String>, Option<String>)],
     new_topic: Option<&str>,
 ) -> AppResult<Option<Uuid>> {
@@ -278,7 +294,7 @@ async fn match_by_topic_cosine(
 
     let mut texts: Vec<String> = vec![nt.to_string()];
     texts.extend(with_topics.iter().map(|(_, t)| t.to_string()));
-    let embeddings = state.nlp.embed_batch(texts).await?;
+    let embeddings = nlp.embed_batch(texts).await?;
 
     if embeddings.len() != with_topics.len() + 1 {
         return Ok(None);
@@ -799,5 +815,249 @@ mod tests {
     fn dedupe_empty_input_gives_empty_output() {
         let out: Vec<String> = dedupe(vec![]);
         assert!(out.is_empty());
+    }
+
+    // ---- ingest_memory integration tests --------------------------------
+    //
+    // These exercise the full handler logic (DB writes, supersede detection,
+    // extraction wiring) using a `StubNlp` that returns canned responses.
+    // No fastembed, no AiProvider HTTP. Just pool + stub.
+
+    use async_trait::async_trait;
+    use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+
+    use crate::nlp::NlpService;
+
+    #[derive(Clone)]
+    struct StubNlp {
+        extract_result: Extraction,
+        embedding: Vec<f32>,
+    }
+
+    impl StubNlp {
+        fn new() -> Self {
+            Self {
+                extract_result: Extraction::empty(),
+                embedding: vec![0.0_f32; 384],
+            }
+        }
+
+        fn with_topic(mut self, topic: &str) -> Self {
+            self.extract_result.topic = Some(topic.to_string());
+            self
+        }
+
+        fn with_entities(mut self, ents: &[&str]) -> Self {
+            self.extract_result.entities = ents.iter().map(|s| s.to_string()).collect();
+            self
+        }
+    }
+
+    #[async_trait]
+    impl NlpService for StubNlp {
+        fn provider_name(&self) -> &'static str {
+            "stub"
+        }
+        fn provider_can_distill(&self) -> bool {
+            false
+        }
+        fn embedder_model_name(&self) -> &str {
+            "stub-embedder"
+        }
+        fn embedder_dimension(&self) -> usize {
+            384
+        }
+        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(self.embedding.clone())
+        }
+        async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+            Ok((0..texts.len()).map(|_| self.embedding.clone()).collect())
+        }
+        fn extract_entities(&self, _text: &str) -> Vec<String> {
+            Vec::new()
+        }
+        async fn extract_full(&self, _text: &str) -> Result<Extraction, AppError> {
+            Ok(self.extract_result.clone())
+        }
+        async fn distill_facts(
+            &self,
+            _episodes: &[EpisodeRef],
+        ) -> Result<Vec<DistilledFact>, ProviderError> {
+            Err(ProviderError::NotConfigured("stub never distills".into()))
+        }
+    }
+
+    fn make_req(content: Option<&str>) -> IngestRequest {
+        IngestRequest {
+            project_id: None,
+            session_id: None,
+            user_turn: None,
+            assistant_turn: None,
+            content: content.map(|s| s.to_string()),
+            r#type: None,
+            importance: None,
+            ttl_hours: None,
+            entities_override: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_memory_writes_a_row_and_returns_id(pool: PgPool) {
+        let nlp = StubNlp::new().with_entities(&["one", "two"]);
+        let req = make_req(Some("hello world"));
+
+        let resp = ingest_memory(&pool, &nlp, "alice", req).await.unwrap();
+        assert_eq!(resp.r#type, "working");
+        assert_eq!(resp.entities, vec!["one", "two"]);
+        assert_eq!(resp.provider, "stub");
+        assert!(resp.superseded.is_none());
+
+        // Row landed.
+        let (content, user_id, mem_type): (String, String, String) =
+            sqlx::query_as("SELECT content, user_id, type FROM memories WHERE id = $1")
+                .bind(resp.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(content, "hello world");
+        assert_eq!(user_id, "alice");
+        assert_eq!(mem_type, "working");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_memory_builds_content_from_turn_pair(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let mut req = make_req(None);
+        req.user_turn = Some("what is X?".into());
+        req.assistant_turn = Some("X is Y".into());
+
+        let resp = ingest_memory(&pool, &nlp, "alice", req).await.unwrap();
+
+        let content: String = sqlx::query_scalar("SELECT content FROM memories WHERE id = $1")
+            .bind(resp.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(content.contains("User: what is X?"));
+        assert!(content.contains("Assistant: X is Y"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_memory_rejects_empty_request(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let req = make_req(None); // no content, no turns
+        let err = ingest_memory(&pool, &nlp, "alice", req).await.unwrap_err();
+        // Should be a 400-class error; just confirm it's an error path.
+        let _ = err;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_memory_rejects_unknown_type(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let mut req = make_req(Some("hi"));
+        req.r#type = Some("not_a_real_type".into());
+        let err = ingest_memory(&pool, &nlp, "alice", req).await.unwrap_err();
+        let _ = err;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_memory_clamps_importance_to_unit_range(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let mut req = make_req(Some("over"));
+        req.importance = Some(5.0); // over 1.0
+        let resp = ingest_memory(&pool, &nlp, "alice", req).await.unwrap();
+        let imp: f32 = sqlx::query_scalar("SELECT importance FROM memories WHERE id = $1")
+            .bind(resp.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!((imp - 1.0).abs() < 1e-6);
+
+        let mut req2 = make_req(Some("under"));
+        req2.importance = Some(-3.0);
+        let resp2 = ingest_memory(&pool, &nlp, "alice", req2).await.unwrap();
+        let imp2: f32 = sqlx::query_scalar("SELECT importance FROM memories WHERE id = $1")
+            .bind(resp2.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(imp2.abs() < 1e-6);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_memory_working_type_gets_default_ttl(pool: PgPool) {
+        let nlp = StubNlp::new();
+        let req = make_req(Some("ephemeral"));
+        let resp = ingest_memory(&pool, &nlp, "alice", req).await.unwrap();
+
+        let expires_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT expires_at FROM memories WHERE id = $1")
+                .bind(resp.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let expires = expires_at.expect("working memory should have expires_at default");
+        // Should be ~48h in the future. Allow 5-min slack.
+        let now = chrono::Utc::now();
+        let target = now + chrono::Duration::hours(48);
+        let drift = (expires - target).num_minutes().abs();
+        assert!(drift < 5, "expires_at drift was {drift} minutes");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_memory_entities_override_skips_nlp_extract(pool: PgPool) {
+        // StubNlp would return [] from extract; override forces a different set.
+        let nlp = StubNlp::new().with_entities(&["from_stub"]);
+        let mut req = make_req(Some("text"));
+        req.entities_override = Some(vec!["forced_a".into(), "forced_b".into()]);
+
+        let resp = ingest_memory(&pool, &nlp, "alice", req).await.unwrap();
+        assert_eq!(resp.entities, vec!["forced_a", "forced_b"]);
+        // DB confirms.
+        let stored: Vec<String> = sqlx::query_scalar("SELECT entities FROM memories WHERE id = $1")
+            .bind(resp.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, vec!["forced_a", "forced_b"]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn ingest_memory_supersede_detection_runs_only_with_session_id(pool: PgPool) {
+        let nlp = StubNlp::new().with_entities(&["topic-x"]);
+
+        // Insert an existing candidate in the same session with overlapping entities.
+        let old_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO memories
+               (id, type, content, embedding, importance, decay_class, user_id,
+                session_id, entities, extraction)
+               VALUES ($1, 'episodic', 'old content', $2, 0.5, 'medium',
+                       'alice', 'sess-a', ARRAY['topic-x', 'topic-y'], '{}'::jsonb)"#,
+        )
+        .bind(old_id)
+        .bind(pgvector::Vector::from(vec![0.0_f32; 384]))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Without session_id → no supersede detection runs.
+        let no_sess = ingest_memory(&pool, &nlp, "alice", make_req(Some("new1")))
+            .await
+            .unwrap();
+        assert!(no_sess.superseded.is_none());
+
+        // With session_id matching the candidate → supersede detection fires.
+        let mut req = make_req(Some("new2"));
+        req.session_id = Some("sess-a".into());
+        let with_sess = ingest_memory(&pool, &nlp, "alice", req).await.unwrap();
+        // Single-entity overlap = jaccard 1/2 = 0.5 ≥ 0.3 threshold, so supersede fires.
+        assert_eq!(with_sess.superseded, Some(old_id));
     }
 }
