@@ -16,7 +16,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use rand::RngCore;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -33,7 +32,6 @@ pub struct AuthUser {
     pub token_id: uuid::Uuid,
 }
 
-#[axum::async_trait]
 impl<S> FromRequestParts<S> for AuthUser
 where
     S: Send + Sync,
@@ -169,8 +167,7 @@ pub fn sha256_hex(s: &str) -> String {
 /// Generate a new token plaintext. Caller is responsible for ensuring it is
 /// never logged, never persisted, and printed exactly once.
 pub fn generate_token() -> String {
-    let mut bytes = [0u8; 24]; // 24 bytes → 32 chars base32 alphabet (close enough)
-    rand::thread_rng().fill_bytes(&mut bytes);
+    let bytes: [u8; 24] = rand::random(); // 24 bytes → 32 chars base32 alphabet (close enough)
     let body: String = bytes
         .iter()
         .map(|b| {
