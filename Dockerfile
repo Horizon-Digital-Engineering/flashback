@@ -65,5 +65,13 @@ COPY --from=builder /app/target/release/flashback-mcp   ./flashback-mcp
 COPY --from=builder /opt/flashback/fastembed-cache      /opt/flashback/fastembed-cache
 COPY migrations ./migrations
 
+# Run as a non-root user. Limits blast radius if the binary is exploited
+# (semgrep dockerfile.security.missing-user). Port 8080 is non-privileged so
+# the unprivileged user can bind it.
+RUN groupadd --system flashback \
+    && useradd --system --gid flashback --home-dir /app --shell /usr/sbin/nologin flashback \
+    && chown -R flashback:flashback /app /opt/flashback
+USER flashback
+
 EXPOSE 8080
 CMD ["./flashback"]
