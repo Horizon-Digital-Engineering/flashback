@@ -1,0 +1,39 @@
+name: CodeQL
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    # Weekly Sunday 06:17 UTC — catches new query updates against unchanged code.
+    - cron: '17 6 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (rust)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload SARIF to Code Scanning
+      packages: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@84498526a009a99c875e83ef4821a8ba52de7c22 # codeql-bundle-v2.25.5
+        with:
+          languages: rust
+          # security-extended adds a handful of higher-noise rules; flip on
+          # once we've baselined the default ruleset.
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@84498526a009a99c875e83ef4821a8ba52de7c22 # codeql-bundle-v2.25.5
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@84498526a009a99c875e83ef4821a8ba52de7c22 # codeql-bundle-v2.25.5
+        with:
+          category: "/language:rust"

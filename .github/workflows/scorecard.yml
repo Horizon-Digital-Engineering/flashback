@@ -1,0 +1,44 @@
+name: OpenSSF Scorecard
+on:
+  # Recomputes on protection rule changes (so a tightened ruleset bumps the score).
+  branch_protection_rule:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * 0'  # weekly Sunday 06:17 UTC
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload SARIF to Code Scanning
+      id-token: write          # publish results signed via OIDC
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@99c09fe975337306107572b4fdf4db224cf8e2f2 # v2.4.3
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publishes the score publicly at https://api.securityscorecards.dev/projects/github.com/Horizon-Digital-Engineering/flashback
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scorecard-results
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to Code Scanning
+        uses: github/codeql-action/upload-sarif@84498526a009a99c875e83ef4821a8ba52de7c22 # codeql-bundle-v2.25.5
+        with:
+          sarif_file: results.sarif

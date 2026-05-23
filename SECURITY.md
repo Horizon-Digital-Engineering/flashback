@@ -52,9 +52,12 @@ What runs on every push / PR:
   - `actionlint` workflow lint
   - `trufflehog --only-verified` against full git history
   - `gitleaks detect` against full git history (SARIF uploaded as artifact)
+  - `actions/dependency-review-action` on PRs — blocks merges that introduce high-severity vulns or licenses outside the allowlist
   - `rustsec/audit-check` (cargo-audit) on Cargo.lock
   - `cargo deny check` (licenses + sources + advisories + bans) per `deny.toml`
   - `semgrep --config auto --error` (pinned image tag)
+- **CodeQL** (`.github/workflows/codeql.yml`) — GitHub's first-party SAST; runs `security-and-quality` query suite for Rust on every push, PR, and weekly schedule. Findings appear in the repo's Code Scanning tab.
+- **OpenSSF Scorecard** (`.github/workflows/scorecard.yml`) — runs weekly + on branch-protection-rule changes; publishes a public posture score at `https://api.securityscorecards.dev/projects/github.com/Horizon-Digital-Engineering/flashback` and uploads SARIF to Code Scanning.
 - **SBOM** (`.github/workflows/sbom.yml`) — on every published release, generates CycloneDX + SPDX SBOMs via `anchore/sbom-action` (syft) and attaches them to the release.
 - **Dependabot** — weekly grouped cargo + github-actions + docker update PRs.
 
@@ -62,6 +65,8 @@ What's enabled at the GitHub repo level:
 
 - Dependabot vulnerability alerts: **on**
 - Dependabot automated security updates: **on**
+- GitHub-native secret scanning: **on**
+- Secret-scanning push protection: **on** (server-side; blocks pushes containing detected secrets before they land)
 - All GitHub Actions pinned to commit SHAs with trailing `# vX.Y.Z` comment.
 - `CODEOWNERS` routes review on security-sensitive paths (`/.github/`, `/SECURITY.md`, `/deny.toml`, `/migrations/`, `/crates/server/src/auth/`).
 
@@ -69,18 +74,13 @@ Local pre-push convenience:
 
 - `./scripts/scan-secrets.sh` — runs `gitleaks` against the working tree (install gitleaks first). Optional pre-commit hook: `ln -s ../../scripts/scan-secrets.sh .git/hooks/pre-commit`.
 
-## Deferred until repo goes public
+## Manual follow-ups (not auto-configurable)
 
-These rely on GitHub Advanced Security (GHAS) or only meaningfully apply to
-public repos; intentionally not configured today. Re-evaluate at the
-public-flip:
+These need a click in the GitHub UI or an additional setup step:
 
-- **CodeQL code scanning** — free on public, GHAS-only on private.
-- **OpenSSF Scorecard** — publishes results publicly; not useful on private.
-- **`actions/dependency-review-action`** on PRs — requires Dependency Graph API, GHAS-only on private.
-- **Secret scanning + push protection** — GitHub-native; GHAS-only on private.
-- **Branch protection rules** on `main` — `gh api .../branches/main/protection` requires Pro on private repos. Until then treat as social-contract enforced.
-- **Private vulnerability reporting** — org-level toggle; not configured.
+- **Custom secret-scanning patterns** (`secret_scanning_non_provider_patterns`) and **validity checks** (`secret_scanning_validity_checks`) — extra GHAS-style features that require explicit enablement at the org level on Horizon-Digital-Engineering. Basic provider-pattern scanning is already on.
+- **Private vulnerability reporting** — org-level toggle in Settings → Code security on `Horizon-Digital-Engineering`. Lets external researchers privately disclose findings.
+- **Branch protection rules on `main`** — currently none. Solo dev; add later if/when contributors join (require PR + status checks).
 
 ## Reporting
 
