@@ -47,7 +47,7 @@ RUN mkdir -p $FLASHBACK_FASTEMBED_CACHE \
     && ./target/release/flashback-nlp-prefetch
 
 # Runtime stage — small image with just the binaries + cached model.
-FROM debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8
+FROM debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
 
 # Match the builder's Debian version (rust:1.95-slim is Debian trixie, glibc 2.41).
 # Runtime needs libstdc++6 for `onig`'s C extension that gets dynamically linked.
