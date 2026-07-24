@@ -43,6 +43,7 @@ const COLS_R: &str = "r.id, r.type, r.content, r.content_hash, r.event_time, r.i
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/", post(ingest))
+        .route("/import", post(import_records))
         .route("/query", post(query_records))
         .route("/context", post(assemble))
         .route("/:id", get(get_record))
@@ -198,6 +199,128 @@ pub(crate) async fn ingest_record(
     }
 
     Ok(IngestRecordResponse { id })
+}
+
+// ---------------------------------------------------------------------------
+// Bulk import (backdated, idempotent) — the door for a corpus of past
+// conversations. Records with a stable `source_ref` dedup on re-import.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ImportRecord {
+    pub r#type: String,
+    pub content: String,
+    #[serde(default)]
+    pub event_time: Option<DateTime<Utc>>,
+    pub source: String,
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub importance: Option<f32>,
+    #[serde(default)]
+    pub payload: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImportRequest {
+    pub records: Vec<ImportRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportResponse {
+    pub imported: usize,
+    pub skipped: usize,
+}
+
+async fn import_records(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(req): Json<ImportRequest>,
+) -> AppResult<Json<ImportResponse>> {
+    Ok(Json(
+        import_records_inner(&state.pool, &*state.nlp, &auth_user.user_id, req).await?,
+    ))
+}
+
+/// Bulk insert with per-row dedup on (user_id, source, source_ref). Invalid /
+/// empty rows are skipped, not fatal. Embeddings are batch-computed after commit.
+/// Clients chunk large corpora into batches (e.g. a few hundred records/call).
+pub(crate) async fn import_records_inner(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    req: ImportRequest,
+) -> AppResult<ImportResponse> {
+    let total = req.records.len();
+    let mut inserted: Vec<(Uuid, String)> = Vec::new();
+
+    let mut tx = pool.begin().await?;
+    for r in req.records {
+        if validate_type(&r.r#type).is_err() || r.content.trim().is_empty() {
+            continue;
+        }
+        let id = Uuid::new_v4();
+        let event_time = r.event_time.unwrap_or_else(Utc::now);
+        let importance = r.importance.map(|i| i.clamp(0.0, 1.0));
+        let new_id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO raw_records
+                (id, type, content, event_time, source, source_ref,
+                 user_id, project_id, session_id, mode, importance, payload)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            ON CONFLICT (user_id, source, source_ref) WHERE source_ref IS NOT NULL
+            DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(id)
+        .bind(&r.r#type)
+        .bind(&r.content)
+        .bind(event_time)
+        .bind(&r.source)
+        .bind(&r.source_ref)
+        .bind(user_id)
+        .bind(&r.project_id)
+        .bind(&r.session_id)
+        .bind(&r.mode)
+        .bind(importance)
+        .bind(&r.payload)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(nid) = new_id {
+            inserted.push((nid, r.content));
+        }
+    }
+    tx.commit().await?;
+
+    // Batch-embed the freshly imported rows (best-effort; a backfill can retry).
+    if !inserted.is_empty() {
+        let contents: Vec<String> = inserted.iter().map(|(_, c)| c.clone()).collect();
+        if let Ok(embs) = nlp.embed_batch(contents).await {
+            if embs.len() == inserted.len() {
+                let model = nlp.embedder_model_name().to_string();
+                for ((rid, _), emb) in inserted.iter().zip(embs) {
+                    let _ = sqlx::query(
+                        "INSERT INTO raw_embeddings (record_id, model, embedding) \
+                         VALUES ($1, $2, $3) ON CONFLICT (record_id, model) DO NOTHING",
+                    )
+                    .bind(rid)
+                    .bind(&model)
+                    .bind(Vector::from(emb))
+                    .execute(pool)
+                    .await;
+                }
+            }
+        }
+    }
+
+    Ok(ImportResponse { imported: inserted.len(), skipped: total - inserted.len() })
 }
 
 // ---------------------------------------------------------------------------
@@ -577,5 +700,51 @@ mod tests {
         assert_eq!(query_records_inner(&pool, "bob", q()).await.unwrap().len(), 1);
         let leslies = query_records_inner(&pool, "leslie", q()).await.unwrap()[0].id;
         assert!(get_record_inner(&pool, "bob", leslies).await.is_err());
+    }
+
+    fn imp(content: &str, source_ref: Option<&str>) -> ImportRecord {
+        ImportRecord {
+            r#type: "episodic".into(),
+            content: content.into(),
+            event_time: None,
+            source: "chatgpt".into(),
+            source_ref: source_ref.map(|s| s.into()),
+            project_id: None, session_id: None, mode: None,
+            importance: None, payload: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn import_bulk_then_dedup_on_reimport(pool: PgPool) {
+        let batch = ImportRequest { records: vec![imp("chat one", Some("m1")), imp("chat two", Some("m2"))] };
+        let out = import_records_inner(&pool, &StubNlp, "leslie", batch).await.unwrap();
+        assert_eq!((out.imported, out.skipped), (2, 0));
+
+        // Re-import the same source_refs -> all deduped, nothing duplicated.
+        let batch2 = ImportRequest { records: vec![imp("chat one", Some("m1")), imp("chat two edited", Some("m2"))] };
+        let out2 = import_records_inner(&pool, &StubNlp, "leslie", batch2).await.unwrap();
+        assert_eq!((out2.imported, out2.skipped), (0, 2));
+        assert_eq!(query_records_inner(&pool, "leslie", q()).await.unwrap().len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn import_without_source_ref_always_inserts(pool: PgPool) {
+        let b1 = ImportRequest { records: vec![imp("ok", None)] };
+        let b2 = ImportRequest { records: vec![imp("ok", None)] };
+        assert_eq!(import_records_inner(&pool, &StubNlp, "leslie", b1).await.unwrap().imported, 1);
+        assert_eq!(import_records_inner(&pool, &StubNlp, "leslie", b2).await.unwrap().imported, 1);
+        assert_eq!(query_records_inner(&pool, "leslie", q()).await.unwrap().len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn imported_records_are_embedded_and_searchable(pool: PgPool) {
+        let batch = ImportRequest { records: vec![imp("discussed lisinopril", Some("x1"))] };
+        assert_eq!(import_records_inner(&pool, &StubNlp, "leslie", batch).await.unwrap().imported, 1);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_embeddings").fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
+        let ctx = assemble_inner(&pool, &StubNlp, "leslie", AssembleRequest {
+            project_id: None, session_id: None, mode: None, query: Some("lisinopril".into()), limit: None,
+        }).await.unwrap();
+        assert_eq!(ctx.records.len(), 1);
     }
 }
