@@ -190,6 +190,8 @@ pub struct MemoryQuery {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
     pub include_superseded: Option<String>,
 }
 
@@ -205,6 +207,7 @@ impl MemoryQuery {
             r#type: self.r#type.as_ref().and_then(empty_to_none),
             project_id: self.project_id.as_ref().and_then(empty_to_none),
             session_id: self.session_id.as_ref().and_then(empty_to_none),
+            mode: self.mode.as_ref().and_then(empty_to_none),
             include_superseded: if self.include_super() {
                 Some("1".to_string())
             } else {
@@ -233,15 +236,23 @@ pub async fn memories_list(
     let total = count_memories(&state.pool, &user.user_id, &q).await?;
     let memories: Vec<MemoryView> = rows.into_iter().map(MemoryView::from).collect();
 
+    // The user's registers, for the mode-filter dropdown.
+    let mode_names: Vec<String> = crate::modes::list_modes(&state.pool, &user.user_id)
+        .await
+        .map(|ms| ms.into_iter().map(|m| m.name).collect())
+        .unwrap_or_default();
+
     let filter = views::MemoriesFilter {
         r#type: q.r#type.clone(),
         project_id: q.project_id.clone(),
         session_id: q.session_id.clone(),
+        mode: q.mode.clone(),
         include_superseded: q.include_super(),
     };
     Ok(Html(views::memories_list(
         &user.user_id,
         &filter,
+        &mode_names,
         &memories,
         total,
     )))
@@ -256,17 +267,21 @@ async fn fetch_memories(
 ) -> Result<Vec<MemoryRow>, sqlx::Error> {
     sqlx::query_as::<_, MemoryRow>(
         r#"
-        SELECT id, type, content, embedding, importance, access_count, decay_class,
-               user_id, project_id, session_id, entities, superseded_by, supersedes,
-               source_path, chunk_index, content_hash, state_kind, state_key, state_data,
-               expires_at, created_at, updated_at, last_accessed_at
-        FROM memories
-        WHERE user_id = $1
-          AND ($2::TEXT IS NULL OR type = $2)
-          AND ($3::TEXT IS NULL OR project_id = $3)
-          AND ($4::TEXT IS NULL OR session_id = $4)
-          AND ($5::BOOLEAN OR superseded_by IS NULL)
-        ORDER BY created_at DESC
+        SELECT m.id, m.type, m.content, m.embedding, m.importance, m.access_count, m.decay_class,
+               m.user_id, m.project_id, m.session_id, m.entities, m.superseded_by, m.supersedes,
+               m.source_path, m.chunk_index, m.content_hash, m.state_kind, m.state_key, m.state_data,
+               m.expires_at, m.created_at, m.updated_at, m.last_accessed_at
+        FROM memories m
+        WHERE m.user_id = $1
+          AND ($2::TEXT IS NULL OR m.type = $2)
+          AND ($3::TEXT IS NULL OR m.project_id = $3)
+          AND ($4::TEXT IS NULL OR m.session_id = $4)
+          AND ($5::BOOLEAN OR m.superseded_by IS NULL)
+          AND ($8::TEXT IS NULL OR EXISTS (
+              SELECT 1 FROM raw_records rr
+              WHERE rr.user_id = m.user_id AND rr.content = m.content AND rr.mode = $8
+          ))
+        ORDER BY m.created_at DESC
         LIMIT $6 OFFSET $7
         "#,
     )
@@ -277,6 +292,7 @@ async fn fetch_memories(
     .bind(q.include_super())
     .bind(limit)
     .bind(offset)
+    .bind(&q.mode)
     .fetch_all(pool)
     .await
 }
@@ -288,12 +304,16 @@ async fn count_memories(
 ) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
         r#"
-        SELECT COUNT(*) FROM memories
-        WHERE user_id = $1
-          AND ($2::TEXT IS NULL OR type = $2)
-          AND ($3::TEXT IS NULL OR project_id = $3)
-          AND ($4::TEXT IS NULL OR session_id = $4)
-          AND ($5::BOOLEAN OR superseded_by IS NULL)
+        SELECT COUNT(*) FROM memories m
+        WHERE m.user_id = $1
+          AND ($2::TEXT IS NULL OR m.type = $2)
+          AND ($3::TEXT IS NULL OR m.project_id = $3)
+          AND ($4::TEXT IS NULL OR m.session_id = $4)
+          AND ($5::BOOLEAN OR m.superseded_by IS NULL)
+          AND ($6::TEXT IS NULL OR EXISTS (
+              SELECT 1 FROM raw_records rr
+              WHERE rr.user_id = m.user_id AND rr.content = m.content AND rr.mode = $6
+          ))
         "#,
     )
     .bind(user_id)
@@ -301,6 +321,7 @@ async fn count_memories(
     .bind(&q.project_id)
     .bind(&q.session_id)
     .bind(q.include_super())
+    .bind(&q.mode)
     .fetch_one(pool)
     .await
 }
@@ -871,7 +892,7 @@ fn node_label(r: &MemoryRow) -> String {
     }
     // We don't deserialize the full extraction here for cost reasons; just
     // pull the topic via a quick JSON string lookup.
-    // (For now we rely on entities — Phase 2d will use the topic column.)
+    // (For now we rely on entities — the topic column can be used later.)
     if let Some(first_entity) = r.entities.iter().find(|e| e.contains(' ')) {
         return first_entity.clone();
     }
@@ -1078,6 +1099,7 @@ mod tests {
             r#type: Some("  ".to_string()),
             project_id: Some("real-project".to_string()),
             session_id: Some("".to_string()),
+            mode: None,
             include_superseded: Some("0".to_string()),
         };
         let cleaned = raw.clean();

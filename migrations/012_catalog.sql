@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS catalog_stores (
     -- How the lake reaches the store's data:
     --   {interface:'internal'|'http'|'sql', url?, auth_ref?}
     -- 'internal' = a built-in lake table (raw/curated). 'http'/'sql' = an
-    -- external system the lake syncs from (live query-through is a later step).
+    -- external system the lake syncs from (live query-through comes later).
     access         JSONB,
     description    TEXT,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -42,9 +42,9 @@ CREATE INDEX IF NOT EXISTS catalog_stores_user_kind_idx
 -- into the lake. A store declares "here are the facts you may ingest"; a sync
 -- pulls them into `raw_records` through the normal idempotent import path. This
 -- is the concrete "the lake ingests slices" mechanism (as opposed to live
--- query-through, which is a later step).
+-- query-through, which comes later).
 --
--- CASCADE on the store FK so deleting a store cleans up its staged slices.
+-- CASCADE on the store FK so deleting a store cleans up its buffered slices.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS catalog_published_facts (
     id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),

@@ -18,7 +18,7 @@
 //!   GET  /admin/api/map.json   — projected coordinates for the scatterplot
 //!   GET  /admin/style.css      — embedded stylesheet
 //!
-//! Phase 3 evolution path: the /admin/map view will get a Three.js 3D
+//! A later evolution: the /admin/map view will get a Three.js 3D
 //! renderer + true UMAP projection. Today it ships as 2D PCA in SVG —
 //! same data, less spectacle, zero JS dependencies.
 

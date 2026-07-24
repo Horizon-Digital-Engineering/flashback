@@ -88,6 +88,21 @@ impl Scope {
         self.mode = mode;
         self
     }
+
+    /// The embedder key this scope's mode pins, for embedding curated nodes in
+    /// the same geometry as the raw records they derive from. A mode-less scope
+    /// (mode = NULL) or an unresolvable mode falls back to the default embedder
+    /// key (all-MiniLM-L6-v2, 384-dim).
+    pub(crate) async fn embedder_key(&self, pool: &PgPool) -> String {
+        const DEFAULT: &str = "sentence-transformers/all-MiniLM-L6-v2";
+        let Some(mode) = self.mode.as_deref() else {
+            return DEFAULT.to_string();
+        };
+        match crate::modes::get_mode(pool, &self.user_id, mode).await {
+            Ok(Some(m)) => m.embedder,
+            _ => DEFAULT.to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +167,7 @@ pub async fn promote_working_to_episodic(
         )
         .await?;
         add_edge(pool, node_id, r.id, "derived_from").await?;
-        embed_node(pool, nlp, node_id, &r.content).await;
+        embed_node(pool, nlp, scope, node_id, &r.content).await;
 
         // Populate the entity index for this raw record and emit one labelled
         // `entity` edge (node -> raw id) per entity. The index is what the
@@ -343,7 +358,7 @@ pub async fn distill_semantic(
             for raw_id in &cluster_raw_ids {
                 add_edge(pool, node_id, *raw_id, "derived_from").await?;
             }
-            embed_node(pool, nlp, node_id, &fact.content).await;
+            embed_node(pool, nlp, scope, node_id, &fact.content).await;
             stats.distilled += 1;
         }
     }
@@ -591,23 +606,31 @@ pub(crate) mod edges {
     }
 
     /// Best-effort embed — mirrors the raw ingest contract. A failed embed never
-    /// fails curation; a backfill can fill the gap. The node still exists.
+    /// fails curation; a backfill can fill the gap. The node still exists. The
+    /// vector is written in the scope's mode geometry (its embedder + dimension),
+    /// into the matching `embedding_<dim>` column, so a curated node never mixes
+    /// registers with a raw record in a different mode.
     pub(crate) async fn embed_node(
         pool: &PgPool,
         nlp: &dyn NlpService,
+        scope: &Scope,
         node_id: Uuid,
         content: &str,
     ) {
-        if let Ok(embedding) = nlp.embed_one(content).await {
-            let _ = sqlx::query(
-                "INSERT INTO curated_embeddings (node_id, model, embedding) VALUES ($1, $2, $3) \
-                 ON CONFLICT (node_id, model) DO NOTHING",
-            )
-            .bind(node_id)
-            .bind(nlp.embedder_model_name())
-            .bind(Vector::from(embedding))
-            .execute(pool)
-            .await;
+        let embedder_key = scope.embedder_key(pool).await;
+        if let Ok((dim, embedding)) = nlp.embed_for_mode(&embedder_key, content).await {
+            let col = crate::routes::records::embedding_col_for_dim(dim);
+            let sql = format!(
+                "INSERT INTO curated_embeddings (node_id, model, {col}) VALUES ($1, $2, $3) \
+                 ON CONFLICT (node_id, model) DO NOTHING"
+            );
+            // col is a trusted constant from embedding_col_for_dim; values bound.
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(node_id)
+                .bind(&embedder_key)
+                .bind(Vector::from(embedding))
+                .execute(pool)
+                .await;
         }
     }
 }
@@ -1026,6 +1049,86 @@ mod tests {
         rebuild(&pool, &DistillingNlp, "bob").await.unwrap();
         assert_eq!(count_nodes(&pool, "alice", "episodic").await, 1);
         assert_eq!(count_nodes(&pool, "bob", "episodic").await, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn consolidation_never_crosses_a_mode_boundary(pool: PgPool) {
+        // Two records with an IDENTICAL entity set (jaccard 1.0) that would
+        // cluster into one semantic fact — except they live in different modes.
+        // Curation is scoped per (user, project, mode), so they must NOT merge.
+        insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            Some("code"),
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            Some("journal"),
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+
+        // A full rebuild processes every (project, mode) bucket separately.
+        rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
+
+        // Each mode promoted its own episodic node...
+        let code_ep: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes WHERE user_id='alice' AND kind='episodic' AND mode='code'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let journal_ep: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes WHERE user_id='alice' AND kind='episodic' AND mode='journal'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((code_ep, journal_ep), (1, 1));
+
+        // ...and because each mode's scope saw only ONE episode, neither could
+        // form a >=2 cluster, so ZERO semantic facts were distilled. The two
+        // modes never merged into a cross-register fact.
+        assert_eq!(count_nodes(&pool, "alice", "semantic").await, 0);
+
+        // Every curated node carries the mode of its source — never a blend.
+        let leaked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes WHERE user_id='alice' AND mode NOT IN ('code','journal')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leaked, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn same_mode_still_clusters_together(pool: PgPool) {
+        // Control for the boundary test: the SAME two records in the SAME mode
+        // DO cluster into one semantic fact — proving the boundary above is the
+        // mode split, not something else blocking the merge.
+        insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            Some("code"),
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            Some("code"),
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+        rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(count_nodes(&pool, "alice", "semantic").await, 1);
     }
 
     // -- entity index ------------------------------------------------------

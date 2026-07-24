@@ -265,7 +265,10 @@ impl Flashback {
         description = "Store a raw record in Flashback's immutable raw layer: a conversation \
                        turn, fact, document, event, or transaction. Universal typed record — set \
                        `type` (episodic/semantic/working/document/procedural/state_object) and a \
-                       `source` tag. Append-only; never overwrites."
+                       `source` tag. Optional `mode` pins the cognitive register \
+                       (code/general/journal/research/…) it's embedded and recalled in; omitted, \
+                       it's auto-classified or falls back to the default register. Append-only; \
+                       never overwrites."
     )]
     async fn flashback_record(
         &self,
@@ -281,7 +284,10 @@ impl Flashback {
     #[tool(
         description = "Recall the most relevant raw records for a query via hybrid semantic + \
                        keyword retrieval over the immutable raw layer, scoped by \
-                       project/session/mode. Call before answering to ground in memory."
+                       project/session/mode. `mode` picks a cognitive register \
+                       (code/general/journal/research/…) and searches its vector geometry; \
+                       `all` searches across registers with keyword-degraded ranking. Call \
+                       before answering to ground in memory."
     )]
     async fn flashback_recall(
         &self,

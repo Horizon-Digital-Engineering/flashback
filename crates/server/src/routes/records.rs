@@ -190,6 +190,12 @@ pub(crate) async fn ingest_record(
     let importance = req.importance.map(|i| i.clamp(0.0, 1.0));
     let ttl = req.ttl_hours.map(|h| Utc::now() + Duration::hours(h));
 
+    // Resolve the mode by precedence: caller override → LLM auto-classify →
+    // project default → general. The LLM classification only fires for an
+    // LLM-capable provider (the heuristic returns `None`, so no extra work on
+    // the no-LLM path); a resolve failure never blocks ingest.
+    let mode = resolve_ingest_mode(pool, nlp, user_id, req.mode.as_deref(), &req.content).await;
+
     // content_hash + content_tsv + ingest_time are generated/defaulted by the DB.
     sqlx::query(
         r#"
@@ -208,7 +214,7 @@ pub(crate) async fn ingest_record(
     .bind(user_id)
     .bind(&req.project_id)
     .bind(&req.session_id)
-    .bind(&req.mode)
+    .bind(mode.as_ref().map(|m| m.name.as_str()))
     .bind(importance)
     .bind(req.supersedes)
     .bind(&req.acl)
@@ -217,21 +223,106 @@ pub(crate) async fn ingest_record(
     .execute(pool)
     .await?;
 
-    // Derived embedding — best-effort. Raw is the source of truth; if the
-    // embedder is down a backfill job can fill the gap later. Never fails ingest.
-    if let Ok(embedding) = nlp.embed_one(&req.content).await {
-        let _ = sqlx::query(
-            "INSERT INTO raw_embeddings (record_id, model, embedding) VALUES ($1, $2, $3) \
-             ON CONFLICT (record_id, model) DO NOTHING",
-        )
-        .bind(id)
-        .bind(nlp.embedder_model_name())
-        .bind(Vector::from(embedding))
-        .execute(pool)
-        .await;
+    // Derived embedding — best-effort, in the resolved mode's geometry. Raw is
+    // the source of truth; if the embedder is down a backfill job can fill the
+    // gap later. Never fails ingest.
+    let embedder_key = mode
+        .as_ref()
+        .map(|m| m.embedder.clone())
+        .unwrap_or_else(|| nlp.embedder_model_name().to_string());
+    if let Ok((dim, embedding)) = nlp.embed_for_mode(&embedder_key, &req.content).await {
+        let _ = write_raw_embedding(pool, id, &embedder_key, dim, embedding).await;
     }
 
     Ok(IngestRecordResponse { id })
+}
+
+/// Resolve the mode a record lands in. Runs the AiProvider's classifier only
+/// when the caller didn't pin a mode AND the provider is LLM-capable (the
+/// heuristic returns `None`, so this stays a no-op on the no-LLM path). A
+/// classification / resolution failure degrades gracefully to the project
+/// default. Returns `None` only if the modes table itself is unreachable, in
+/// which case the record is stored mode-less (the historical behavior).
+async fn resolve_ingest_mode(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    caller_override: Option<&str>,
+    content: &str,
+) -> Option<crate::modes::Mode> {
+    // Only reach for the LLM when there's no explicit override — the override
+    // wins anyway, so we'd waste a call.
+    let llm_classified = if caller_override.is_none() {
+        match nlp.extract_full(content).await {
+            Ok(e) => e.mode,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    crate::modes::resolve_mode(pool, user_id, caller_override, llm_classified.as_deref())
+        .await
+        .ok()
+}
+
+/// Batch-embed `texts` with a specific embedder key. When the key is the
+/// default embedder's model, the fast batched path is used; otherwise each item
+/// is embedded through the mode-aware single path (the extra embedders load
+/// lazily and inference is cheap per item). Returns vectors in input order.
+async fn embed_batch_with(
+    nlp: &dyn NlpService,
+    embedder_key: &str,
+    texts: Vec<String>,
+) -> Result<Vec<Vec<f32>>, AppError> {
+    // The default 384-dim embedder has a real batched path — use it.
+    let is_default = flashback_nlp::model_name_for_key(embedder_key)
+        .map(|n| n == nlp.embedder_model_name())
+        .unwrap_or(true);
+    if is_default {
+        return nlp.embed_batch(texts).await;
+    }
+    let mut out = Vec::with_capacity(texts.len());
+    for t in texts {
+        let (_dim, v) = nlp.embed_for_mode(embedder_key, &t).await?;
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// Write a derived embedding into the `embedding_<dim>` column matching the
+/// mode's embedder dimension. Exactly one column is populated per (record,
+/// model) row; the other two stay NULL. Idempotent on the composite PK.
+pub(crate) async fn write_raw_embedding(
+    pool: &PgPool,
+    record_id: Uuid,
+    model: &str,
+    dim: usize,
+    embedding: Vec<f32>,
+) -> Result<(), sqlx::Error> {
+    let col = embedding_col_for_dim(dim);
+    let sql = format!(
+        "INSERT INTO raw_embeddings (record_id, model, {col}) VALUES ($1, $2, $3) \
+         ON CONFLICT (record_id, model) DO NOTHING"
+    );
+    sqlx::query(AssertSqlSafe(sql))
+        .bind(record_id)
+        .bind(model)
+        .bind(Vector::from(embedding))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The `raw_embeddings` / `curated_embeddings` column name for a vector
+/// dimension. 384 is the original `embedding` column; 768/1024 are the
+/// per-dimension columns added for modes. Unknown dims fall back to the 384
+/// column (the default embedder's), which is the safe historical behavior.
+pub(crate) fn embedding_col_for_dim(dim: usize) -> &'static str {
+    match dim {
+        768 => "embedding_768",
+        1024 => "embedding_1024",
+        _ => "embedding",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -291,7 +382,10 @@ pub(crate) async fn import_records_inner(
     req: ImportRequest,
 ) -> AppResult<ImportResponse> {
     let total = req.records.len();
-    let mut inserted: Vec<(Uuid, String)> = Vec::new();
+    // (record_id, content, embedder_key) for the post-commit embed pass. Each
+    // row carries the embedder its resolved mode pins so the batch writes into
+    // the matching per-dimension column.
+    let mut inserted: Vec<(Uuid, String, String)> = Vec::new();
 
     let mut tx = pool.begin().await?;
     for r in req.records {
@@ -301,6 +395,16 @@ pub(crate) async fn import_records_inner(
         let id = Uuid::new_v4();
         let event_time = r.event_time.unwrap_or_else(Utc::now);
         let importance = r.importance.map(|i| i.clamp(0.0, 1.0));
+        // Bulk import resolves mode by caller override → project default (no
+        // per-record LLM classification — a corpus load stays cheap; the
+        // background curation pass can re-derive later).
+        let mode = crate::modes::resolve_mode(pool, user_id, r.mode.as_deref(), None)
+            .await
+            .ok();
+        let embedder_key = mode
+            .as_ref()
+            .map(|m| m.embedder.clone())
+            .unwrap_or_else(|| nlp.embedder_model_name().to_string());
         let new_id: Option<Uuid> = sqlx::query_scalar(
             r#"
             INSERT INTO raw_records
@@ -321,34 +425,40 @@ pub(crate) async fn import_records_inner(
         .bind(user_id)
         .bind(&r.project_id)
         .bind(&r.session_id)
-        .bind(&r.mode)
+        .bind(mode.as_ref().map(|m| m.name.as_str()))
         .bind(importance)
         .bind(&r.payload)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(nid) = new_id {
-            inserted.push((nid, r.content));
+            inserted.push((nid, r.content, embedder_key));
         }
     }
     tx.commit().await?;
 
-    // Batch-embed the freshly imported rows (best-effort; a backfill can retry).
+    // Embed the freshly imported rows in their mode's geometry (best-effort; a
+    // backfill can retry). Group by embedder so each distinct model batches once.
     if !inserted.is_empty() {
-        let contents: Vec<String> = inserted.iter().map(|(_, c)| c.clone()).collect();
-        if let Ok(embs) = nlp.embed_batch(contents).await {
-            if embs.len() == inserted.len() {
-                let model = nlp.embedder_model_name().to_string();
-                for ((rid, _), emb) in inserted.iter().zip(embs) {
-                    let _ = sqlx::query(
-                        "INSERT INTO raw_embeddings (record_id, model, embedding) \
-                         VALUES ($1, $2, $3) ON CONFLICT (record_id, model) DO NOTHING",
-                    )
-                    .bind(rid)
-                    .bind(&model)
-                    .bind(Vector::from(emb))
-                    .execute(pool)
-                    .await;
-                }
+        let mut by_embedder: std::collections::HashMap<String, Vec<(Uuid, String)>> =
+            std::collections::HashMap::new();
+        for (rid, content, key) in &inserted {
+            by_embedder
+                .entry(key.clone())
+                .or_default()
+                .push((*rid, content.clone()));
+        }
+        for (embedder_key, rows) in by_embedder {
+            let contents: Vec<String> = rows.iter().map(|(_, c)| c.clone()).collect();
+            // Resolve the dim once for this embedder (unknown → default 384).
+            let dim = flashback_nlp::model_for_key(&embedder_key)
+                .map(|(_, d)| d)
+                .unwrap_or(384);
+            let embs = match embed_batch_with(nlp, &embedder_key, contents).await {
+                Ok(e) if e.len() == rows.len() => e,
+                _ => continue,
+            };
+            for ((rid, _), emb) in rows.iter().zip(embs) {
+                let _ = write_raw_embedding(pool, *rid, &embedder_key, dim, emb).await;
             }
         }
     }
@@ -460,8 +570,16 @@ pub struct AssembleRequest {
     pub project_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// The cognitive register to search. A single mode name uses that mode's
+    /// vector geometry. `"all"` (or `modes` = `["all"]`) is a cross-mode
+    /// request that can't compare cosine across mismatched dims, so it degrades
+    /// to keyword + recency. Unset resolves to the user's default register.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Explicit multi-mode form. `["all"]` — or more than one distinct mode —
+    /// is a cross-mode (degraded) request.
+    #[serde(default)]
+    pub modes: Option<Vec<String>>,
     #[serde(default)]
     pub query: Option<String>,
     #[serde(default)]
@@ -471,6 +589,13 @@ pub struct AssembleRequest {
 #[derive(Debug, Serialize)]
 pub struct AssembleResponse {
     pub records: Vec<RawRecordRow>,
+    /// True when the request spanned modes and fell back to keyword/entity/
+    /// recency retrieval (no cross-dimension vector search). The `warning`
+    /// spells out why.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 async fn assemble(
@@ -492,6 +617,35 @@ pub(crate) async fn assemble_inner(
     let limit = req.limit.unwrap_or(50).clamp(1, 200);
     let query = req.query.clone().unwrap_or_default();
 
+    // A cross-mode request can't compare cosine across mismatched dims. When the
+    // caller asks for `all` (or names more than one distinct mode) we degrade to
+    // keyword + entity + recency over raw, and flag it. A single mode (or unset,
+    // which resolves to the user's default) takes the normal vector path.
+    let cross_mode = is_cross_mode(&req);
+
+    // Resolve the single register to search when not cross-mode. `None` on a
+    // cross-mode request; otherwise the mode's embedder + dim drive which vector
+    // column and geometry we use.
+    let resolved_mode = if cross_mode {
+        None
+    } else {
+        let name = req.mode.as_deref().or_else(|| {
+            req.modes
+                .as_ref()
+                .and_then(|m| m.first().map(|s| s.as_str()))
+        });
+        crate::modes::resolve_mode(pool, user_id, name, None)
+            .await
+            .ok()
+    };
+    // The mode name the query is scoped to, and the embedder + column that
+    // matches its geometry. Cross-mode leaves these empty and never scopes/embeds.
+    let scope_mode: Option<String> = resolved_mode.as_ref().map(|m| m.name.clone());
+    let embedder_key = resolved_mode
+        .as_ref()
+        .map(|m| m.embedder.clone())
+        .unwrap_or_else(|| nlp.embedder_model_name().to_string());
+
     if query.trim().is_empty() {
         // No query -> pure recency over raw (the backstop feed; nothing to score).
         let sql = format!(
@@ -511,36 +665,61 @@ pub(crate) async fn assemble_inner(
             .bind(user_id)
             .bind(&req.project_id)
             .bind(&req.session_id)
-            .bind(&req.mode)
+            .bind(&scope_mode)
             .bind(limit)
             .fetch_all(pool)
             .await?;
-        return Ok(AssembleResponse { records });
+        return Ok(AssembleResponse {
+            records,
+            degraded: false,
+            warning: None,
+        });
     }
 
-    let qvec = nlp.embed_one(&query).await?;
-    let model = nlp.embedder_model_name().to_string();
+    // Cross-mode: no shared vector geometry — keyword(BM25) + entity + recency
+    // over raw, across every mode. Visible `degraded` flag + a warning.
+    if cross_mode {
+        let records = cross_mode_degraded(pool, nlp, user_id, &req, &query, limit).await?;
+        return Ok(AssembleResponse {
+            records,
+            degraded: true,
+            warning: Some(
+                "cross-mode request: vector search skipped (modes live in different \
+                 embedding spaces); ranked by keyword, entity overlap, and recency."
+                    .to_string(),
+            ),
+        });
+    }
+
+    // Single-mode vector path — embed the query in this mode's geometry and read
+    // the matching per-dimension column.
+    let (dim, qvec) = nlp.embed_for_mode(&embedder_key, &query).await?;
+    let model = embedder_key.clone();
+    let emb_col = embedding_col_for_dim(dim);
 
     // 1) Rank the CURATED layer with the full blended score. Summaries and
     // level-0 nodes compete on the same score; higher `level` breaks ties so a
     // summary that covers a cluster leads its own children ("summary first").
     // recency = e^(-age_hours/REC_S); ref_weight = e^(-idle_hours/half_life)
     // (the Ebbinghaus decay, computed inline from ref_weights; a node with no
-    // ref_weights row scores 1.0 so absence never demotes it).
+    // ref_weights row scores 1.0 so absence never demotes it). The `mode` scope
+    // is exact (never crosses a register), and the embedding column matches the
+    // mode's dimension.
     let curated_scored: Vec<(Uuid, i32)> = {
-        let sql = r#"
+        let sql = format!(
+            r#"
             SELECT n.id, n.level
             FROM curated_nodes n
             LEFT JOIN curated_embeddings ce ON ce.node_id = n.id AND ce.model = $1
             LEFT JOIN ref_weights rw ON rw.ref_id = n.id
             WHERE n.user_id = $2
               AND ($3::text IS NULL OR n.project_id = $3)
-              AND ($4::text IS NULL OR n.mode = $4)
+              AND n.mode IS NOT DISTINCT FROM $4
               AND NOT EXISTS (
                   SELECT 1 FROM curated_edges s WHERE s.to_id = n.id AND s.kind = 'supersedes'
               )
             ORDER BY (
-                  $5 * COALESCE(NULLIF(1 - (ce.embedding <=> $6), 'NaN'::float8), 0)
+                  $5 * COALESCE(NULLIF(1 - (ce.{emb_col} <=> $6), 'NaN'::float8), 0)
                 + $7 * ts_rank(to_tsvector('english', n.content), plainto_tsquery('english', $8))
                 + $9  * exp(- GREATEST(EXTRACT(EPOCH FROM (NOW() - COALESCE(n.event_time, n.created_at))) / 3600.0, 0) / $10)
                 + $11 * COALESCE(n.importance, 0)
@@ -555,12 +734,15 @@ pub(crate) async fn assemble_inner(
                         1.0)
             ) DESC, n.level DESC, n.created_at DESC
             LIMIT $13
-        "#;
-        sqlx::query_as::<_, (Uuid, i32)>(sql)
+        "#
+        );
+        // emb_col is a trusted constant from embedding_col_for_dim; all values
+        // are $-bound params.
+        sqlx::query_as::<_, (Uuid, i32)>(AssertSqlSafe(sql))
             .bind(&model)
             .bind(user_id)
             .bind(&req.project_id)
-            .bind(&req.mode)
+            .bind(&scope_mode)
             .bind(W_SEM)
             .bind(Vector::from(qvec.clone()))
             .bind(W_KW)
@@ -607,7 +789,18 @@ pub(crate) async fn assemble_inner(
     // `working`), so this is the surface that makes references first-class in
     // retrieval. Shape is unchanged: references are ordinary RawRecordRow rows.
     if is_present_tense(&query) {
-        let ref_hits = reference_hits(pool, user_id, &req, &qvec, &model, &query, limit).await?;
+        let ref_hits = reference_hits(
+            pool,
+            user_id,
+            &req,
+            &scope_mode,
+            &qvec,
+            &model,
+            emb_col,
+            &query,
+            limit,
+        )
+        .await?;
         let seen_ids: std::collections::HashSet<Uuid> = records.iter().map(|r| r.id).collect();
         let mut biased: Vec<RawRecordRow> = ref_hits
             .into_iter()
@@ -624,12 +817,92 @@ pub(crate) async fn assemble_inner(
     if (records.len() as i64) < limit {
         let need = limit - records.len() as i64;
         let exclude: Vec<Uuid> = records.iter().map(|r| r.id).collect();
-        let backstop =
-            raw_hybrid(pool, user_id, &req, &qvec, &model, &query, need, &exclude).await?;
+        let backstop = raw_hybrid(
+            pool,
+            user_id,
+            &req,
+            &scope_mode,
+            &qvec,
+            &model,
+            emb_col,
+            &query,
+            need,
+            &exclude,
+        )
+        .await?;
         records.extend(backstop);
     }
 
-    Ok(AssembleResponse { records })
+    Ok(AssembleResponse {
+        records,
+        degraded: false,
+        warning: None,
+    })
+}
+
+/// A request is cross-mode (degraded) when it explicitly asks for `all` or names
+/// more than one distinct mode. A single named mode, or an unset mode, is
+/// single-mode (the latter resolves to the user's default register).
+fn is_cross_mode(req: &AssembleRequest) -> bool {
+    let mut names: Vec<&str> = Vec::new();
+    if let Some(m) = req.mode.as_deref() {
+        names.push(m);
+    }
+    if let Some(ms) = &req.modes {
+        names.extend(ms.iter().map(|s| s.as_str()));
+    }
+    if names.iter().any(|n| n.eq_ignore_ascii_case("all")) {
+        return true;
+    }
+    let distinct: std::collections::HashSet<&str> = names.into_iter().collect();
+    distinct.len() > 1
+}
+
+/// Cross-mode retrieval: no shared vector geometry, so rank raw records across
+/// every mode by keyword (BM25) + entity overlap + recency. Deliberately no
+/// cosine term — the whole point is that the vectors aren't comparable. The
+/// entity overlap uses the query's own extracted entities against `entity_index`.
+async fn cross_mode_degraded(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+    req: &AssembleRequest,
+    query: &str,
+    limit: i64,
+) -> AppResult<Vec<RawRecordRow>> {
+    let entities = nlp.extract_entities(query);
+    let sql = format!(
+        r#"
+        SELECT {COLS_R} FROM raw_records r
+        LEFT JOIN (
+            SELECT record_id, COUNT(*) AS hits
+            FROM entity_index
+            WHERE user_id = $2 AND entity = ANY($5)
+            GROUP BY record_id
+        ) ent ON ent.record_id = r.id
+        WHERE r.user_id = $2
+          AND ($3::text IS NULL OR r.project_id = $3)
+          AND ($4::text IS NULL OR r.session_id = $4)
+          AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
+          AND (r.ttl IS NULL OR r.ttl > NOW())
+        ORDER BY (
+            0.5 * ts_rank(r.content_tsv, plainto_tsquery('english', $1))
+          + 0.3 * LEAST(COALESCE(ent.hits, 0) / 3.0, 1.0)
+          + 0.2 * exp(- GREATEST(EXTRACT(EPOCH FROM (NOW() - r.event_time)) / 3600.0, 0) / {REC_S_HOURS})
+        ) DESC, r.event_time DESC
+        LIMIT $6
+        "#
+    );
+    let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+        .bind(query)
+        .bind(user_id)
+        .bind(&req.project_id)
+        .bind(&req.session_id)
+        .bind(&entities)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// The additive reference bias applied to a matching reference on present-tense
@@ -669,15 +942,19 @@ fn is_present_tense(query: &str) -> bool {
 /// Terminal state_object rows ranked by the hybrid score plus the reference
 /// bias, scoped + owned. Only terminal (not-superseded) references are eligible,
 /// so a superseded value never surfaces. Ordered best-first.
+#[allow(clippy::too_many_arguments)]
 async fn reference_hits(
     pool: &PgPool,
     user_id: &str,
     req: &AssembleRequest,
+    scope_mode: &Option<String>,
     qvec: &[f32],
     model: &str,
+    emb_col: &str,
     query: &str,
     limit: i64,
 ) -> AppResult<Vec<RawRecordRow>> {
+    // emb_col is a trusted constant from embedding_col_for_dim; all values bound.
     let sql = format!(
         r#"
         SELECT {COLS_R} FROM raw_records r
@@ -686,12 +963,12 @@ async fn reference_hits(
           AND r.type = 'state_object'
           AND ($3::text IS NULL OR r.project_id = $3)
           AND ($4::text IS NULL OR r.session_id = $4)
-          AND ($5::text IS NULL OR r.mode = $5)
+          AND r.mode IS NOT DISTINCT FROM $5
           AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
           AND (r.ttl IS NULL OR r.ttl > NOW())
         ORDER BY (
             $9
-            + 0.7 * COALESCE(NULLIF(1 - (e.embedding <=> $6), 'NaN'::float8), 0)
+            + 0.7 * COALESCE(NULLIF(1 - (e.{emb_col} <=> $6), 'NaN'::float8), 0)
             + 0.3 * ts_rank(r.content_tsv, plainto_tsquery('english', $7))
         ) DESC, r.event_time DESC
         LIMIT $8
@@ -702,7 +979,7 @@ async fn reference_hits(
         .bind(user_id)
         .bind(&req.project_id)
         .bind(&req.session_id)
-        .bind(&req.mode)
+        .bind(scope_mode)
         .bind(Vector::from(qvec.to_vec()))
         .bind(query)
         .bind(limit)
@@ -775,12 +1052,15 @@ async fn raw_hybrid(
     pool: &PgPool,
     user_id: &str,
     req: &AssembleRequest,
+    scope_mode: &Option<String>,
     qvec: &[f32],
     model: &str,
+    emb_col: &str,
     query: &str,
     limit: i64,
     exclude: &[Uuid],
 ) -> AppResult<Vec<RawRecordRow>> {
+    // emb_col is a trusted constant from embedding_col_for_dim; all values bound.
     let sql = format!(
         r#"
         SELECT {COLS_R} FROM raw_records r
@@ -788,12 +1068,12 @@ async fn raw_hybrid(
         WHERE r.user_id = $2
           AND ($3::text IS NULL OR r.project_id = $3)
           AND ($4::text IS NULL OR r.session_id = $4)
-          AND ($5::text IS NULL OR r.mode = $5)
+          AND r.mode IS NOT DISTINCT FROM $5
           AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
           AND (r.ttl IS NULL OR r.ttl > NOW())
           AND NOT (r.id = ANY($9))
         ORDER BY (
-            0.7 * COALESCE(NULLIF(1 - (e.embedding <=> $6), 'NaN'::float8), 0)
+            0.7 * COALESCE(NULLIF(1 - (e.{emb_col} <=> $6), 'NaN'::float8), 0)
             + 0.3 * ts_rank(r.content_tsv, plainto_tsquery('english', $7))
         ) DESC, r.event_time DESC
         LIMIT $8
@@ -804,7 +1084,7 @@ async fn raw_hybrid(
         .bind(user_id)
         .bind(&req.project_id)
         .bind(&req.session_id)
-        .bind(&req.mode)
+        .bind(scope_mode)
         .bind(Vector::from(qvec.to_vec()))
         .bind(query)
         .bind(limit)
@@ -1062,6 +1342,57 @@ mod tests {
         }
     }
 
+    /// A stub whose `embed_for_mode` honors the embedder key's real dimension
+    /// (via `model_for_key`) so the per-mode embedding column routing is
+    /// exercised for real. Vectors are uniform (cosine is constant), so the mode
+    /// SCOPE + column dim — not similarity — decide what a query retrieves.
+    #[derive(Clone)]
+    struct ModeAwareStub;
+
+    #[async_trait]
+    impl NlpService for ModeAwareStub {
+        fn provider_name(&self) -> &'static str {
+            "mode-aware-stub"
+        }
+        fn provider_can_distill(&self) -> bool {
+            false
+        }
+        fn embedder_model_name(&self) -> &str {
+            "sentence-transformers/all-MiniLM-L6-v2"
+        }
+        fn embedder_dimension(&self) -> usize {
+            384
+        }
+        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(vec![0.1_f32; 384])
+        }
+        async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+        }
+        async fn embed_for_mode(
+            &self,
+            embedder_key: &str,
+            _text: &str,
+        ) -> Result<(usize, Vec<f32>), AppError> {
+            let dim = flashback_nlp::model_for_key(embedder_key)
+                .map(|(_, d)| d)
+                .unwrap_or(384);
+            Ok((dim, vec![0.1_f32; dim]))
+        }
+        fn extract_entities(&self, text: &str) -> Vec<String> {
+            flashback_nlp::extract_entities(text)
+        }
+        async fn extract_full(&self, _text: &str) -> Result<Extraction, AppError> {
+            Ok(Extraction::empty())
+        }
+        async fn distill_facts(
+            &self,
+            _e: &[EpisodeRef],
+        ) -> Result<Vec<DistilledFact>, ProviderError> {
+            Err(ProviderError::NotConfigured("stub".into()))
+        }
+    }
+
     fn req(content: &str) -> IngestRecordRequest {
         IngestRecordRequest {
             r#type: "episodic".into(),
@@ -1212,6 +1543,7 @@ mod tests {
                 project_id: None,
                 session_id: None,
                 mode: None,
+                modes: None,
                 query: Some("lisinopril".into()),
                 limit: None,
             },
@@ -1237,6 +1569,7 @@ mod tests {
                 project_id: None,
                 session_id: None,
                 mode: None,
+                modes: None,
                 query: None,
                 limit: None,
             },
@@ -1370,6 +1703,7 @@ mod tests {
                 project_id: None,
                 session_id: None,
                 mode: None,
+                modes: None,
                 query: Some("lisinopril".into()),
                 limit: None,
             },
@@ -1381,13 +1715,20 @@ mod tests {
 
     // -- summary-first + decay-weighted retrieval --------------------------
 
-    /// Insert a level-0 curated node deriving from `raw_id`, embed it (uniform
-    /// via StubNlp so cosine is constant across nodes), and return the node id.
+    /// The default (general) register's embedder key — the model + column a
+    /// mode-less/general record's derived embedding uses. Records ingested with
+    /// no explicit mode resolve to `general`, so a curated node deriving from
+    /// them shares this mode + model for retrieval to match.
+    const GENERAL_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
+    /// Insert a level-0 curated node deriving from `raw_id`, in the `general`
+    /// register (matching a mode-less raw ingest), embed it (uniform via StubNlp
+    /// so cosine is constant across nodes), and return the node id.
     async fn curated_node_from(pool: &PgPool, user_id: &str, raw_id: Uuid, content: &str) -> Uuid {
         let node_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO curated_nodes (id, kind, content, level, user_id, importance, event_time) \
-             VALUES ($1, 'episodic', $2, 0, $3, 0.5, NOW())",
+            "INSERT INTO curated_nodes (id, kind, content, level, user_id, mode, importance, event_time) \
+             VALUES ($1, 'episodic', $2, 0, $3, 'general', 0.5, NOW())",
         )
         .bind(node_id)
         .bind(content)
@@ -1408,7 +1749,7 @@ mod tests {
             "INSERT INTO curated_embeddings (node_id, model, embedding) VALUES ($1, $2, $3)",
         )
         .bind(node_id)
-        .bind(StubNlp.embedder_model_name())
+        .bind(GENERAL_MODEL)
         .bind(Vector::from(emb))
         .execute(pool)
         .await
@@ -1421,6 +1762,7 @@ mod tests {
             project_id: None,
             session_id: None,
             mode: None,
+            modes: None,
             query: Some(query.into()),
             limit: None,
         }
@@ -1773,5 +2115,212 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    // -- modes (cognitive registers) ---------------------------------------
+
+    /// An ingest request in a specific mode, no project scope (so the mode is
+    /// the only scoping axis under test).
+    fn req_in_mode(content: &str, mode: &str) -> IngestRecordRequest {
+        IngestRecordRequest {
+            r#type: "episodic".into(),
+            content: content.into(),
+            event_time: None,
+            source: "test".into(),
+            source_ref: None,
+            project_id: None,
+            session_id: None,
+            mode: Some(mode.into()),
+            importance: None,
+            supersedes: None,
+            ttl_hours: None,
+            acl: None,
+            payload: None,
+        }
+    }
+
+    fn ctx_mode(query: &str, mode: &str) -> AssembleRequest {
+        AssembleRequest {
+            project_id: None,
+            session_id: None,
+            mode: Some(mode.into()),
+            modes: None,
+            query: Some(query.into()),
+            limit: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn code_mode_embeds_in_its_column_and_scopes_retrieval(pool: PgPool) {
+        // Ingest a record in `code` mode: it resolves to the jina-code embedder
+        // (768-dim), so its vector lands in embedding_768 and the row is tagged
+        // mode='code'.
+        let coded = ingest_record(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            req_in_mode("Arc<Mutex<T>>", "code"),
+        )
+        .await
+        .unwrap();
+
+        // The derived embedding went into the 768 column, not the 384 default.
+        let row: (Option<i32>, Option<i32>, Option<i32>) = sqlx::query_as(
+            "SELECT (embedding IS NOT NULL)::int, (embedding_768 IS NOT NULL)::int, \
+                    (embedding_1024 IS NOT NULL)::int \
+             FROM raw_embeddings WHERE record_id = $1",
+        )
+        .bind(coded.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (Some(0), Some(1), Some(0)),
+            "code record uses embedding_768"
+        );
+        let mode: Option<String> = sqlx::query_scalar("SELECT mode FROM raw_records WHERE id = $1")
+            .bind(coded.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mode.as_deref(), Some("code"));
+
+        // A code-scoped query finds it (same 768 geometry, same mode scope).
+        let hit = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            ctx_mode("Arc Mutex", "code"),
+        )
+        .await
+        .unwrap();
+        assert!(!hit.degraded);
+        assert!(
+            hit.records.iter().any(|r| r.id == coded.id),
+            "code query must retrieve the code record"
+        );
+
+        // A general-scoped query must NOT — different mode scope AND different
+        // (384) geometry / column.
+        let miss = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            ctx_mode("Arc Mutex", "general"),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !miss.records.iter().any(|r| r.id == coded.id),
+            "general query must not retrieve the code record"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn cross_mode_query_is_keyword_degraded_with_flag(pool: PgPool) {
+        // Two records in two different registers/geometries.
+        ingest_record(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            req_in_mode("deploy target is staging", "code"),
+        )
+        .await
+        .unwrap();
+        ingest_record(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            req_in_mode("felt calm about the deploy today", "journal"),
+        )
+        .await
+        .unwrap();
+
+        // A cross-mode ("all") request can't compare cosine across dims — it
+        // degrades to keyword/entity/recency and flags it.
+        let out = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            AssembleRequest {
+                project_id: None,
+                session_id: None,
+                mode: Some("all".into()),
+                modes: None,
+                query: Some("deploy".into()),
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out.degraded, "cross-mode request must set degraded");
+        assert!(
+            out.warning.is_some(),
+            "cross-mode request must carry a warning"
+        );
+        // Keyword recall still works across both registers — the code record
+        // (keyword 'deploy') surfaces, and the search spans modes.
+        assert!(
+            out.records
+                .iter()
+                .any(|r| r.content.contains("deploy target")),
+            "keyword recall should surface the matching record across modes"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn cross_mode_via_modes_list_also_degrades(pool: PgPool) {
+        ingest_record(&pool, &ModeAwareStub, "leslie", req_in_mode("x", "code"))
+            .await
+            .unwrap();
+        // Two distinct named modes is also a cross-mode request.
+        let out = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            AssembleRequest {
+                project_id: None,
+                session_id: None,
+                mode: None,
+                modes: Some(vec!["code".into(), "journal".into()]),
+                query: Some("x".into()),
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out.degraded);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn mode_records_are_scope_isolated_by_user(pool: PgPool) {
+        let mine = ingest_record(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            req_in_mode("Arc Mutex mine", "code"),
+        )
+        .await
+        .unwrap();
+        ingest_record(
+            &pool,
+            &ModeAwareStub,
+            "bob",
+            req_in_mode("Arc Mutex theirs", "code"),
+        )
+        .await
+        .unwrap();
+
+        let out = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            ctx_mode("Arc Mutex", "code"),
+        )
+        .await
+        .unwrap();
+        assert!(out.records.iter().all(|r| r.user_id == "leslie"));
+        assert!(out.records.iter().any(|r| r.id == mine.id));
     }
 }

@@ -80,6 +80,22 @@ impl Embedder {
         })
     }
 
+    /// Build an Embedder for a mode's pinned embedder key (see `model_for_key`).
+    /// Returns `None` for an unknown key so the caller can fall back to the
+    /// default. `cache_dir`/`show_progress` mirror the default constructor.
+    pub fn from_key(
+        key: &str,
+        cache_dir: Option<PathBuf>,
+        show_progress: bool,
+    ) -> Option<Result<Self, EmbedError>> {
+        let (model, _dim) = model_for_key(key)?;
+        Some(Self::new(EmbedderConfig {
+            model,
+            cache_dir,
+            show_progress,
+        }))
+    }
+
     pub fn dimension(&self) -> usize {
         self.dimension
     }
@@ -123,6 +139,42 @@ fn model_name_for(m: &EmbeddingModel) -> &'static str {
         EmbeddingModel::AllMiniLML12V2 => "sentence-transformers/all-MiniLM-L12-v2",
         EmbeddingModel::BGESmallENV15 => "BAAI/bge-small-en-v1.5",
         EmbeddingModel::BGEBaseENV15 => "BAAI/bge-base-en-v1.5",
+        EmbeddingModel::BGELargeENV15 => "BAAI/bge-large-en-v1.5",
+        EmbeddingModel::MultilingualE5Base => "intfloat/multilingual-e5-base",
+        EmbeddingModel::JinaEmbeddingsV2BaseCode => "jinaai/jina-embeddings-v2-base-code",
         _ => "fastembed model",
     }
+}
+
+/// Resolve an embedder key (the string a mode pins) to the fastembed model and
+/// its output dimension. Accepts both the canonical `model_name_for` label and
+/// the fastembed model-code the mode table stores, so a mode declared with
+/// either form resolves. Returns `None` for an unknown key — the caller falls
+/// back to the default embedder.
+pub fn model_for_key(key: &str) -> Option<(EmbeddingModel, usize)> {
+    match key {
+        "sentence-transformers/all-MiniLM-L6-v2"
+        | "Qdrant/all-MiniLM-L6-v2-onnx"
+        | "all-MiniLM-L6-v2" => Some((EmbeddingModel::AllMiniLML6V2, 384)),
+        "BAAI/bge-base-en-v1.5" | "Xenova/bge-base-en-v1.5" | "bge-base-en-v1.5" => {
+            Some((EmbeddingModel::BGEBaseENV15, 768))
+        }
+        "BAAI/bge-large-en-v1.5" | "Xenova/bge-large-en-v1.5" | "bge-large-en-v1.5" => {
+            Some((EmbeddingModel::BGELargeENV15, 1024))
+        }
+        "intfloat/multilingual-e5-base" | "multilingual-e5-base" => {
+            Some((EmbeddingModel::MultilingualE5Base, 768))
+        }
+        "jinaai/jina-embeddings-v2-base-code" | "jina-embeddings-v2-base-code" | "jina-code" => {
+            Some((EmbeddingModel::JinaEmbeddingsV2BaseCode, 768))
+        }
+        _ => None,
+    }
+}
+
+/// The canonical model name (`model_name_for`) for an embedder key, or `None`
+/// if the key is unknown. Lets callers compare a mode's key against a loaded
+/// embedder's `model_name()` without constructing anything.
+pub fn model_name_for_key(key: &str) -> Option<&'static str> {
+    model_for_key(key).map(|(m, _)| model_name_for(&m))
 }

@@ -520,8 +520,8 @@ pub(crate) async fn sync_store_inner(
     }
 
     // TODO: when access.interface is 'sql' or 'http', query the external store
-    // live and stage/import the returned rows. For now sync only drains the
-    // staged `catalog_published_facts` slices the store has published.
+    // live and buffer the returned rows for import. For now sync only drains the
+    // buffered `catalog_published_facts` slices the store has published.
 
     #[derive(FromRow)]
     struct Fact {

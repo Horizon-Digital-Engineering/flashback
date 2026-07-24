@@ -3,6 +3,7 @@ pub mod context;
 pub mod core;
 pub mod health;
 pub mod memory;
+pub mod modes;
 pub mod records;
 pub mod state;
 
@@ -19,6 +20,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/state", state::router(state.clone()))
         .nest("/context", context::router(state.clone()))
         .nest("/records", records::router(state.clone()))
+        .nest("/modes", modes::router(state.clone()))
         .nest("/catalog", crate::catalog::router(state.clone()))
         .nest("/proposals", crate::proposals::router(state.clone()))
         .route("/lineage/{id}", get(memory::lineage))

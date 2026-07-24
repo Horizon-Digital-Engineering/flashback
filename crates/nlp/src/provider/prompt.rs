@@ -13,6 +13,7 @@ Schema:
   "topic":            string | null,
   "intent":           "question" | "update" | "decision" | "task" | "opinion" | "reference" | "unknown",
   "operation":        "add" | "remove" | "replace" | "reaffirm" | "contradict" | null,
+  "mode":             "code" | "general" | "journal" | "research" | null,
   "entities":         string[],
   "action_target":    string | null,
   "contradicts_hint": string | null,
@@ -23,6 +24,7 @@ Field semantics:
 - `topic` — a 1-4 word canonical phrase summarizing what this turn is about. Lowercase. Example: "deploy target", "auth middleware", "Q3 plan". Null if the turn has no clear topic.
 - `intent` — the speaker's communicative goal. Use "update" when state is changing, "question" when asking, "decision" when settling something, "task" when creating a follow-up, "opinion" for preference statements, "reference" when re-mentioning without changing.
 - `operation` — what the speaker is doing to the topic. "replace" supersedes a prior value. "contradict" asserts something opposite to a prior claim. Null if no state change.
+- `mode` — the dominant cognitive register of this turn. "code" for code / dev-work talk (symbols, frameworks, error traces), "journal" for reflective / emotional writing, "research" for dense academic / technical text, "general" for everyday English conversation. Return null if unclear — the caller then applies its own default.
 - `entities` — 0-8 key noun phrases mentioned, lowercase, deduplicated. Multi-word phrases preferred over single tokens.
 - `action_target` — the entity the operation acts on, if any.
 - `contradicts_hint` — free-text claim being contradicted, if intent is contradict.
@@ -83,7 +85,14 @@ mod tests {
         let p = build_system_prompt();
         // Spot-check critical schema fields are mentioned by name — guard
         // against an accidental clobber by a future edit.
-        for field in ["topic", "intent", "operation", "entities", "confidence"] {
+        for field in [
+            "topic",
+            "intent",
+            "operation",
+            "mode",
+            "entities",
+            "confidence",
+        ] {
             assert!(p.contains(field), "system prompt missing {field}");
         }
         // Intent enum must list each variant.

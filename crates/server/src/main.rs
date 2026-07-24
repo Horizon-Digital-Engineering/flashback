@@ -8,6 +8,7 @@ mod db;
 mod decay;
 mod error;
 mod models;
+mod modes;
 mod nlp;
 mod proposals;
 mod references;

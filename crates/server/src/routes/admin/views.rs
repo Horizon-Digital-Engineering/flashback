@@ -206,12 +206,17 @@ pub struct MemoriesFilter {
     pub r#type: Option<String>,
     pub project_id: Option<String>,
     pub session_id: Option<String>,
+    /// Cognitive register (mode) filter. Restricts the list to memories whose
+    /// content also lives in a raw record tagged with this mode — the glass-box
+    /// view of "what's in my code register vs my journal register".
+    pub mode: Option<String>,
     pub include_superseded: bool,
 }
 
 pub fn memories_list(
     user_id: &str,
     filter: &MemoriesFilter,
+    mode_names: &[String],
     memories: &[MemoryView],
     total: i64,
 ) -> String {
@@ -244,6 +249,22 @@ pub fn memories_list(
         r#"<div><label class="muted">Session</label><br />
             <input type="text" name="session_id" value="{}" placeholder="any" style="min-width:160px" /></div>"#,
         esc(filter.session_id.as_deref().unwrap_or(""))
+    ));
+    filter_form.push_str(&format!(
+        r#"<div><label class="muted">Mode</label><br />
+            <select name="mode" style="background:var(--bg-2);color:var(--fg-0);border:1px solid var(--border);border-radius:6px;padding:8px;min-width:140px">
+              <option value="" {sel_any}>any</option>
+              {opts}
+            </select></div>"#,
+        sel_any = if filter.mode.is_none() { "selected" } else { "" },
+        opts = mode_names
+            .iter()
+            .map(|m| {
+                let sel = if filter.mode.as_deref() == Some(m.as_str()) { "selected" } else { "" };
+                format!(r#"<option value="{m}" {sel}>{m}</option>"#, m = esc(m))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     ));
     filter_form.push_str(&format!(
         r#"<div><label><input type="checkbox" name="include_superseded" value="1" {} /> include superseded</label></div>"#,
@@ -326,6 +347,9 @@ fn build_query_string(f: &MemoriesFilter) -> String {
     }
     if let Some(s) = &f.session_id {
         parts.push(format!("session_id={}", s));
+    }
+    if let Some(m) = &f.mode {
+        parts.push(format!("mode={}", m));
     }
     if f.include_superseded {
         parts.push("include_superseded=1".to_string());

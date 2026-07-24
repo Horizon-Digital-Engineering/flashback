@@ -232,7 +232,7 @@ async fn write_summary(
     for child in children {
         edges::add_edge(pool, node_id, child.id, "summarizes").await?;
     }
-    edges::embed_node(pool, nlp, node_id, &content).await;
+    edges::embed_node(pool, nlp, scope, node_id, &content).await;
     Ok(node_id)
 }
 
@@ -455,7 +455,7 @@ mod tests {
         edges::insert_node_at_level(pool, id, kind, content, 0, scope, importance, None)
             .await
             .unwrap();
-        edges::embed_node(pool, nlp, id, content).await;
+        edges::embed_node(pool, nlp, scope, id, content).await;
         id
     }
 
