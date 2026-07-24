@@ -468,6 +468,64 @@ pub(crate) async fn list_state_objects_for(
 }
 
 // ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+pub async fn catalog_view(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Html<String>, super::Error> {
+    let catalog = crate::catalog::list_catalog_inner(&state.pool, &user.user_id)
+        .await
+        .map_err(app_err_to_admin)?;
+    Ok(Html(views::catalog_view(&user.user_id, &catalog)))
+}
+
+// ---------------------------------------------------------------------------
+// Proposals
+// ---------------------------------------------------------------------------
+
+pub async fn proposals_view(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Html<String>, super::Error> {
+    let proposals = crate::proposals::list_proposals_inner(&state.pool, &user.user_id, None)
+        .await
+        .map_err(app_err_to_admin)?;
+    Ok(Html(views::proposals_view(&user.user_id, &proposals)))
+}
+
+pub async fn proposal_approve(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Response, super::Error> {
+    // Best-effort decision; a stale/foreign id just refreshes the queue.
+    let _ =
+        crate::proposals::approve_inner(&state.pool, &user.user_id, id, Some(&user.user_id)).await;
+    Ok(Redirect::to("/admin/proposals").into_response())
+}
+
+pub async fn proposal_deny(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Response, super::Error> {
+    let _ = crate::proposals::deny_inner(&state.pool, &user.user_id, id, Some(&user.user_id)).await;
+    Ok(Redirect::to("/admin/proposals").into_response())
+}
+
+/// Bridge an AppError from the shared modules into the admin UI's Error type.
+/// A DB failure surfaces as a 500; anything else (not-found/bad-request) is a
+/// 404 in the admin context — the admin pages don't distinguish finer than that.
+fn app_err_to_admin(e: crate::error::AppError) -> super::Error {
+    match e {
+        crate::error::AppError::Database(db) => super::Error::Db(db),
+        _ => super::Error::NotFound,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tokens
 // ---------------------------------------------------------------------------
 

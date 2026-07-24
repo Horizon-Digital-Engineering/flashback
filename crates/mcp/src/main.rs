@@ -213,6 +213,24 @@ pub struct RecallArgs {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ProposeArgs {
+    /// A short headline for the proposal.
+    pub title: String,
+    /// The proposed action to take (or, for kind="insight", the insight itself).
+    pub action: String,
+    /// Optional "action" | "insight". Defaults to "action".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Why — the reasoning behind the proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// Raw record ids (uuids) that justify the proposal. Each must be one of the
+    /// caller's own records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ids: Option<Vec<String>>,
+}
+
 #[tool_router]
 impl Flashback {
     pub fn new(flashback_url: String) -> Self {
@@ -273,6 +291,44 @@ impl Flashback {
         let bearer = bearer_or_err(&ctx)?;
         let body = to_json(&args)?;
         let res = self.post("/records/context", &bearer, body).await?;
+        result_ok(res)
+    }
+
+    #[tool(
+        description = "List the data catalog: every store the lake knows about, grouped by kind \
+                       (raw / curated / operational / external), each with its schema, current \
+                       record count, and lineage. The answer to 'is my data organized and can I \
+                       see it?'. The raw + curated layers register automatically."
+    )]
+    async fn flashback_catalog(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let bearer = bearer_or_err(&ctx)?;
+        let res = self.get("/catalog", &bearer).await?;
+        result_ok(res)
+    }
+
+    #[tool(
+        description = "Propose an action or insight for the operator to decide on — Flashback \
+                       proposes, it never acts. Cite the raw record ids that justify it via \
+                       `evidence_ids`. The proposal lands as 'proposed'; a human approves or \
+                       denies it, and the host (not Flashback) carries out any approved action."
+    )]
+    async fn flashback_propose(
+        &self,
+        Parameters(args): Parameters<ProposeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let bearer = bearer_or_err(&ctx)?;
+        let body = json!({
+            "title": args.title,
+            "action": args.action,
+            "kind": args.kind,
+            "rationale": args.rationale,
+            "evidence": args.evidence_ids.unwrap_or_default(),
+        });
+        let res = self.post("/proposals", &bearer, body).await?;
         result_ok(res)
     }
 

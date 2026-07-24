@@ -63,6 +63,8 @@ fn render_nav(active: &str, user_id: &str) -> String {
   {d}
   {e}
   {f}
+  {g}
+  {h}
   <span class="spacer"></span>
   <span class="user">{user_id}</span>
   <a href="/admin/logout">logout</a>
@@ -70,9 +72,11 @@ fn render_nav(active: &str, user_id: &str) -> String {
         a = item("dashboard", "/admin", "Dashboard"),
         b = item("memories", "/admin/memories", "Memories"),
         c = item("state", "/admin/state", "State"),
-        d = item("map", "/admin/map", "Map"),
-        e = item("consolidate", "/admin/consolidate", "Consolidate"),
-        f = item("tokens", "/admin/tokens", "Tokens"),
+        d = item("catalog", "/admin/catalog", "Catalog"),
+        e = item("proposals", "/admin/proposals", "Proposals"),
+        f = item("map", "/admin/map", "Map"),
+        g = item("consolidate", "/admin/consolidate", "Consolidate"),
+        h = item("tokens", "/admin/tokens", "Tokens"),
     )
 }
 
@@ -523,6 +527,163 @@ pub fn state_list(user_id: &str, states: &[MemoryView]) -> String {
 {body}"#
     );
     page("state", user_id, &content)
+}
+
+// ---------------------------------------------------------------------------
+// Catalog (the store map)
+// ---------------------------------------------------------------------------
+
+pub fn catalog_view(user_id: &str, catalog: &crate::catalog::CatalogView) -> String {
+    let section = |title: &str, blurb: &str, stores: &[crate::catalog::StoreView]| -> String {
+        let mut cards = String::new();
+        if stores.is_empty() {
+            cards.push_str(r#"<p class="muted">none</p>"#);
+        }
+        for s in stores {
+            let schema_pre = match &s.store.schema {
+                Some(v) => format!(
+                    r#"<pre class="json">{}</pre>"#,
+                    esc(&serde_json::to_string_pretty(v).unwrap_or_default())
+                ),
+                None => r#"<p class="muted">no declared schema</p>"#.to_string(),
+            };
+            let synced = match s.store.last_synced_at {
+                Some(t) => format!("synced {}", format_when(t)),
+                None => "never synced".to_string(),
+            };
+            cards.push_str(&format!(
+                r#"<div class="card">
+  <h3 style="margin-top:0"><code>{name}</code> <span class="pill">{kind}</span></h3>
+  <p><strong>{count}</strong> records · <span class="muted">{lineage}</span></p>
+  <p class="muted" style="font-size:12px">{desc}</p>
+  {schema}
+  <p class="muted" style="font-size:12px">{synced}</p>
+</div>"#,
+                name = esc(&s.store.name),
+                kind = esc(&s.store.kind),
+                count = s.record_count,
+                lineage = esc(&s.lineage),
+                desc = esc(s.store.description.as_deref().unwrap_or("")),
+                schema = schema_pre,
+                synced = synced,
+            ));
+        }
+        format!(
+            r#"<section style="margin-top:24px">
+  <h2>{title}</h2>
+  <p class="muted">{blurb}</p>
+  {cards}
+</section>"#
+        )
+    };
+
+    let content = format!(
+        r#"<h1>Catalog</h1>
+<p class="muted">Every store the lake knows about, grouped by kind. The raw + curated layers register themselves with a live schema and record count; operational/external stores you register publish slices into the lake on sync.</p>
+{raw}
+{curated}
+{operational}
+{external}"#,
+        raw = section("Raw", "The immutable source of truth.", &catalog.raw),
+        curated = section(
+            "Curated",
+            "Derived from raw and rebuildable from it.",
+            &catalog.curated
+        ),
+        operational = section(
+            "Operational",
+            "Live systems that publish slices into the lake.",
+            &catalog.operational
+        ),
+        external = section(
+            "External",
+            "Outside sources the lake ingests from.",
+            &catalog.external
+        ),
+    );
+    page("catalog", user_id, &content)
+}
+
+// ---------------------------------------------------------------------------
+// Proposals (the review queue)
+// ---------------------------------------------------------------------------
+
+pub fn proposals_view(user_id: &str, proposals: &[crate::proposals::ProposalRow]) -> String {
+    let mut body = String::new();
+    if proposals.is_empty() {
+        body.push_str(
+            r#"<p class="muted">No proposals. The lake surfaces a suggestion here — it never acts on its own; you decide.</p>"#,
+        );
+    }
+    for p in proposals {
+        let action = p.body.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let rationale = p
+            .body
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let evidence = p
+            .body
+            .get("evidence")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let status_pill = match p.status.as_str() {
+            "proposed" => r#"<span class="pill" style="color:var(--fg-0)">proposed</span>"#,
+            "approved" => r#"<span class="pill" style="color:var(--good)">approved</span>"#,
+            "denied" => r#"<span class="pill" style="color:var(--bad)">denied</span>"#,
+            "executed" => r#"<span class="pill" style="color:var(--good)">executed</span>"#,
+            _ => r#"<span class="pill">?</span>"#,
+        };
+        // Approve/deny are only offered while the proposal is still 'proposed'.
+        // The lake never executes: there is no execute button here — completion
+        // is reported by the host, not triggered from this queue.
+        let actions = if p.status == "proposed" {
+            format!(
+                r#"<form method="post" action="/admin/proposals/{id}/approve" class="inline">
+     <button type="submit" class="btn">approve</button>
+   </form>
+   <form method="post" action="/admin/proposals/{id}/deny" class="inline">
+     <button type="submit" class="btn danger">deny</button>
+   </form>"#,
+                id = p.id
+            )
+        } else {
+            let decided = match (&p.decided_by, p.decided_at) {
+                (Some(who), Some(at)) => format!("by {} · {}", esc(who), format_when(at)),
+                (None, Some(at)) => format_when(at),
+                _ => String::new(),
+            };
+            format!(r#"<span class="muted" style="font-size:12px">{decided}</span>"#)
+        };
+        body.push_str(&format!(
+            r#"<div class="card">
+  <h2 style="margin-top:0">{title} <span class="pill">{kind}</span> {status}</h2>
+  <p><strong>Action:</strong> {action}</p>
+  {rationale_html}
+  <p class="muted" style="font-size:12px">{ev} evidence record(s) · created {created}</p>
+  <div style="display:flex;gap:8px">{actions}</div>
+</div>"#,
+            title = esc(&p.title),
+            kind = esc(&p.kind),
+            status = status_pill,
+            action = esc(action),
+            rationale_html = if rationale.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<p><strong>Rationale:</strong> {}</p>"#, esc(rationale))
+            },
+            ev = evidence,
+            created = format_when(p.created_at),
+            actions = actions,
+        ));
+    }
+    let content = format!(
+        r#"<h1>Proposals</h1>
+<p class="muted">The lake proposes; you decide. Approving hands the action to the host to carry out — the lake itself never executes.</p>
+{body}"#
+    );
+    page("proposals", user_id, &content)
 }
 
 // ---------------------------------------------------------------------------

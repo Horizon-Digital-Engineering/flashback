@@ -1,4 +1,5 @@
 mod auth;
+mod catalog;
 mod chunking;
 mod config;
 mod consolidation;
@@ -8,6 +9,7 @@ mod decay;
 mod error;
 mod models;
 mod nlp;
+mod proposals;
 mod references;
 mod retrieval;
 mod routes;

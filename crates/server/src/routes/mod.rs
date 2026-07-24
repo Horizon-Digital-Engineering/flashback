@@ -19,6 +19,8 @@ pub fn router(state: AppState) -> Router {
         .nest("/state", state::router(state.clone()))
         .nest("/context", context::router(state.clone()))
         .nest("/records", records::router(state.clone()))
+        .nest("/catalog", crate::catalog::router(state.clone()))
+        .nest("/proposals", crate::proposals::router(state.clone()))
         .route("/lineage/{id}", get(memory::lineage))
         .with_state(state)
 }
