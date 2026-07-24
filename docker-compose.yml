@@ -115,6 +115,24 @@ services:
       # debugging from the host.
       - "127.0.0.1:11434:11434"
 
+  # Neon-style raw data browser (tables, columns, rows, ad-hoc SQL) over the same
+  # pgvector DB — "see your data". Opt-in tool: only starts with `--profile tools`,
+  # so it never runs in production. Full DB access, so it binds loopback-only;
+  # SSH-tunnel or front it with auth to view remotely.
+  pgweb:
+    image: sosedoff/pgweb:latest
+    restart: unless-stopped
+    profiles: ["tools"]
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - "--bind=0.0.0.0"
+      - "--listen=8081"
+      - "--url=postgres://flashback:${POSTGRES_PASSWORD:-flashback}@db:5432/flashback?sslmode=disable"
+    ports:
+      - "127.0.0.1:8081:8081"
+
 volumes:
   pgdata:
   ollama:
