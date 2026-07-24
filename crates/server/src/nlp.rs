@@ -218,8 +218,8 @@ impl Nlp {
     }
 
     /// True if the configured provider supports distill_facts (i.e. is an
-    /// LLM provider, not the heuristic). The consolidation worker checks
-    /// this before running the weekly job.
+    /// LLM provider, not the heuristic). The curation pipeline checks this
+    /// before running the semantic-distill derivation.
     pub fn provider_can_distill(&self) -> bool {
         self.provider.capabilities().fact_distillation
     }
@@ -304,7 +304,7 @@ pub trait NlpService: Send + Sync {
     fn extract_entities(&self, text: &str) -> Vec<String>;
     async fn extract_full(&self, text: &str) -> Result<Extraction, AppError>;
     /// Forwarded to the underlying AiProvider. Heuristic-only providers
-    /// return `Err(NotConfigured)`; consolidation worker checks
+    /// return `Err(NotConfigured)`; the curation pipeline checks
     /// `provider_can_distill()` before calling.
     async fn distill_facts(
         &self,

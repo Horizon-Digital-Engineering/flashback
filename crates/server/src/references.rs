@@ -16,9 +16,8 @@
 //! through the normal ingest path with `supersedes` = the old terminal id; the
 //! old row is never mutated (append-only).
 //!
-//! This is a NEW raw-native surface. The legacy `memories`-backed `/state/*`
-//! routes are untouched; these endpoints live under `/records/state/*` and
-//! share the raw door's bearer auth and ingest path.
+//! The raw-native reference surface: these endpoints live under
+//! `/records/state/*` and share the raw door's bearer auth and ingest path.
 
 use axum::{
     extract::{Path, State},

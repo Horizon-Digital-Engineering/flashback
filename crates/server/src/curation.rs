@@ -1,10 +1,9 @@
-//! Curation pipeline over `raw_records` — the NEW derived layer.
+//! Curation pipeline over `raw_records` — the derived layer.
 //!
-//! This is a fresh build on the immutable raw layer, deliberately separate from
-//! the legacy `memories`/`consolidation` world (which is untouched). The
-//! contract: raw is read-only and immutable; curation only ever INSERTs into
-//! `curated_*`, and the whole curated set is rebuildable from raw. That's what
-//! `rebuild` proves — wipe curation, re-derive, get the same set back.
+//! Built on the immutable raw layer. The contract: raw is read-only and
+//! immutable; curation only ever INSERTs into `curated_*`, and the whole curated
+//! set is rebuildable from raw. That's what `rebuild` proves — wipe curation,
+//! re-derive, get the same set back.
 //!
 //! Two derivations, both scoped to a single (user, project, mode) tuple and
 //! never crossing it:
@@ -440,8 +439,7 @@ pub async fn rebuild(
 }
 
 /// Rebuild the curated layer for every user with raw records. The background
-/// scheduler uses this; it never reads the legacy `memories` table (that's the
-/// legacy consolidator's job) — it lists users straight from `raw_records`.
+/// scheduler uses this; it lists users straight from `raw_records`.
 pub async fn rebuild_all_users(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -636,9 +634,8 @@ pub(crate) mod edges {
 }
 
 // ---------------------------------------------------------------------------
-// Entity-overlap clustering. Greedy single-link on entity Jaccard — the same
-// signal the legacy consolidator uses, ported to raw-derived entities. Returns
-// clusters as index groups into `episodes`.
+// Entity-overlap clustering. Greedy single-link on entity Jaccard over
+// raw-derived entities. Returns clusters as index groups into `episodes`.
 // ---------------------------------------------------------------------------
 
 fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
@@ -1052,7 +1049,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn consolidation_never_crosses_a_mode_boundary(pool: PgPool) {
+    async fn curation_never_crosses_a_mode_boundary(pool: PgPool) {
         // Two records with an IDENTICAL entity set (jaccard 1.0) that would
         // cluster into one semantic fact — except they live in different modes.
         // Curation is scoped per (user, project, mode), so they must NOT merge.

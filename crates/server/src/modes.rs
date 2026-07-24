@@ -2,8 +2,8 @@
 //!
 //! A mode pins an embedder + vector dimension, so a record ingested in one mode
 //! is embedded in that mode's geometry and only ever compared against records in
-//! the same geometry. Retrieval, curation, and consolidation all scope by
-//! `(user_id, mode)` and never cross a mode boundary.
+//! the same geometry. Retrieval and curation both scope by `(user_id, mode)`
+//! and never cross a mode boundary.
 //!
 //! Four built-in registers ship out of the box (general/code/journal/research),
 //! seeded under the reserved `'*'` template user by migration 014. The first

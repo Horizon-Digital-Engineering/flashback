@@ -1,26 +1,28 @@
 //! Browser admin UI.
 //!
 //! Server-rendered HTML, cookie-based session, zero external JS/CSS deps
-//! (per the project's "minimize third parties" stance). Routes:
+//! (per the project's "minimize third parties" stance). It renders the
+//! canonical world: raw records, the curated layer, references, the data
+//! catalog, and the operator proposal queue. Routes:
 //!
 //!   GET  /admin/login          — login form
 //!   POST /admin/login          — accept token, set cookie, redirect
 //!   GET  /admin/logout         — clear cookie, redirect to login
 //!   GET  /admin                — dashboard
-//!   GET  /admin/memories       — list (filterable, paginated)
-//!   GET  /admin/memories/:id   — detail (extraction + lineage)
-//!   POST /admin/memories/:id/delete       — hard delete
-//!   POST /admin/memories/:id/supersede    — mark superseded by a new content
-//!   GET  /admin/state          — list state objects
+//!   GET  /admin/records        — raw record list (filterable, native mode filter)
+//!   GET  /admin/records/:id    — raw record detail (entities + supersede chain)
+//!   GET  /admin/curated        — curated node list
+//!   GET  /admin/state          — references (state_object raw records)
+//!   GET  /admin/catalog        — data catalog
+//!   GET  /admin/proposals      — proposal queue
+//!   POST /admin/proposals/:id/approve|deny
 //!   GET  /admin/tokens         — token management
 //!   POST /admin/tokens/:id/revoke         — revoke a token
 //!   GET  /admin/map            — interactive embedding scatterplot
 //!   GET  /admin/api/map.json   — projected coordinates for the scatterplot
+//!   GET  /admin/curate         — curation status + trigger
+//!   POST /admin/api/curate     — run the curated-layer rebuild for this user
 //!   GET  /admin/style.css      — embedded stylesheet
-//!
-//! A later evolution: the /admin/map view will get a Three.js 3D
-//! renderer + true UMAP projection. Today it ships as 2D PCA in SVG —
-//! same data, less spectacle, zero JS dependencies.
 
 use axum::{
     routing::{get, post},
@@ -72,9 +74,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         )
         .route("/logout", get(handlers::logout))
         .route("/style.css", get(handlers::style_css))
-        .route("/memories", get(handlers::memories_list))
-        .route("/memories/{id}", get(handlers::memory_detail))
-        .route("/memories/{id}/delete", post(handlers::memory_delete))
+        .route("/records", get(handlers::records_list))
+        .route("/records/{id}", get(handlers::record_detail))
+        .route("/curated", get(handlers::curated_list))
         .route("/state", get(handlers::state_list))
         .route("/catalog", get(handlers::catalog_view))
         .route("/proposals", get(handlers::proposals_view))
@@ -84,11 +86,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/tokens/{id}/revoke", post(handlers::token_revoke))
         .route("/map", get(handlers::map_view))
         .route("/api/map.json", get(handlers::map_data))
-        .route("/consolidate", get(handlers::consolidate_view))
-        .route(
-            "/api/consolidate/{kind}",
-            post(handlers::consolidate_trigger),
-        )
+        .route("/curate", get(handlers::curate_view))
         .route("/api/curate", post(handlers::curate_trigger))
         .with_state(state)
 }

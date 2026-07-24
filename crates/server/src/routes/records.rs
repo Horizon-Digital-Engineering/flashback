@@ -50,8 +50,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/context", post(assemble))
         .route("/summaries", get(summaries))
         .route("/rebuild", post(rebuild_curation))
-        // The raw-native reference surface (state_object records). NEW; the
-        // legacy `memories`-backed /state/* routes are untouched.
+        // The raw-native reference surface (state_object records).
         .nest("/state", crate::references::router(state.clone()))
         .route("/{id}", get(get_record))
         .route("/{id}/lineage", get(lineage))

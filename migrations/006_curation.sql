@@ -1,10 +1,8 @@
--- The CURATED layer built FRESH on `raw_records` (medallion "silver/gold").
+-- The CURATED layer built on `raw_records` (medallion "silver/gold").
 -- Derived + rebuildable: raw is immutable and never mutated; curation only ever
--- INSERTs here and can be wiped + rebuilt from raw at any time. This is a NEW
--- layer alongside the legacy `memories`/`consolidation` world — that path is
--- untouched.
+-- INSERTs here and can be wiped + rebuilt from raw at any time.
 --
--- 005 already scaffolded bare `curated_nodes`/`curated_edges`; this migration
+-- 003 already scaffolded bare `curated_nodes`/`curated_edges`; this migration
 -- promotes them to load-bearing: scope + lineage columns, an embeddings table
 -- mirroring `raw_embeddings`, and the indexes the pipeline reads by.
 
