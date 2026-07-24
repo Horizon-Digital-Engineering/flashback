@@ -24,12 +24,7 @@ jobs:
           persist-credentials: false
 
       - name: Run analysis
-        # NB: pinned to tag (not SHA) because the scorecard webapp's workflow
-        # verification rejects SHA-pinned uses with "imposter commit" — see
-        # https://github.com/ossf/scorecard-action#workflow-restrictions
-        # The SARIF upload step below still pins by SHA so this is the only
-        # exception in the workflow.
-        uses: ossf/scorecard-action@v2.4.3
+        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a # v2.4.3
         with:
           results_file: results.sarif
           results_format: sarif

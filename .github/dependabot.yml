@@ -3,11 +3,14 @@ updates:
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
-    # Lowered from 10 → 5 after the first weekly batch burned ~200 Actions-min
-    # in 10 min on the fresh repo. Combined with the `major` group below this
-    # caps the worst case at ~2 PRs per ecosystem per week.
+      interval: "monthly"
+    # Wait a week before proposing a freshly published version — a
+    # newly compromised or yanked release is likely caught in that window.
+    cooldown:
+      default-days: 7
+    # A monthly cadence keeps the update load light; combined with the split
+    # below this caps the worst case at ~2 PRs for this ecosystem per run
+    # (minor/patch batched together, major separate).
     open-pull-requests-limit: 5
     groups:
       minor-and-patch:
@@ -23,8 +26,9 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       actions:
@@ -38,7 +42,8 @@ updates:
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
-      interval: "weekly"
-      day: "monday"
+      interval: "monthly"
+    cooldown:
+      default-days: 7
     labels:
       - "deps"

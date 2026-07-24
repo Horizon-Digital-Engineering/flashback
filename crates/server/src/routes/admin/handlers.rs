@@ -1222,7 +1222,9 @@ mod tests {
             ..MemoryQuery::default()
         };
         assert_eq!(
-            count_memories(&pool, "alice", &proj_a_sess_1).await.unwrap(),
+            count_memories(&pool, "alice", &proj_a_sess_1)
+                .await
+                .unwrap(),
             1
         );
     }
@@ -1245,7 +1247,10 @@ mod tests {
             include_superseded: Some("1".to_string()),
             ..MemoryQuery::default()
         };
-        assert_eq!(count_memories(&pool, "alice", &with_super).await.unwrap(), 2);
+        assert_eq!(
+            count_memories(&pool, "alice", &with_super).await.unwrap(),
+            2
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1398,7 +1403,10 @@ mod tests {
     async fn list_state_objects_scoped_to_user(pool: PgPool) {
         insert_state(&pool, "alice", "todo", "a").await;
         insert_state(&pool, "bob", "todo", "b").await;
-        assert_eq!(list_state_objects_for(&pool, "alice").await.unwrap().len(), 1);
+        assert_eq!(
+            list_state_objects_for(&pool, "alice").await.unwrap().len(),
+            1
+        );
         assert_eq!(list_state_objects_for(&pool, "bob").await.unwrap().len(), 1);
     }
 
