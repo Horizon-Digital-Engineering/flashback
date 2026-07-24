@@ -46,8 +46,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/import", post(import_records))
         .route("/query", post(query_records))
         .route("/context", post(assemble))
-        .route("/:id", get(get_record))
-        .route("/:id/lineage", get(lineage))
+        .route("/{id}", get(get_record))
+        .route("/{id}/lineage", get(lineage))
         .with_state(state)
 }
 

@@ -30,9 +30,9 @@ use crate::{
 
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/:kind", axum::routing::post(create))
-        .route("/:kind/:key", get(get_current).patch(patch).put(replace))
-        .route("/:kind/:key/history", get(history))
+        .route("/{kind}", axum::routing::post(create))
+        .route("/{kind}/{key}", get(get_current).patch(patch).put(replace))
+        .route("/{kind}/{key}/history", get(history))
         .with_state(state)
 }
 

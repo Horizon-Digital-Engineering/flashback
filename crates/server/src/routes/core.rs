@@ -22,7 +22,7 @@ use crate::{
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/", get(list).post(create))
-        .route("/:id", get(get_one).put(update).delete(delete))
+        .route("/{id}", get(get_one).put(update).delete(delete))
         .with_state(state)
 }
 

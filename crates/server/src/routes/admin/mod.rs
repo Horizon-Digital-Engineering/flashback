@@ -73,16 +73,16 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/logout", get(handlers::logout))
         .route("/style.css", get(handlers::style_css))
         .route("/memories", get(handlers::memories_list))
-        .route("/memories/:id", get(handlers::memory_detail))
-        .route("/memories/:id/delete", post(handlers::memory_delete))
+        .route("/memories/{id}", get(handlers::memory_detail))
+        .route("/memories/{id}/delete", post(handlers::memory_delete))
         .route("/state", get(handlers::state_list))
         .route("/tokens", get(handlers::tokens_list))
-        .route("/tokens/:id/revoke", post(handlers::token_revoke))
+        .route("/tokens/{id}/revoke", post(handlers::token_revoke))
         .route("/map", get(handlers::map_view))
         .route("/api/map.json", get(handlers::map_data))
         .route("/consolidate", get(handlers::consolidate_view))
         .route(
-            "/api/consolidate/:kind",
+            "/api/consolidate/{kind}",
             post(handlers::consolidate_trigger),
         )
         .with_state(state)

@@ -23,8 +23,8 @@ pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/ingest", post(ingest))
         .route("/search", post(search))
-        .route("/:id", get(get_memory))
-        .route("/:id/supersede", put(supersede))
+        .route("/{id}", get(get_memory))
+        .route("/{id}/supersede", put(supersede))
         .with_state(state)
 }
 
