@@ -3,6 +3,7 @@ pub mod context;
 pub mod core;
 pub mod health;
 pub mod memory;
+pub mod records;
 pub mod state;
 
 use axum::{routing::get, Router};
@@ -17,6 +18,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/memory", memory::router(state.clone()))
         .nest("/state", state::router(state.clone()))
         .nest("/context", context::router(state.clone()))
+        .nest("/records", records::router(state.clone()))
         .route("/lineage/:id", get(memory::lineage))
         .with_state(state)
 }
