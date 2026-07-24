@@ -148,7 +148,11 @@ pub(crate) async fn ingest_record(
                 .await?;
         match owner {
             Some(u) if u == user_id => {}
-            _ => return Err(AppError::bad_request(format!("supersedes target {sid} not found"))),
+            _ => {
+                return Err(AppError::bad_request(format!(
+                    "supersedes target {sid} not found"
+                )))
+            }
         }
     }
 
@@ -320,7 +324,10 @@ pub(crate) async fn import_records_inner(
         }
     }
 
-    Ok(ImportResponse { imported: inserted.len(), skipped: total - inserted.len() })
+    Ok(ImportResponse {
+        imported: inserted.len(),
+        skipped: total - inserted.len(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +357,9 @@ async fn query_records(
     auth_user: AuthUser,
     Json(req): Json<QueryRecordsRequest>,
 ) -> AppResult<Json<Vec<RawRecordRow>>> {
-    Ok(Json(query_records_inner(&state.pool, &auth_user.user_id, req).await?))
+    Ok(Json(
+        query_records_inner(&state.pool, &auth_user.user_id, req).await?,
+    ))
 }
 
 /// Active = not superseded (no newer row points at it) AND not expired.
@@ -506,7 +515,9 @@ async fn get_record(
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<RawRecordRow>> {
-    Ok(Json(get_record_inner(&state.pool, &auth_user.user_id, id).await?))
+    Ok(Json(
+        get_record_inner(&state.pool, &auth_user.user_id, id).await?,
+    ))
 }
 
 pub(crate) async fn get_record_inner(
@@ -535,7 +546,9 @@ async fn lineage(
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<RawRecordRow>>> {
-    Ok(Json(lineage_inner(&state.pool, &auth_user.user_id, id).await?))
+    Ok(Json(
+        lineage_inner(&state.pool, &auth_user.user_id, id).await?,
+    ))
 }
 
 pub(crate) async fn lineage_inner(
@@ -584,21 +597,34 @@ mod tests {
 
     #[async_trait]
     impl NlpService for StubNlp {
-        fn provider_name(&self) -> &'static str { "stub" }
-        fn provider_can_distill(&self) -> bool { false }
-        fn embedder_model_name(&self) -> &str { "stub-embedder" }
-        fn embedder_dimension(&self) -> usize { 384 }
+        fn provider_name(&self) -> &'static str {
+            "stub"
+        }
+        fn provider_can_distill(&self) -> bool {
+            false
+        }
+        fn embedder_model_name(&self) -> &str {
+            "stub-embedder"
+        }
+        fn embedder_dimension(&self) -> usize {
+            384
+        }
         async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
             Ok(vec![0.1_f32; 384]) // non-zero to keep cosine defined
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
             Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
         }
-        fn extract_entities(&self, _text: &str) -> Vec<String> { Vec::new() }
+        fn extract_entities(&self, _text: &str) -> Vec<String> {
+            Vec::new()
+        }
         async fn extract_full(&self, _text: &str) -> Result<Extraction, AppError> {
             Ok(Extraction::empty())
         }
-        async fn distill_facts(&self, _e: &[EpisodeRef]) -> Result<Vec<DistilledFact>, ProviderError> {
+        async fn distill_facts(
+            &self,
+            _e: &[EpisodeRef],
+        ) -> Result<Vec<DistilledFact>, ProviderError> {
             Err(ProviderError::NotConfigured("stub".into()))
         }
     }
@@ -623,14 +649,21 @@ mod tests {
 
     fn q() -> QueryRecordsRequest {
         QueryRecordsRequest {
-            project_id: None, session_id: None, mode: None,
-            r#type: None, since: None, until: None, limit: None,
+            project_id: None,
+            session_id: None,
+            mode: None,
+            r#type: None,
+            since: None,
+            until: None,
+            limit: None,
         }
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_and_query_roundtrip(pool: PgPool) {
-        let out = ingest_record(&pool, &StubNlp, "leslie", req("took 5mg lisinopril")).await.unwrap();
+        let out = ingest_record(&pool, &StubNlp, "leslie", req("took 5mg lisinopril"))
+            .await
+            .unwrap();
         let rows = query_records_inner(&pool, "leslie", q()).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, out.id);
@@ -639,24 +672,35 @@ mod tests {
 
         // The derived embedding landed in the separate table.
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_embeddings WHERE record_id = $1")
-            .bind(out.id).fetch_one(&pool).await.unwrap();
+            .bind(out.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn raw_records_are_immutable(pool: PgPool) {
-        let out = ingest_record(&pool, &StubNlp, "leslie", req("original")).await.unwrap();
+        let out = ingest_record(&pool, &StubNlp, "leslie", req("original"))
+            .await
+            .unwrap();
         let upd = sqlx::query("UPDATE raw_records SET content = 'tampered' WHERE id = $1")
-            .bind(out.id).execute(&pool).await;
+            .bind(out.id)
+            .execute(&pool)
+            .await;
         assert!(upd.is_err(), "UPDATE on raw_records should be blocked");
         let del = sqlx::query("DELETE FROM raw_records WHERE id = $1")
-            .bind(out.id).execute(&pool).await;
+            .bind(out.id)
+            .execute(&pool)
+            .await;
         assert!(del.is_err(), "DELETE on raw_records should be blocked");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn supersede_forward_pointer_hides_old_keeps_it(pool: PgPool) {
-        let v1 = ingest_record(&pool, &StubNlp, "leslie", req("weight 180")).await.unwrap();
+        let v1 = ingest_record(&pool, &StubNlp, "leslie", req("weight 180"))
+            .await
+            .unwrap();
         let mut r2 = req("weight 178");
         r2.supersedes = Some(v1.id);
         let v2 = ingest_record(&pool, &StubNlp, "leslie", r2).await.unwrap();
@@ -669,59 +713,125 @@ mod tests {
         assert_eq!(old.supersedes, None); // never mutated
 
         let line = lineage_inner(&pool, "leslie", v2.id).await.unwrap();
-        assert_eq!(line.iter().map(|r| r.id).collect::<Vec<_>>(), vec![v1.id, v2.id]);
+        assert_eq!(
+            line.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![v1.id, v2.id]
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn lineage_keeps_branched_siblings(pool: PgPool) {
-        let v1 = ingest_record(&pool, &StubNlp, "leslie", req("weight 180")).await.unwrap();
-        let mut ra = req("weight 178"); ra.supersedes = Some(v1.id);
+        let v1 = ingest_record(&pool, &StubNlp, "leslie", req("weight 180"))
+            .await
+            .unwrap();
+        let mut ra = req("weight 178");
+        ra.supersedes = Some(v1.id);
         let a = ingest_record(&pool, &StubNlp, "leslie", ra).await.unwrap();
-        let mut rb = req("weight 179"); rb.supersedes = Some(v1.id);
+        let mut rb = req("weight 179");
+        rb.supersedes = Some(v1.id);
         let b = ingest_record(&pool, &StubNlp, "leslie", rb).await.unwrap();
-        let mut got: Vec<_> = lineage_inner(&pool, "leslie", v1.id).await.unwrap().iter().map(|r| r.id).collect();
+        let mut got: Vec<_> = lineage_inner(&pool, "leslie", v1.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
         got.sort();
-        let mut want = vec![v1.id, a.id, b.id]; want.sort();
+        let mut want = vec![v1.id, a.id, b.id];
+        want.sort();
         assert_eq!(got, want); // all three; the branch sibling is not dropped
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn truncate_is_blocked(pool: PgPool) {
-        ingest_record(&pool, &StubNlp, "leslie", req("x")).await.unwrap();
-        let err = sqlx::query("TRUNCATE raw_records CASCADE").execute(&pool).await;
+        ingest_record(&pool, &StubNlp, "leslie", req("x"))
+            .await
+            .unwrap();
+        let err = sqlx::query("TRUNCATE raw_records CASCADE")
+            .execute(&pool)
+            .await;
         assert!(err.is_err(), "TRUNCATE on raw_records must be blocked");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn context_hybrid_ranks_keyword_over_recency(pool: PgPool) {
-        ingest_record(&pool, &StubNlp, "leslie", req("weighed 180 lbs")).await.unwrap();
-        ingest_record(&pool, &StubNlp, "leslie", req("discussed lisinopril dosage")).await.unwrap();
-        ingest_record(&pool, &StubNlp, "leslie", req("ate lunch")).await.unwrap();
+        ingest_record(&pool, &StubNlp, "leslie", req("weighed 180 lbs"))
+            .await
+            .unwrap();
+        ingest_record(
+            &pool,
+            &StubNlp,
+            "leslie",
+            req("discussed lisinopril dosage"),
+        )
+        .await
+        .unwrap();
+        ingest_record(&pool, &StubNlp, "leslie", req("ate lunch"))
+            .await
+            .unwrap();
         // Stub embeddings are uniform, so the vector term is constant and the
         // keyword term decides — the lisinopril record must come first.
-        let out = assemble_inner(&pool, &StubNlp, "leslie", AssembleRequest {
-            project_id: None, session_id: None, mode: None,
-            query: Some("lisinopril".into()), limit: None,
-        }).await.unwrap();
+        let out = assemble_inner(
+            &pool,
+            &StubNlp,
+            "leslie",
+            AssembleRequest {
+                project_id: None,
+                session_id: None,
+                mode: None,
+                query: Some("lisinopril".into()),
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
         assert!(out.records[0].content.contains("lisinopril"));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn context_empty_query_is_recency(pool: PgPool) {
-        ingest_record(&pool, &StubNlp, "leslie", req("first")).await.unwrap();
-        let latest = ingest_record(&pool, &StubNlp, "leslie", req("second")).await.unwrap();
-        let out = assemble_inner(&pool, &StubNlp, "leslie", AssembleRequest {
-            project_id: None, session_id: None, mode: None, query: None, limit: None,
-        }).await.unwrap();
+        ingest_record(&pool, &StubNlp, "leslie", req("first"))
+            .await
+            .unwrap();
+        let latest = ingest_record(&pool, &StubNlp, "leslie", req("second"))
+            .await
+            .unwrap();
+        let out = assemble_inner(
+            &pool,
+            &StubNlp,
+            "leslie",
+            AssembleRequest {
+                project_id: None,
+                session_id: None,
+                mode: None,
+                query: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(out.records[0].id, latest.id); // most recent first
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn scoped_and_isolated_by_user(pool: PgPool) {
-        ingest_record(&pool, &StubNlp, "leslie", req("mine")).await.unwrap();
-        ingest_record(&pool, &StubNlp, "bob", req("theirs")).await.unwrap();
-        assert_eq!(query_records_inner(&pool, "leslie", q()).await.unwrap().len(), 1);
-        assert_eq!(query_records_inner(&pool, "bob", q()).await.unwrap().len(), 1);
+        ingest_record(&pool, &StubNlp, "leslie", req("mine"))
+            .await
+            .unwrap();
+        ingest_record(&pool, &StubNlp, "bob", req("theirs"))
+            .await
+            .unwrap();
+        assert_eq!(
+            query_records_inner(&pool, "leslie", q())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            query_records_inner(&pool, "bob", q()).await.unwrap().len(),
+            1
+        );
         let leslies = query_records_inner(&pool, "leslie", q()).await.unwrap()[0].id;
         assert!(get_record_inner(&pool, "bob", leslies).await.is_err());
     }
@@ -733,42 +843,106 @@ mod tests {
             event_time: None,
             source: "chatgpt".into(),
             source_ref: source_ref.map(|s| s.into()),
-            project_id: None, session_id: None, mode: None,
-            importance: None, payload: None,
+            project_id: None,
+            session_id: None,
+            mode: None,
+            importance: None,
+            payload: None,
         }
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn import_bulk_then_dedup_on_reimport(pool: PgPool) {
-        let batch = ImportRequest { records: vec![imp("chat one", Some("m1")), imp("chat two", Some("m2"))] };
-        let out = import_records_inner(&pool, &StubNlp, "leslie", batch).await.unwrap();
+        let batch = ImportRequest {
+            records: vec![imp("chat one", Some("m1")), imp("chat two", Some("m2"))],
+        };
+        let out = import_records_inner(&pool, &StubNlp, "leslie", batch)
+            .await
+            .unwrap();
         assert_eq!((out.imported, out.skipped), (2, 0));
 
         // Re-import the same source_refs -> all deduped, nothing duplicated.
-        let batch2 = ImportRequest { records: vec![imp("chat one", Some("m1")), imp("chat two edited", Some("m2"))] };
-        let out2 = import_records_inner(&pool, &StubNlp, "leslie", batch2).await.unwrap();
+        let batch2 = ImportRequest {
+            records: vec![
+                imp("chat one", Some("m1")),
+                imp("chat two edited", Some("m2")),
+            ],
+        };
+        let out2 = import_records_inner(&pool, &StubNlp, "leslie", batch2)
+            .await
+            .unwrap();
         assert_eq!((out2.imported, out2.skipped), (0, 2));
-        assert_eq!(query_records_inner(&pool, "leslie", q()).await.unwrap().len(), 2);
+        assert_eq!(
+            query_records_inner(&pool, "leslie", q())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn import_without_source_ref_always_inserts(pool: PgPool) {
-        let b1 = ImportRequest { records: vec![imp("ok", None)] };
-        let b2 = ImportRequest { records: vec![imp("ok", None)] };
-        assert_eq!(import_records_inner(&pool, &StubNlp, "leslie", b1).await.unwrap().imported, 1);
-        assert_eq!(import_records_inner(&pool, &StubNlp, "leslie", b2).await.unwrap().imported, 1);
-        assert_eq!(query_records_inner(&pool, "leslie", q()).await.unwrap().len(), 2);
+        let b1 = ImportRequest {
+            records: vec![imp("ok", None)],
+        };
+        let b2 = ImportRequest {
+            records: vec![imp("ok", None)],
+        };
+        assert_eq!(
+            import_records_inner(&pool, &StubNlp, "leslie", b1)
+                .await
+                .unwrap()
+                .imported,
+            1
+        );
+        assert_eq!(
+            import_records_inner(&pool, &StubNlp, "leslie", b2)
+                .await
+                .unwrap()
+                .imported,
+            1
+        );
+        assert_eq!(
+            query_records_inner(&pool, "leslie", q())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn imported_records_are_embedded_and_searchable(pool: PgPool) {
-        let batch = ImportRequest { records: vec![imp("discussed lisinopril", Some("x1"))] };
-        assert_eq!(import_records_inner(&pool, &StubNlp, "leslie", batch).await.unwrap().imported, 1);
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_embeddings").fetch_one(&pool).await.unwrap();
+        let batch = ImportRequest {
+            records: vec![imp("discussed lisinopril", Some("x1"))],
+        };
+        assert_eq!(
+            import_records_inner(&pool, &StubNlp, "leslie", batch)
+                .await
+                .unwrap()
+                .imported,
+            1
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_embeddings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(n, 1);
-        let ctx = assemble_inner(&pool, &StubNlp, "leslie", AssembleRequest {
-            project_id: None, session_id: None, mode: None, query: Some("lisinopril".into()), limit: None,
-        }).await.unwrap();
+        let ctx = assemble_inner(
+            &pool,
+            &StubNlp,
+            "leslie",
+            AssembleRequest {
+                project_id: None,
+                session_id: None,
+                mode: None,
+                query: Some("lisinopril".into()),
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(ctx.records.len(), 1);
     }
 }
