@@ -180,6 +180,39 @@ pub struct Flashback {
     tool_router: ToolRouter<Flashback>,
 }
 
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RecordArgs {
+    /// episodic | semantic | working | document | procedural | state_object
+    pub r#type: String,
+    pub content: String,
+    /// Origin tag, e.g. "chatgpt", "ritsu:health", "finance-sync".
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub importance: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_hours: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RecallArgs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i64>,
+}
+
 #[tool_router]
 impl Flashback {
     pub fn new(flashback_url: String) -> Self {
@@ -207,6 +240,39 @@ impl Flashback {
         let bearer = bearer_or_err(&ctx)?;
         let body = to_json(&args)?;
         let res = self.post("/memory/ingest", &bearer, body).await?;
+        result_ok(res)
+    }
+
+    #[tool(
+        description = "Store a raw record in Flashback's immutable raw layer: a conversation \
+                       turn, fact, document, event, or transaction. Universal typed record — set \
+                       `type` (episodic/semantic/working/document/procedural/state_object) and a \
+                       `source` tag. Append-only; never overwrites."
+    )]
+    async fn flashback_record(
+        &self,
+        Parameters(args): Parameters<RecordArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let bearer = bearer_or_err(&ctx)?;
+        let body = to_json(&args)?;
+        let res = self.post("/records", &bearer, body).await?;
+        result_ok(res)
+    }
+
+    #[tool(
+        description = "Recall the most relevant raw records for a query via hybrid semantic + \
+                       keyword retrieval over the immutable raw layer, scoped by \
+                       project/session/mode. Call before answering to ground in memory."
+    )]
+    async fn flashback_recall(
+        &self,
+        Parameters(args): Parameters<RecallArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let bearer = bearer_or_err(&ctx)?;
+        let body = to_json(&args)?;
+        let res = self.post("/records/context", &bearer, body).await?;
         result_ok(res)
     }
 
