@@ -60,6 +60,8 @@ impl AiProvider for HeuristicProvider {
             topic,
             intent,
             operation,
+            // No LLM to classify the register — leave it to the project default.
+            mode: None,
             entities,
             action_target,
             contradicts_hint: None,

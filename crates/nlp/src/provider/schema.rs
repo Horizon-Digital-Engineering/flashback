@@ -1,8 +1,8 @@
 //! The shape every backend produces, regardless of how it got there.
 //!
 //! All three providers — heuristic, local LLM, remote LLM — return the same
-//! `Extraction` struct. The Phase 1 supersede heuristic only consumed
-//! `entities`; Phase 2b reads `topic` + `intent` + `operation` to do
+//! `Extraction` struct. The original supersede heuristic only consumed
+//! `entities`; the semantic path reads `topic` + `intent` + `operation` to do
 //! semantic supersede instead of string-Jaccard.
 
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,7 @@ pub enum Operation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extraction {
     /// Canonical topic phrase for this memory. e.g. "deploy target",
-    /// "auth middleware". Used for semantic supersede in Phase 2b.
+    /// "auth middleware". Used for semantic supersede.
     #[serde(default)]
     pub topic: Option<String>,
 
@@ -60,8 +60,15 @@ pub struct Extraction {
     #[serde(default)]
     pub operation: Option<Operation>,
 
+    /// The cognitive register this turn belongs to (e.g. "code", "general",
+    /// "journal", "research"). Auto-classified by an LLM provider when the
+    /// caller didn't pin a mode; `None` when unclear (the project default then
+    /// wins). The heuristic provider always returns `None`.
+    #[serde(default)]
+    pub mode: Option<String>,
+
     /// Multi-word noun phrases. Always populated, even by the heuristic.
-    /// Kept for back-compat with Phase 1's entity-Jaccard fingerprint.
+    /// Kept for back-compat with the original entity-Jaccard fingerprint.
     #[serde(default)]
     pub entities: Vec<String>,
 
@@ -72,7 +79,7 @@ pub struct Extraction {
     pub action_target: Option<String>,
 
     /// Free-text claim being contradicted, if `operation=contradict`.
-    /// Phase 3 surfaces this via a /conflicts endpoint.
+    /// Surfaced later via a /conflicts endpoint.
     #[serde(default)]
     pub contradicts_hint: Option<String>,
 
@@ -94,6 +101,7 @@ impl Extraction {
             topic: None,
             intent: Intent::Unknown,
             operation: None,
+            mode: None,
             entities: Vec::new(),
             action_target: None,
             contradicts_hint: None,

@@ -1,7 +1,7 @@
 -- The immutable RAW layer (medallion "bronze"): the universal typed record every
--- consumer writes. Distinct from `memories` (which conflates raw + curation):
--- raw_records is APPEND-ONLY and holds NO embeddings — embeddings + curated views
--- + references live in the derived tables below and are rebuildable from raw.
+-- consumer writes. raw_records is APPEND-ONLY and holds NO embeddings — embeddings
+-- + curated views + references live in the derived tables below and are
+-- rebuildable from raw.
 --
 -- The one move nobody else makes: `supersedes` is a FORWARD pointer on the NEW
 -- record; the old row is never mutated. "Superseded" is a derived status (is this

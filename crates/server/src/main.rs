@@ -1,14 +1,16 @@
 mod auth;
-mod chunking;
+mod catalog;
 mod config;
-mod consolidation;
+mod curation;
 mod db;
+mod decay;
 mod error;
-mod models;
+mod modes;
 mod nlp;
-mod retrieval;
+mod proposals;
+mod references;
 mod routes;
-mod state;
+mod summaries;
 
 use std::sync::Arc;
 
@@ -91,16 +93,16 @@ async fn run_serve() -> Result<()> {
         cfg: cfg_arc.clone(),
     };
 
-    // Consolidation scheduler — daily promote + weekly distill.
-    // FLASHBACK_DISABLE_CONSOLIDATION=1 turns it off (useful for tests).
-    let disable_consolidation = matches!(
-        std::env::var("FLASHBACK_DISABLE_CONSOLIDATION").as_deref(),
+    // Curation scheduler — rebuilds the curated layer from raw_records.
+    // FLASHBACK_DISABLE_CURATION=1 turns it off (useful for tests).
+    let disable_curation = matches!(
+        std::env::var("FLASHBACK_DISABLE_CURATION").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes")
     );
-    if !disable_consolidation {
-        spawn_consolidation_scheduler(state.clone());
+    if !disable_curation {
+        spawn_curation_scheduler(state.clone());
     } else {
-        tracing::warn!("FLASHBACK_DISABLE_CONSOLIDATION=1 — scheduler not spawned");
+        tracing::warn!("FLASHBACK_DISABLE_CURATION=1 — curation scheduler not spawned");
     }
 
     let app = routes::router(state.clone())
@@ -215,52 +217,28 @@ async fn token_revoke_cli(pool: &sqlx::PgPool, args: &[String]) -> Result<String
     }
 }
 
-/// Spawn a background tokio task that runs the consolidation jobs on a
-/// schedule. The first tick fires 60s after startup (gives the server time
-/// to settle); subsequent ticks fire on the configured intervals.
-///
-/// Failures are logged, not panicked — a single failed consolidation should
-/// never bring down the server.
-fn spawn_consolidation_scheduler(state: AppState) {
-    let daily_interval = std::env::var("FLASHBACK_CONSOLIDATION_DAILY_HOURS")
+/// Spawn a background task that rebuilds the curated layer (promote + distill)
+/// for every user on an interval. It lists users from `raw_records` and only
+/// ever INSERTs into `curated_*`. Failures are logged, never fatal.
+fn spawn_curation_scheduler(state: AppState) {
+    let interval_hours = std::env::var("FLASHBACK_CURATION_HOURS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(24);
-    let weekly_interval = std::env::var("FLASHBACK_CONSOLIDATION_WEEKLY_HOURS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(24 * 7);
 
-    let s_daily = state.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        // Settle after startup so first-boot logs don't interleave.
+        tokio::time::sleep(std::time::Duration::from_secs(180)).await;
         let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(daily_interval * 3600));
-        // First tick fires immediately; that's fine since we already slept 60s.
+            tokio::time::interval(std::time::Duration::from_secs(interval_hours * 3600));
         loop {
             interval.tick().await;
-            tracing::info!("consolidation: daily tick");
-            let _ = consolidation::run_daily_all_users(&s_daily.pool).await;
+            tracing::info!("curation: scheduled tick");
+            let _ = curation::rebuild_all_users(&state.pool, &*state.nlp).await;
         }
     });
 
-    let s_weekly = state;
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(weekly_interval * 3600));
-        loop {
-            interval.tick().await;
-            tracing::info!("consolidation: weekly tick");
-            let _ = consolidation::run_weekly_all_users(&s_weekly.pool, &s_weekly.nlp).await;
-        }
-    });
-
-    tracing::info!(
-        daily_h = daily_interval,
-        weekly_h = weekly_interval,
-        "consolidation scheduler armed"
-    );
+    tracing::info!(interval_h = interval_hours, "curation scheduler armed");
 }
 
 fn take_flag(args: &[String], name: &str) -> Option<String> {

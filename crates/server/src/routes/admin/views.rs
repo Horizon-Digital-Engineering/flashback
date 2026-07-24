@@ -1,12 +1,14 @@
 //! HTML rendering helpers. Hand-rolled `format!` calls — no templating crate.
+//!
+//! Every view renders the canonical world: raw records, the curated layer,
+//! references, the catalog, and the proposal queue.
 
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
-use serde_json::Value;
 use uuid::Uuid;
 
-use crate::models::{CoreMemoryRow, MemoryView};
+use super::handlers::RawAdminRow;
 
 /// Set once at startup by `main.rs`. Read by `page()` and `login_page()` to
 /// render the dev banner — saves threading a `dev_mode` parameter through
@@ -63,16 +65,22 @@ fn render_nav(active: &str, user_id: &str) -> String {
   {d}
   {e}
   {f}
+  {g}
+  {h}
+  {i}
   <span class="spacer"></span>
   <span class="user">{user_id}</span>
   <a href="/admin/logout">logout</a>
 </nav>"#,
         a = item("dashboard", "/admin", "Dashboard"),
-        b = item("memories", "/admin/memories", "Memories"),
-        c = item("state", "/admin/state", "State"),
-        d = item("map", "/admin/map", "Map"),
-        e = item("consolidate", "/admin/consolidate", "Consolidate"),
-        f = item("tokens", "/admin/tokens", "Tokens"),
+        b = item("records", "/admin/records", "Records"),
+        c = item("curated", "/admin/curated", "Curated"),
+        d = item("state", "/admin/state", "State"),
+        e = item("catalog", "/admin/catalog", "Catalog"),
+        f = item("proposals", "/admin/proposals", "Proposals"),
+        g = item("map", "/admin/map", "Map"),
+        h = item("curate", "/admin/curate", "Curate"),
+        i = item("tokens", "/admin/tokens", "Tokens"),
     )
 }
 
@@ -120,33 +128,34 @@ pub fn login_page(error: Option<&str>) -> String {
 // ---------------------------------------------------------------------------
 
 pub struct DashboardStats {
-    pub memories_total: i64,
-    pub memories_terminal: i64,
+    pub records_total: i64,
+    pub records_terminal: i64,
     pub state_objects: i64,
+    pub curated_nodes: i64,
+    pub proposals_pending: i64,
     pub tokens_active: i64,
     pub provider: String,
     pub embedder_model: String,
     pub embedder_dim: usize,
 }
 
-pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[MemoryView]) -> String {
+pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[RawAdminRow]) -> String {
     let mut recent_html =
-        String::from(r#"<div class="card"><h2 style="margin-top:0">Recent memories</h2>"#);
+        String::from(r#"<div class="card"><h2 style="margin-top:0">Recent records</h2>"#);
     if recent.is_empty() {
-        recent_html.push_str(
-            r#"<p class="muted">No memories yet. Ingest some via POST /memory/ingest.</p>"#,
-        );
+        recent_html
+            .push_str(r#"<p class="muted">No records yet. Ingest some via POST /records.</p>"#);
     } else {
         recent_html.push_str(
-            "<table><thead><tr><th>type</th><th>content</th><th>created</th></tr></thead><tbody>",
+            "<table><thead><tr><th>type</th><th>content</th><th>event</th></tr></thead><tbody>",
         );
-        for m in recent {
+        for r in recent {
             recent_html.push_str(&format!(
-                r#"<tr><td>{ty}</td><td><a href="/admin/memories/{id}"><div class="content-preview">{content}</div></a></td><td class="mono muted">{when}</td></tr>"#,
-                ty = type_pill(&m.type_),
-                id = m.id,
-                content = esc(&m.content),
-                when = format_when(m.created_at),
+                r#"<tr><td>{ty}</td><td><a href="/admin/records/{id}"><div class="content-preview">{content}</div></a></td><td class="mono muted">{when}</td></tr>"#,
+                ty = type_pill(&r.r#type),
+                id = r.id,
+                content = esc(&r.content),
+                when = format_when(r.event_time),
             ));
         }
         recent_html.push_str("</tbody></table>");
@@ -156,9 +165,11 @@ pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[MemoryView]) ->
     let content = format!(
         r#"<h1>Dashboard</h1>
 <div class="stat-grid">
-  <div class="stat"><div class="label">Memories (terminal)</div><div class="value">{term}</div></div>
-  <div class="stat"><div class="label">Memories (all)</div><div class="value">{total}</div></div>
+  <div class="stat"><div class="label">Records (terminal)</div><div class="value">{term}</div></div>
+  <div class="stat"><div class="label">Records (all)</div><div class="value">{total}</div></div>
   <div class="stat"><div class="label">State objects</div><div class="value">{state}</div></div>
+  <div class="stat"><div class="label">Curated nodes</div><div class="value">{curated}</div></div>
+  <div class="stat"><div class="label">Proposals pending</div><div class="value">{proposals}</div></div>
   <div class="stat"><div class="label">Active tokens</div><div class="value">{tok}</div></div>
 </div>
 <div class="row">
@@ -173,16 +184,18 @@ pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[MemoryView]) ->
   </div>
   <div class="card">
     <h2 style="margin-top:0">Quick links</h2>
-    <p><a href="/admin/memories">Browse memories →</a></p>
+    <p><a href="/admin/records">Browse records →</a></p>
+    <p><a href="/admin/curated">Curated layer →</a></p>
     <p><a href="/admin/map">Embedding map →</a></p>
-    <p><a href="/admin/state">State objects →</a></p>
-    <p><a href="/admin/tokens">Tokens →</a></p>
+    <p><a href="/admin/proposals">Proposal queue →</a></p>
   </div>
 </div>
 {recent}"#,
-        term = stats.memories_terminal,
-        total = stats.memories_total,
+        term = stats.records_terminal,
+        total = stats.records_total,
         state = stats.state_objects,
+        curated = stats.curated_nodes,
+        proposals = stats.proposals_pending,
         tok = stats.tokens_active,
         embed = esc(&stats.embedder_model),
         dim = stats.embedder_dim,
@@ -194,26 +207,29 @@ pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[MemoryView]) ->
 }
 
 // ---------------------------------------------------------------------------
-// Memories list
+// Records list
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-pub struct MemoriesFilter {
+pub struct RecordsFilter {
     pub r#type: Option<String>,
     pub project_id: Option<String>,
     pub session_id: Option<String>,
+    /// Cognitive register (mode) filter — a NATIVE `raw_records.mode` predicate.
+    pub mode: Option<String>,
     pub include_superseded: bool,
 }
 
-pub fn memories_list(
+pub fn records_list(
     user_id: &str,
-    filter: &MemoriesFilter,
-    memories: &[MemoryView],
+    filter: &RecordsFilter,
+    mode_names: &[String],
+    records: &[RawAdminRow],
     total: i64,
 ) -> String {
     let q = build_query_string(filter);
     let mut filter_form = String::from(
-        r#"<form method="get" action="/admin/memories" class="card" style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">"#,
+        r#"<form method="get" action="/admin/records" class="card" style="display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end">"#,
     );
     filter_form.push_str(&format!(
         r#"<div><label class="muted">Type</label><br />
@@ -242,6 +258,22 @@ pub fn memories_list(
         esc(filter.session_id.as_deref().unwrap_or(""))
     ));
     filter_form.push_str(&format!(
+        r#"<div><label class="muted">Mode</label><br />
+            <select name="mode" style="background:var(--bg-2);color:var(--fg-0);border:1px solid var(--border);border-radius:6px;padding:8px;min-width:140px">
+              <option value="" {sel_any}>any</option>
+              {opts}
+            </select></div>"#,
+        sel_any = if filter.mode.is_none() { "selected" } else { "" },
+        opts = mode_names
+            .iter()
+            .map(|m| {
+                let sel = if filter.mode.as_deref() == Some(m.as_str()) { "selected" } else { "" };
+                format!(r#"<option value="{m}" {sel}>{m}</option>"#, m = esc(m))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    ));
+    filter_form.push_str(&format!(
         r#"<div><label><input type="checkbox" name="include_superseded" value="1" {} /> include superseded</label></div>"#,
         if filter.include_superseded { "checked" } else { "" }
     ));
@@ -252,55 +284,51 @@ pub fn memories_list(
         r#"<table>
 <thead><tr>
   <th>type</th>
-  <th>topic / content</th>
+  <th>content</th>
   <th>entities</th>
-  <th>created</th>
-  <th></th>
+  <th>mode</th>
+  <th>event</th>
 </tr></thead>
 <tbody>"#,
     );
-    for m in memories {
-        let topic = m
+    for r in records {
+        let topic = r
             .state_key
             .as_deref()
             .map(|k| format!("<strong>{}</strong> &nbsp;", esc(k)))
             .unwrap_or_default();
-        let entities = if m.entities.is_empty() {
-            "<span class=\"muted\">—</span>".to_string()
+        let entities = render_entities(&r.entities, 5);
+        let mode = r
+            .mode
+            .as_deref()
+            .map(|m| format!(r#"<code>{}</code>"#, esc(m)))
+            .unwrap_or_else(|| r#"<span class="muted">—</span>"#.to_string());
+        let sup = if r.superseded {
+            r#" <span class="pill" style="color:var(--bad)">superseded</span>"#
         } else {
-            format!(
-                r#"<div class="tag-list">{}</div>"#,
-                m.entities
-                    .iter()
-                    .take(5)
-                    .map(|e| format!(r#"<span class="tag">{}</span>"#, esc(e)))
-                    .collect::<Vec<_>>()
-                    .join("")
-            )
+            ""
         };
         table.push_str(&format!(
-            r#"<tr><td>{ty}</td><td><a href="/admin/memories/{id}">{topic}<div class="content-preview">{content}</div></a></td><td>{ents}</td><td class="mono muted">{when}</td><td class="right">
-  <form method="post" action="/admin/memories/{id}/delete" class="inline" onsubmit="return confirm('Hard delete this memory? This cannot be undone.')">
-    <button type="submit" class="btn danger">delete</button>
-  </form>
-</td></tr>"#,
-            ty = type_pill(&m.type_),
-            id = m.id,
+            r#"<tr><td>{ty}</td><td><a href="/admin/records/{id}">{topic}<div class="content-preview">{content}</div></a>{sup}</td><td>{ents}</td><td>{mode}</td><td class="mono muted">{when}</td></tr>"#,
+            ty = type_pill(&r.r#type),
+            id = r.id,
             topic = topic,
-            content = esc(&m.content),
+            content = esc(&r.content),
+            sup = sup,
             ents = entities,
-            when = format_when(m.created_at),
+            mode = mode,
+            when = format_when(r.event_time),
         ));
     }
-    if memories.is_empty() {
+    if records.is_empty() {
         table.push_str(
-            r#"<tr><td colspan="5"><p class="muted" style="text-align:center;padding:16px">No memories match the current filter.</p></td></tr>"#,
+            r#"<tr><td colspan="5"><p class="muted" style="text-align:center;padding:16px">No records match the current filter.</p></td></tr>"#,
         );
     }
     table.push_str("</tbody></table>");
 
     let content = format!(
-        r#"<h1>Memories</h1>
+        r#"<h1>Records</h1>
 <p class="muted">{total} total matching this filter. URL state: <code>?{q}</code></p>
 {filter_form}
 {table}"#,
@@ -309,10 +337,10 @@ pub fn memories_list(
         filter_form = filter_form,
         table = table,
     );
-    page("memories", user_id, &content)
+    page("records", user_id, &content)
 }
 
-fn build_query_string(f: &MemoriesFilter) -> String {
+fn build_query_string(f: &RecordsFilter) -> String {
     let mut parts = Vec::new();
     if let Some(t) = &f.r#type {
         parts.push(format!("type={}", t));
@@ -323,63 +351,50 @@ fn build_query_string(f: &MemoriesFilter) -> String {
     if let Some(s) = &f.session_id {
         parts.push(format!("session_id={}", s));
     }
+    if let Some(m) = &f.mode {
+        parts.push(format!("mode={}", m));
+    }
     if f.include_superseded {
         parts.push("include_superseded=1".to_string());
     }
     parts.join("&")
 }
 
-// ---------------------------------------------------------------------------
-// Memory detail
-// ---------------------------------------------------------------------------
-
-pub fn memory_detail(
-    user_id: &str,
-    m: &MemoryView,
-    chain: &[MemoryView],
-    extraction: Option<&Value>,
-) -> String {
-    let terminal_id = chain
-        .iter()
-        .find(|v| v.superseded_by.is_none())
-        .map(|v| v.id);
-    let chain_html = render_chain(chain, terminal_id, m.id);
-    let extraction_html = match extraction {
-        Some(v) => format!(
-            r#"<pre class="json">{}</pre>"#,
-            esc(&serde_json::to_string_pretty(v).unwrap_or_default())
-        ),
-        None => {
-            r#"<p class="muted">No structured extraction recorded for this memory.</p>"#.to_string()
-        }
-    };
-    let entities_html = if m.entities.is_empty() {
+fn render_entities(entities: &[String], take: usize) -> String {
+    if entities.is_empty() {
         "<span class=\"muted\">—</span>".to_string()
     } else {
         format!(
             r#"<div class="tag-list">{}</div>"#,
-            m.entities
+            entities
                 .iter()
+                .take(take)
                 .map(|e| format!(r#"<span class="tag">{}</span>"#, esc(e)))
                 .collect::<Vec<_>>()
                 .join("")
         )
-    };
+    }
+}
 
-    let state_block = if let Some(data) = &m.state_data {
-        format!(
-            r#"<div class="card"><h2 style="margin-top:0">State data — {kind}/{key}</h2>
-<pre class="json">{json}</pre></div>"#,
-            kind = esc(m.state_kind.as_deref().unwrap_or("?")),
-            key = esc(m.state_key.as_deref().unwrap_or("?")),
-            json = esc(&serde_json::to_string_pretty(data).unwrap_or_default())
-        )
-    } else {
-        String::new()
+// ---------------------------------------------------------------------------
+// Record detail
+// ---------------------------------------------------------------------------
+
+pub fn record_detail(user_id: &str, r: &RawAdminRow, chain: &[RawAdminRow]) -> String {
+    let terminal_id = chain.iter().find(|v| !v.superseded).map(|v| v.id);
+    let chain_html = render_chain(chain, terminal_id, r.id);
+    let entities_html = render_entities(&r.entities, usize::MAX);
+
+    let payload_html = match &r.payload {
+        Some(v) => format!(
+            r#"<pre class="json">{}</pre>"#,
+            esc(&serde_json::to_string_pretty(v).unwrap_or_default())
+        ),
+        None => r#"<p class="muted">No structured payload on this record.</p>"#.to_string(),
     };
 
     let content = format!(
-        r#"<p><a href="/admin/memories">← back to memories</a></p>
+        r#"<p><a href="/admin/records">← back to records</a></p>
 <h1>{ty} <span class="mono muted" style="font-size:14px;font-weight:normal">{id}</span></h1>
 
 <div class="row">
@@ -387,7 +402,7 @@ pub fn memory_detail(
     <h2 style="margin-top:0">Content</h2>
     <pre class="json">{content}</pre>
     <p class="muted" style="margin-top:12px;font-size:12px">
-      created {when} · importance {imp:.2} · decay <code>{decay}</code>{sup}
+      event {when} · source <code>{source}</code>{imp}{mode}{sup}
     </p>
     <div style="margin-top:16px">
       <span class="muted">entities:</span> {ents}
@@ -396,37 +411,36 @@ pub fn memory_detail(
     {session}
   </div>
   <div class="card">
-    <h2 style="margin-top:0">Structured extraction</h2>
-    {extraction_html}
+    <h2 style="margin-top:0">Payload</h2>
+    {payload_html}
   </div>
 </div>
-
-{state_block}
 
 <div class="card">
   <h2 style="margin-top:0">Supersede chain ({n} node{plural})</h2>
   {chain_html}
-</div>
-
-<form method="post" action="/admin/memories/{id}/delete" onsubmit="return confirm('Hard delete this memory? This cannot be undone.')">
-  <button type="submit" class="btn danger">Delete this memory</button>
-</form>"#,
-        ty = type_pill(&m.type_),
-        id = m.id,
-        content = esc(&m.content),
-        when = format_when(m.created_at),
-        imp = m.importance,
-        decay = esc(&m.decay_class),
-        sup = if let Some(s) = m.superseded_by {
-            format!(
-                " · superseded by <a href=\"/admin/memories/{s}\">{}</a>",
-                short_id(s)
-            )
+</div>"#,
+        ty = type_pill(&r.r#type),
+        id = r.id,
+        content = esc(&r.content),
+        when = format_when(r.event_time),
+        source = esc(&r.source),
+        imp = r
+            .importance
+            .map(|i| format!(" · importance {i:.2}"))
+            .unwrap_or_default(),
+        mode = r
+            .mode
+            .as_deref()
+            .map(|m| format!(" · mode <code>{}</code>", esc(m)))
+            .unwrap_or_default(),
+        sup = if r.superseded {
+            " · <span class=\"pill\" style=\"color:var(--bad)\">superseded</span>".to_string()
         } else {
             String::new()
         },
         ents = entities_html,
-        project = m
+        project = r
             .project_id
             .as_deref()
             .map(|p| format!(
@@ -434,35 +448,34 @@ pub fn memory_detail(
                 esc(p)
             ))
             .unwrap_or_default(),
-        session = m
+        session = r
             .session_id
             .as_deref()
             .map(|s| format!(r#"<p class="muted">session: <code>{}</code></p>"#, esc(s)))
             .unwrap_or_default(),
-        extraction_html = extraction_html,
-        state_block = state_block,
+        payload_html = payload_html,
         n = chain.len(),
         plural = if chain.len() == 1 { "" } else { "s" },
         chain_html = chain_html,
     );
 
-    page("memories", user_id, &content)
+    page("records", user_id, &content)
 }
 
-fn render_chain(chain: &[MemoryView], terminal_id: Option<Uuid>, current_id: Uuid) -> String {
+fn render_chain(chain: &[RawAdminRow], terminal_id: Option<Uuid>, current_id: Uuid) -> String {
     if chain.is_empty() {
         return r#"<p class="muted">No supersede chain.</p>"#.to_string();
     }
     let mut out = String::from(r#"<div class="chain">"#);
-    for (i, m) in chain.iter().enumerate() {
-        let is_terminal = terminal_id == Some(m.id);
-        let is_current = current_id == m.id;
+    for (i, r) in chain.iter().enumerate() {
+        let is_terminal = terminal_id == Some(r.id);
+        let is_current = current_id == r.id;
         let cls = if is_terminal {
             "chain-node terminal"
         } else {
             "chain-node"
         };
-        let marker = if is_current { " (this memory)" } else { "" };
+        let marker = if is_current { " (this record)" } else { "" };
         let terminal_label = if is_terminal {
             r#" <span class="pill t-semantic">current</span>"#
         } else {
@@ -472,15 +485,15 @@ fn render_chain(chain: &[MemoryView], terminal_id: Option<Uuid>, current_id: Uui
             r#"<div class="{cls}">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
     <div style="flex:1">
-      <strong><a href="/admin/memories/{id}">{short}</a></strong>{terminal_label} <span class="mono muted">{when}</span>{marker}
+      <strong><a href="/admin/records/{id}">{short}</a></strong>{terminal_label} <span class="mono muted">{when}</span>{marker}
       <div class="content-preview" style="margin-top:6px;color:var(--fg-0)">{content}</div>
     </div>
   </div>
 </div>"#,
-            id = m.id,
-            short = short_id(m.id),
-            content = esc(&m.content),
-            when = format_when(m.created_at),
+            id = r.id,
+            short = short_id(r.id),
+            content = esc(&r.content),
+            when = format_when(r.event_time),
         ));
         if i < chain.len() - 1 {
             out.push_str(r#"<div class="chain-arrow">↓ superseded by</div>"#);
@@ -491,13 +504,51 @@ fn render_chain(chain: &[MemoryView], terminal_id: Option<Uuid>, current_id: Uui
 }
 
 // ---------------------------------------------------------------------------
-// State objects
+// Curated layer
 // ---------------------------------------------------------------------------
 
-pub fn state_list(user_id: &str, states: &[MemoryView]) -> String {
+pub struct CuratedNodeView {
+    pub kind: String,
+    pub content: String,
+    pub level: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+pub fn curated_list(user_id: &str, nodes: &[CuratedNodeView]) -> String {
+    let mut body = String::new();
+    if nodes.is_empty() {
+        body.push_str(r#"<p class="muted">No curated nodes yet. Run a curation pass from the <a href="/admin/curate">Curate</a> page (or wait for the scheduler) to promote + distill raw records.</p>"#);
+    } else {
+        body.push_str(
+            r#"<table><thead><tr><th>kind</th><th>level</th><th>content</th><th>created</th></tr></thead><tbody>"#,
+        );
+        for n in nodes {
+            body.push_str(&format!(
+                r#"<tr><td>{kind}</td><td class="mono">{level}</td><td><div class="content-preview">{content}</div></td><td class="mono muted">{when}</td></tr>"#,
+                kind = type_pill(&n.kind),
+                level = n.level,
+                content = esc(&n.content),
+                when = format_when(n.created_at),
+            ));
+        }
+        body.push_str("</tbody></table>");
+    }
+    let content = format!(
+        r#"<h1>Curated layer</h1>
+<p class="muted">Derived from raw and rebuildable from it: promoted episodic records and distilled semantic facts, plus higher-level summary nodes. Level 0 is raw-adjacent; higher levels are summaries.</p>
+{body}"#
+    );
+    page("curated", user_id, &content)
+}
+
+// ---------------------------------------------------------------------------
+// State objects (references over raw)
+// ---------------------------------------------------------------------------
+
+pub fn state_list(user_id: &str, states: &[RawAdminRow]) -> String {
     let mut body = String::new();
     if states.is_empty() {
-        body.push_str(r#"<p class="muted">No state objects yet. Create one via POST /state/todo_list (or any other kind).</p>"#);
+        body.push_str(r#"<p class="muted">No state objects yet. Create one via POST /records/state/todo_list (or any other kind).</p>"#);
     } else {
         for s in states {
             let rendered = esc(&s.content);
@@ -505,7 +556,7 @@ pub fn state_list(user_id: &str, states: &[MemoryView]) -> String {
             let kind = esc(s.state_kind.as_deref().unwrap_or("?"));
             body.push_str(&format!(
                 r#"<div class="card">
-  <h2 style="margin-top:0"><a href="/admin/memories/{id}"><code>{kind}/{key}</code></a></h2>
+  <h2 style="margin-top:0"><a href="/admin/records/{id}"><code>{kind}/{key}</code></a></h2>
   <pre class="json">{rendered}</pre>
   <p class="muted" style="font-size:12px">updated {when}</p>
 </div>"#,
@@ -513,16 +564,173 @@ pub fn state_list(user_id: &str, states: &[MemoryView]) -> String {
                 kind = kind,
                 key = key,
                 rendered = rendered,
-                when = format_when(s.last_accessed_at),
+                when = format_when(s.event_time),
             ));
         }
     }
     let content = format!(
         r#"<h1>State objects</h1>
-<p class="muted">The "heap" — mutable named cells. See <a href="https://github.com/Horizon-Digital-Engineering/flashback/blob/main/docs/REFERENCES.md">docs/REFERENCES.md</a>.</p>
+<p class="muted">The "heap" — mutable named cells projected from state_object raw records. See <a href="https://github.com/Horizon-Digital-Engineering/flashback/blob/main/docs/REFERENCES.md">docs/REFERENCES.md</a>.</p>
 {body}"#
     );
     page("state", user_id, &content)
+}
+
+// ---------------------------------------------------------------------------
+// Catalog (the store map)
+// ---------------------------------------------------------------------------
+
+pub fn catalog_view(user_id: &str, catalog: &crate::catalog::CatalogView) -> String {
+    let section = |title: &str, blurb: &str, stores: &[crate::catalog::StoreView]| -> String {
+        let mut cards = String::new();
+        if stores.is_empty() {
+            cards.push_str(r#"<p class="muted">none</p>"#);
+        }
+        for s in stores {
+            let schema_pre = match &s.store.schema {
+                Some(v) => format!(
+                    r#"<pre class="json">{}</pre>"#,
+                    esc(&serde_json::to_string_pretty(v).unwrap_or_default())
+                ),
+                None => r#"<p class="muted">no declared schema</p>"#.to_string(),
+            };
+            let synced = match s.store.last_synced_at {
+                Some(t) => format!("synced {}", format_when(t)),
+                None => "never synced".to_string(),
+            };
+            cards.push_str(&format!(
+                r#"<div class="card">
+  <h3 style="margin-top:0"><code>{name}</code> <span class="pill">{kind}</span></h3>
+  <p><strong>{count}</strong> records · <span class="muted">{lineage}</span></p>
+  <p class="muted" style="font-size:12px">{desc}</p>
+  {schema}
+  <p class="muted" style="font-size:12px">{synced}</p>
+</div>"#,
+                name = esc(&s.store.name),
+                kind = esc(&s.store.kind),
+                count = s.record_count,
+                lineage = esc(&s.lineage),
+                desc = esc(s.store.description.as_deref().unwrap_or("")),
+                schema = schema_pre,
+                synced = synced,
+            ));
+        }
+        format!(
+            r#"<section style="margin-top:24px">
+  <h2>{title}</h2>
+  <p class="muted">{blurb}</p>
+  {cards}
+</section>"#
+        )
+    };
+
+    let content = format!(
+        r#"<h1>Catalog</h1>
+<p class="muted">Every store the lake knows about, grouped by kind. The raw + curated layers register themselves with a live schema and record count; operational/external stores you register publish slices into the lake on sync.</p>
+{raw}
+{curated}
+{operational}
+{external}"#,
+        raw = section("Raw", "The immutable source of truth.", &catalog.raw),
+        curated = section(
+            "Curated",
+            "Derived from raw and rebuildable from it.",
+            &catalog.curated
+        ),
+        operational = section(
+            "Operational",
+            "Live systems that publish slices into the lake.",
+            &catalog.operational
+        ),
+        external = section(
+            "External",
+            "Outside sources the lake ingests from.",
+            &catalog.external
+        ),
+    );
+    page("catalog", user_id, &content)
+}
+
+// ---------------------------------------------------------------------------
+// Proposals (the review queue)
+// ---------------------------------------------------------------------------
+
+pub fn proposals_view(user_id: &str, proposals: &[crate::proposals::ProposalRow]) -> String {
+    let mut body = String::new();
+    if proposals.is_empty() {
+        body.push_str(
+            r#"<p class="muted">No proposals. The lake surfaces a suggestion here — it never acts on its own; you decide.</p>"#,
+        );
+    }
+    for p in proposals {
+        let action = p.body.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        let rationale = p
+            .body
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let evidence = p
+            .body
+            .get("evidence")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let status_pill = match p.status.as_str() {
+            "proposed" => r#"<span class="pill" style="color:var(--fg-0)">proposed</span>"#,
+            "approved" => r#"<span class="pill" style="color:var(--good)">approved</span>"#,
+            "denied" => r#"<span class="pill" style="color:var(--bad)">denied</span>"#,
+            "executed" => r#"<span class="pill" style="color:var(--good)">executed</span>"#,
+            _ => r#"<span class="pill">?</span>"#,
+        };
+        // Approve/deny are only offered while the proposal is still 'proposed'.
+        // The lake never executes: there is no execute button here — completion
+        // is reported by the host, not triggered from this queue.
+        let actions = if p.status == "proposed" {
+            format!(
+                r#"<form method="post" action="/admin/proposals/{id}/approve" class="inline">
+     <button type="submit" class="btn">approve</button>
+   </form>
+   <form method="post" action="/admin/proposals/{id}/deny" class="inline">
+     <button type="submit" class="btn danger">deny</button>
+   </form>"#,
+                id = p.id
+            )
+        } else {
+            let decided = match (&p.decided_by, p.decided_at) {
+                (Some(who), Some(at)) => format!("by {} · {}", esc(who), format_when(at)),
+                (None, Some(at)) => format_when(at),
+                _ => String::new(),
+            };
+            format!(r#"<span class="muted" style="font-size:12px">{decided}</span>"#)
+        };
+        body.push_str(&format!(
+            r#"<div class="card">
+  <h2 style="margin-top:0">{title} <span class="pill">{kind}</span> {status}</h2>
+  <p><strong>Action:</strong> {action}</p>
+  {rationale_html}
+  <p class="muted" style="font-size:12px">{ev} evidence record(s) · created {created}</p>
+  <div style="display:flex;gap:8px">{actions}</div>
+</div>"#,
+            title = esc(&p.title),
+            kind = esc(&p.kind),
+            status = status_pill,
+            action = esc(action),
+            rationale_html = if rationale.is_empty() {
+                String::new()
+            } else {
+                format!(r#"<p><strong>Rationale:</strong> {}</p>"#, esc(rationale))
+            },
+            ev = evidence,
+            created = format_when(p.created_at),
+            actions = actions,
+        ));
+    }
+    let content = format!(
+        r#"<h1>Proposals</h1>
+<p class="muted">The lake proposes; you decide. Approving hands the action to the host to carry out — the lake itself never executes.</p>
+{body}"#
+    );
+    page("proposals", user_id, &content)
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +810,7 @@ pub fn tokens_list(user_id: &str, tokens: &[TokenView]) -> String {
 pub fn map_view(user_id: &str, node_count: usize, edge_count: usize) -> String {
     let content = format!(
         r#"<h1>Mind map</h1>
-<p class="muted">{n} memories, {e} edges. <strong>3D scene</strong> rendered in plain canvas2d — hand-rolled perspective projection, depth-sorted, no Three.js / WebGL / framework. Drag to orbit the camera, scroll to zoom, click a node to open. Switch to 2D for the force-directed flat layout.</p>
+<p class="muted">{n} records, {e} edges. <strong>3D scene</strong> rendered in plain canvas2d — hand-rolled perspective projection, depth-sorted, no Three.js / WebGL / framework. Drag to orbit the camera, scroll to zoom, click a node to open. Switch to 2D for the force-directed flat layout.</p>
 
 <div class="map-wrap">
   <canvas id="map-canvas"></canvas>
@@ -625,7 +833,7 @@ pub fn map_view(user_id: &str, node_count: usize, edge_count: usize) -> String {
   <div id="map-tooltip" class="map-tooltip"></div>
   <div id="map-status" style="position:absolute;left:12px;top:12px;background:rgba(20,22,28,0.92);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px;color:var(--fg-2)">loading…</div>
 </div>
-<p class="map-help">Memories at their PCA-projected positions (3 principal components of the 384-dim embedding). Distance ≈ semantic similarity. Edge color = supersede / entity-overlap / same-session.</p>
+<p class="map-help">Records at their PCA-projected positions (3 principal components of the 384-dim embedding). Distance ≈ semantic similarity. Edge color = supersede / entity-overlap / same-session.</p>
 {js}"#,
         n = node_count,
         e = edge_count,
@@ -635,95 +843,62 @@ pub fn map_view(user_id: &str, node_count: usize, edge_count: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Consolidation
+// Curation status + trigger
 // ---------------------------------------------------------------------------
 
-pub fn consolidate_view(
+pub fn curate_view(
     user_id: &str,
-    runs: &[impl serde::Serialize],
+    counts: &[(String, i64)],
     provider_can_distill: bool,
     provider_name: &str,
 ) -> String {
-    let runs_json = serde_json::to_value(runs).unwrap_or(Value::Null);
-    let rows_arr = runs_json.as_array().cloned().unwrap_or_default();
     let mut rows_html = String::new();
-    for r in rows_arr.iter() {
-        let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-        let trigger = r.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
-        let started = r.get("started_at").and_then(|v| v.as_str()).unwrap_or("?");
-        let finished = r.get("finished_at").and_then(|v| v.as_str()).unwrap_or("—");
-        let promoted = r
-            .get("promoted_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let expired = r.get("expired_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let distilled = r
-            .get("distilled_count")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let user = r.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
-        let err = r.get("error").and_then(|v| v.as_str()).unwrap_or("");
-        let status = if !err.is_empty() {
-            format!(
-                r#"<span class="pill" style="color:var(--bad)">error</span> <span class="muted">{}</span>"#,
-                esc(err)
-            )
-        } else if finished == "—" {
-            r#"<span class="pill" style="color:var(--warn)">running</span>"#.to_string()
-        } else {
-            format!(
-                r#"<span class="pill" style="color:var(--good)">ok</span> +{promoted} promoted · {expired} expired · {distilled} distilled"#
-            )
-        };
+    for (kind, n) in counts {
         rows_html.push_str(&format!(
-            r#"<tr><td><span class="pill">{kind}</span></td><td>{trigger}</td><td>{status}</td><td class="muted">{user}</td><td class="mono muted">{started}</td></tr>"#,
-            kind = esc(kind),
-            trigger = esc(trigger),
-            status = status,
-            user = esc(user),
-            started = esc(&started.chars().take(19).collect::<String>()),
+            r#"<tr><td>{kind}</td><td class="mono">{n}</td></tr>"#,
+            kind = type_pill(kind),
+            n = n,
         ));
     }
-    if rows_arr.is_empty() {
-        rows_html.push_str(r#"<tr><td colspan="5" class="muted" style="text-align:center;padding:16px">No consolidation runs yet. Trigger one below or wait for the daily/weekly scheduler.</td></tr>"#);
+    if counts.is_empty() {
+        rows_html.push_str(
+            r#"<tr><td colspan="2" class="muted" style="text-align:center;padding:16px">No curated nodes yet. Run a pass below to promote + distill your raw records.</td></tr>"#,
+        );
     }
 
     let distill_note = if provider_can_distill {
         format!(
-            r#"<p class="muted" style="font-size:13px">Weekly distillation uses provider <code>{}</code> — LLM-grade fact extraction is available.</p>"#,
+            r#"<p class="muted" style="font-size:13px">Distillation uses provider <code>{}</code> — LLM-grade fact extraction is available.</p>"#,
             esc(provider_name)
         )
     } else {
         format!(
             r#"<div class="error" style="background:rgba(255,189,85,0.08);border-color:var(--warn);color:var(--warn)">
-                Current provider <code>{}</code> does not implement fact distillation. The weekly job will skip with a warning until you set <code>PROVIDER=remote</code> (or <code>=embedded</code>) and supply credentials/model. The daily job (promote working→episodic) still works fine.
+                Current provider <code>{}</code> does not implement fact distillation. A curation pass still promotes working → episodic records; semantic distillation is skipped with a warning until you set <code>PROVIDER=remote</code> (or <code>=embedded</code>) and supply credentials/model.
             </div>"#,
             esc(provider_name)
         )
     };
 
     let content = format!(
-        r#"<h1>Consolidation</h1>
-<p class="muted">Daily promotes <code>working</code> → <code>episodic</code> based on importance / access. Weekly clusters episodic memories ≥7d old by topic + entity overlap and asks the AI provider to distill them into <code>semantic</code> facts.</p>
+        r#"<h1>Curate</h1>
+<p class="muted">Rebuild the curated layer from raw: promote important/accessed <code>working</code> records to <code>episodic</code>, then cluster episodic records by topic + entity overlap and distill them into <code>semantic</code> facts. Raw is never touched — curation only writes the <code>curated_*</code> tables.</p>
 {distill_note}
 <div class="card" style="display:flex;gap:12px;align-items:center">
-  <form method="post" action="/admin/api/consolidate/daily" class="inline">
-    <button type="submit">Run daily now</button>
-  </form>
-  <form method="post" action="/admin/api/consolidate/weekly" class="inline">
-    <button type="submit">Run weekly now</button>
+  <form method="post" action="/admin/api/curate" class="inline">
+    <button type="submit">Run curation now</button>
   </form>
   <span class="muted" style="font-size:12px">manual runs scope to <code>{user_id}</code>; the scheduler iterates all users.</span>
 </div>
-<h2>Recent runs</h2>
+<h2>Curated nodes by kind</h2>
 <table>
-<thead><tr><th>kind</th><th>trigger</th><th>status</th><th>user</th><th>started</th></tr></thead>
+<thead><tr><th>kind</th><th>count</th></tr></thead>
 <tbody>{rows_html}</tbody>
 </table>"#,
         user_id = esc(user_id),
     );
 
-    page("consolidate", user_id, &content)
+    page("curate", user_id, &content)
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,8 +1296,3 @@ pub fn esc(s: &str) -> String {
     }
     out
 }
-
-// CoreMemoryRow display is referenced in dashboard helpers from handlers.rs;
-// keep the import alive even if no current call site uses it.
-#[allow(dead_code)]
-fn _link_to_core(_c: &CoreMemoryRow) {}

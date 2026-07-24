@@ -45,87 +45,21 @@ fn any_json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Sche
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct RememberArgs {
-    /// Raw text to remember. Either this OR user_turn/assistant_turn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_turn: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assistant_turn: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    /// One of: working, episodic, semantic, procedural. Defaults to "working".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub r#type: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub importance: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_hours: Option<i64>,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct SearchArgs {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
-    /// "answer" (relevance-weighted) or "manager" (situational-awareness-weighted)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub top_k: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_types: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub include_superseded: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct AssembleArgs {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recent_turns_floor: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct SupersedeArgs {
-    /// UUID of the memory being superseded.
-    pub memory_id: String,
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub importance: Option<f32>,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct LineageArgs {
-    pub memory_id: String,
+    /// UUID of the raw record whose supersede chain to walk.
+    pub record_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct CoreAddArgs {
-    pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub importance: Option<f32>,
-}
-
-#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct StateCreateArgs {
-    /// Currently supported: "todo_list".
+pub struct StateSetArgs {
+    /// The reference kind, e.g. "todo_list" or any app-defined kind.
     pub kind: String,
+    /// The unique key within that kind (each (kind, key) is one reference).
     pub state_key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The COMPLETE new current value for this reference (never a delta). A new
+    /// append-only state_object raw record is written superseding the prior one.
     #[schemars(schema_with = "any_json_schema")]
-    pub initial: Option<Value>,
+    pub data: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,29 +75,8 @@ pub struct StateLookupArgs {
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct StatePatchArgs {
+pub struct StateListArgs {
     pub kind: String,
-    pub state_key: String,
-    /// For kind="todo_list": "add" | "mark_done" | "unmark" | "toggle" |
-    /// "remove" | "update" | "reorder" | "replace" | "clear".
-    pub op: String,
-    /// Required by: add, update.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// Required by: mark_done, unmark, toggle, remove, update.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub item_id: Option<String>,
-    /// Required by: reorder (full list of existing item ids in new order).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ids: Option<Vec<String>>,
-    /// Required by: replace (new full item list).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(schema_with = "any_json_schema")]
-    pub items: Option<Vec<Value>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +126,24 @@ pub struct RecallArgs {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ProposeArgs {
+    /// A short headline for the proposal.
+    pub title: String,
+    /// The proposed action to take (or, for kind="insight", the insight itself).
+    pub action: String,
+    /// Optional "action" | "insight". Defaults to "action".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Why — the reasoning behind the proposal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// Raw record ids (uuids) that justify the proposal. Each must be one of the
+    /// caller's own records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ids: Option<Vec<String>>,
+}
+
 #[tool_router]
 impl Flashback {
     pub fn new(flashback_url: String) -> Self {
@@ -227,27 +158,13 @@ impl Flashback {
     }
 
     #[tool(
-        description = "Append a memory (a conversation turn, a note, an extracted fact). \
-                       Default type is 'working' (session-scoped, 48h TTL). Use 'episodic' \
-                       for cross-session history, 'semantic' for distilled facts, \
-                       'procedural' for learned workflows."
-    )]
-    async fn flashback_remember(
-        &self,
-        Parameters(args): Parameters<RememberArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let bearer = bearer_or_err(&ctx)?;
-        let body = to_json(&args)?;
-        let res = self.post("/memory/ingest", &bearer, body).await?;
-        result_ok(res)
-    }
-
-    #[tool(
         description = "Store a raw record in Flashback's immutable raw layer: a conversation \
                        turn, fact, document, event, or transaction. Universal typed record — set \
                        `type` (episodic/semantic/working/document/procedural/state_object) and a \
-                       `source` tag. Append-only; never overwrites."
+                       `source` tag. Optional `mode` pins the cognitive register \
+                       (code/general/journal/research/…) it's embedded and recalled in; omitted, \
+                       it's auto-classified or falls back to the default register. Append-only; \
+                       never overwrites."
     )]
     async fn flashback_record(
         &self,
@@ -263,7 +180,10 @@ impl Flashback {
     #[tool(
         description = "Recall the most relevant raw records for a query via hybrid semantic + \
                        keyword retrieval over the immutable raw layer, scoped by \
-                       project/session/mode. Call before answering to ground in memory."
+                       project/session/mode. `mode` picks a cognitive register \
+                       (code/general/journal/research/…) and searches its vector geometry; \
+                       `all` searches across registers with keyword-degraded ranking. Call \
+                       before answering to ground in memory."
     )]
     async fn flashback_recall(
         &self,
@@ -277,112 +197,79 @@ impl Flashback {
     }
 
     #[tool(
-        description = "Hybrid retrieval over the user's memories: semantic similarity + BM25 \
-                       keyword + recency + project match + entity overlap. 'answer' mode \
-                       optimizes for relevance to a query; 'manager' mode for situational \
-                       awareness when no specific query exists."
+        description = "List the data catalog: every store the lake knows about, grouped by kind \
+                       (raw / curated / operational / external), each with its schema, current \
+                       record count, and lineage. The answer to 'is my data organized and can I \
+                       see it?'. The raw + curated layers register automatically."
     )]
-    async fn flashback_search(
+    async fn flashback_catalog(
         &self,
-        Parameters(args): Parameters<SearchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let body = to_json(&args)?;
-        let res = self.post("/memory/search", &bearer, body).await?;
+        let res = self.get("/catalog", &bearer).await?;
         result_ok(res)
     }
 
     #[tool(
-        description = "Return a structured 5-layer prompt context for the current session: \
-                       procedural / active project (core memory + state objects) / retrieved \
-                       memories / document chunks / recent conversation. Call this BEFORE \
-                       sending a turn to the LLM."
+        description = "Propose an action or insight for the operator to decide on — Flashback \
+                       proposes, it never acts. Cite the raw record ids that justify it via \
+                       `evidence_ids`. The proposal lands as 'proposed'; a human approves or \
+                       denies it, and the host (not Flashback) carries out any approved action."
     )]
-    async fn flashback_assemble_context(
+    async fn flashback_propose(
         &self,
-        Parameters(args): Parameters<AssembleArgs>,
+        Parameters(args): Parameters<ProposeArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let body = to_json(&args)?;
-        let res = self.post("/context/assemble", &bearer, body).await?;
-        result_ok(res)
-    }
-
-    #[tool(
-        description = "Mark a memory as superseded by a new version. The old row stays in the \
-                       supersede chain for /lineage queries; default retrieval returns only \
-                       the new terminal node."
-    )]
-    async fn flashback_supersede(
-        &self,
-        Parameters(args): Parameters<SupersedeArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/memory/{}/supersede", args.memory_id);
         let body = json!({
-            "content": args.content,
-            "importance": args.importance,
+            "title": args.title,
+            "action": args.action,
+            "kind": args.kind,
+            "rationale": args.rationale,
+            "evidence": args.evidence_ids.unwrap_or_default(),
         });
-        let res = self.put(&path, &bearer, body).await?;
+        let res = self.post("/proposals", &bearer, body).await?;
         result_ok(res)
     }
 
-    #[tool(description = "Walk the supersede chain (back + forward) for a memory id.")]
+    #[tool(
+        description = "Walk the supersede chain (back + forward) for a raw record id — how the \
+                       value evolved. Corrections are new append-only rows; this reconstructs \
+                       the full lineage."
+    )]
     async fn flashback_lineage(
         &self,
         Parameters(args): Parameters<LineageArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/lineage/{}", args.memory_id);
+        let path = format!("/records/{}/lineage", args.record_id);
         let res = self.get(&path, &bearer).await?;
         result_ok(res)
     }
 
     #[tool(
-        description = "Pin a piece of core memory — always-on context injected into every \
-                       /assemble_context call. Use for behavioral rules and persistent \
-                       preferences that should apply on every turn."
+        description = "Set the current value of a reference — a named mutable cell (a todo list, \
+                       a plan, a config) keyed by (kind, state_key). Pass the COMPLETE new value \
+                       in `data`; a new append-only state_object raw record is written that \
+                       supersedes the prior one, so history is preserved and raw stays immutable. \
+                       Creates the reference on first set."
     )]
-    async fn flashback_core_add(
+    async fn flashback_state_set(
         &self,
-        Parameters(args): Parameters<CoreAddArgs>,
+        Parameters(args): Parameters<StateSetArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let body = to_json(&args)?;
-        let res = self.post("/core", &bearer, body).await?;
-        result_ok(res)
-    }
-
-    #[tool(description = "List all pinned core memory entries for the authenticated user.")]
-    async fn flashback_core_list(
-        &self,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let bearer = bearer_or_err(&ctx)?;
-        let res = self.get("/core", &bearer).await?;
-        result_ok(res)
-    }
-
-    #[tool(
-        description = "Create a state object — a named mutable structure (a todo list, a plan). \
-                       Each (kind, state_key) is unique per user. The terminal node is always \
-                       the current value; supersede chain preserves history."
-    )]
-    async fn flashback_state_create(
-        &self,
-        Parameters(args): Parameters<StateCreateArgs>,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/state/{}", args.kind);
+        let path = format!(
+            "/records/state/{}/{}",
+            enc_segment(&args.kind),
+            enc_segment(&args.state_key)
+        );
         let body = json!({
-            "state_key":  args.state_key,
-            "initial":    args.initial,
+            "data":       args.data,
             "project_id": args.project_id,
             "session_id": args.session_id,
             "importance": args.importance,
@@ -391,64 +278,46 @@ impl Flashback {
         result_ok(res)
     }
 
-    #[tool(description = "Get the current (terminal) value of a state object.")]
+    #[tool(description = "Get the current (terminal) value of a reference.")]
     async fn flashback_state_get(
         &self,
         Parameters(args): Parameters<StateLookupArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/state/{}/{}", args.kind, args.state_key);
+        let path = format!(
+            "/records/state/{}/{}",
+            enc_segment(&args.kind),
+            enc_segment(&args.state_key)
+        );
         let res = self.get(&path, &bearer).await?;
         result_ok(res)
     }
 
-    #[tool(
-        description = "Apply an op to a state object. For kind=\"todo_list\" the supported \
-                       ops are: add(text), mark_done(item_id), unmark(item_id), \
-                       toggle(item_id), remove(item_id), update(item_id, text), \
-                       reorder(ids: full list of existing ids in new order), \
-                       replace(items: full new item list), clear."
-    )]
-    async fn flashback_state_patch(
+    #[tool(description = "List the terminal value of every reference of a given kind.")]
+    async fn flashback_state_list(
         &self,
-        Parameters(args): Parameters<StatePatchArgs>,
+        Parameters(args): Parameters<StateListArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/state/{}/{}", args.kind, args.state_key);
-        let mut body = serde_json::Map::new();
-        body.insert("op".into(), Value::String(args.op));
-        if let Some(t) = args.text {
-            body.insert("text".into(), Value::String(t));
-        }
-        if let Some(id) = args.item_id {
-            body.insert("item_id".into(), Value::String(id));
-        }
-        if let Some(ids) = args.ids {
-            body.insert("ids".into(), serde_json::to_value(ids).unwrap());
-        }
-        if let Some(items) = args.items {
-            body.insert("items".into(), Value::Array(items));
-        }
-        if let Some(p) = args.project_id {
-            body.insert("project_id".into(), Value::String(p));
-        }
-        if let Some(s) = args.session_id {
-            body.insert("session_id".into(), Value::String(s));
-        }
-        let res = self.patch(&path, &bearer, Value::Object(body)).await?;
+        let path = format!("/records/state/{}", enc_segment(&args.kind));
+        let res = self.get(&path, &bearer).await?;
         result_ok(res)
     }
 
-    #[tool(description = "Return the full supersede chain for a state object — how it evolved.")]
+    #[tool(description = "Return the full supersede chain for a reference — how it evolved.")]
     async fn flashback_state_history(
         &self,
         Parameters(args): Parameters<StateLookupArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/state/{}/{}/history", args.kind, args.state_key);
+        let path = format!(
+            "/records/state/{}/{}/history",
+            enc_segment(&args.kind),
+            enc_segment(&args.state_key)
+        );
         let res = self.get(&path, &bearer).await?;
         result_ok(res)
     }
@@ -465,32 +334,6 @@ impl Flashback {
             .send()
             .await
             .map_err(|e| internal(format!("POST {path}: {e}")))?;
-        decode_resp(resp, path).await
-    }
-
-    async fn put(&self, path: &str, bearer: &str, body: Value) -> Result<Value, McpError> {
-        let url = format!("{}{}", self.flashback_url, path);
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(bearer)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| internal(format!("PUT {path}: {e}")))?;
-        decode_resp(resp, path).await
-    }
-
-    async fn patch(&self, path: &str, bearer: &str, body: Value) -> Result<Value, McpError> {
-        let url = format!("{}{}", self.flashback_url, path);
-        let resp = self
-            .http
-            .patch(&url)
-            .bearer_auth(bearer)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| internal(format!("PATCH {path}: {e}")))?;
         decode_resp(resp, path).await
     }
 
@@ -567,6 +410,23 @@ fn bearer_or_err(ctx: &RequestContext<RoleServer>) -> Result<String, McpError> {
 
 fn to_json<T: Serialize>(value: &T) -> Result<Value, McpError> {
     serde_json::to_value(value).map_err(|e| internal(format!("serialize args: {e}")))
+}
+
+/// Percent-encode one URL path segment so a `kind`/`state_key` containing `/`,
+/// `?`, `#`, `%`, or other path-significant bytes can't reshape the request
+/// path (it stays an opaque single segment the server matches on). Unreserved
+/// characters (RFC 3986 `ALPHA / DIGIT / -._~`) pass through untouched.
+fn enc_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn internal(msg: impl Into<String>) -> McpError {
@@ -664,4 +524,32 @@ fn health_response(upstream_ok: bool, url: &str) -> impl IntoResponse {
         "upstream": url,
         "upstream_ok": upstream_ok,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enc_segment_passes_unreserved_through() {
+        assert_eq!(enc_segment("todo_list"), "todo_list");
+        assert_eq!(enc_segment("a-b.c_d~e"), "a-b.c_d~e");
+        assert_eq!(enc_segment("Key123"), "Key123");
+    }
+
+    #[test]
+    fn enc_segment_escapes_path_significant_bytes() {
+        // A key that tries to escape its segment can't reshape the path.
+        assert_eq!(enc_segment("../../catalog"), "..%2F..%2Fcatalog");
+        assert_eq!(enc_segment("foo/history"), "foo%2Fhistory");
+        assert_eq!(enc_segment("a b"), "a%20b");
+        assert_eq!(enc_segment("q?x=1#f"), "q%3Fx%3D1%23f");
+        assert_eq!(enc_segment("100%"), "100%25");
+    }
+
+    #[test]
+    fn enc_segment_escapes_non_ascii() {
+        // Multi-byte UTF-8 is percent-encoded byte-by-byte (no panic, no raw bytes).
+        assert_eq!(enc_segment("café"), "caf%C3%A9");
+    }
 }

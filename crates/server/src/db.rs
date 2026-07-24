@@ -29,8 +29,8 @@ mod tests {
         // Second run should be a no-op (no errors).
         migrate(&pool).await.unwrap();
 
-        // Sanity: the memories table exists after migration.
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memories")
+        // Sanity: the raw layer exists after migration.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_records")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -39,8 +39,15 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn migrate_creates_expected_tables(pool: PgPool) {
-        // Cross-check the table set we depend on actually got created.
-        for table in ["memories", "tokens", "core_memory", "consolidation_runs"] {
+        // Cross-check the canonical table set actually got created.
+        for table in [
+            "raw_records",
+            "raw_embeddings",
+            "curated_nodes",
+            "proposals",
+            "modes",
+            "tokens",
+        ] {
             let exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
             )
@@ -49,6 +56,18 @@ mod tests {
             .await
             .unwrap();
             assert!(exists, "table {table} should exist after migrate");
+        }
+
+        // The pre-raw world is never created; confirm those tables are absent.
+        for table in ["memories", "core_memory", "consolidation_runs"] {
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+            )
+            .bind(table)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(!exists, "table {table} should not exist");
         }
     }
 
