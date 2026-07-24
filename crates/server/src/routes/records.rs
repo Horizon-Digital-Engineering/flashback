@@ -370,7 +370,7 @@ pub(crate) async fn query_records_inner(
           AND ($5::text IS NULL OR type = $5)
           AND ($6::timestamptz IS NULL OR event_time >= $6)
           AND ($7::timestamptz IS NULL OR event_time <= $7)
-          AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL)
+          AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
           AND (ttl IS NULL OR ttl > NOW())
         ORDER BY event_time DESC
         LIMIT $8
@@ -443,7 +443,7 @@ pub(crate) async fn assemble_inner(
               AND ($2::text IS NULL OR project_id = $2)
               AND ($3::text IS NULL OR session_id = $3)
               AND ($4::text IS NULL OR mode = $4)
-              AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL)
+              AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
               AND (ttl IS NULL OR ttl > NOW())
             ORDER BY event_time DESC
             LIMIT $5
@@ -470,10 +470,13 @@ pub(crate) async fn assemble_inner(
               AND ($3::text IS NULL OR r.project_id = $3)
               AND ($4::text IS NULL OR r.session_id = $4)
               AND ($5::text IS NULL OR r.mode = $5)
-              AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL)
+              AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
               AND (r.ttl IS NULL OR r.ttl > NOW())
             ORDER BY (
-                0.7 * COALESCE(1 - (e.embedding <=> $6), 0)
+                -- NULLIF('NaN') guards a zero/degenerate vector: `<=>` returns NaN,
+                -- and Postgres sorts NaN above every finite score under DESC, which
+                -- would float a junk record to the top of every recall.
+                0.7 * COALESCE(NULLIF(1 - (e.embedding <=> $6), 'NaN'::float8), 0)
                 + 0.3 * ts_rank(r.content_tsv, plainto_tsquery('english', $7))
             ) DESC, r.event_time DESC
             LIMIT $8
@@ -549,12 +552,12 @@ pub(crate) async fn lineage_inner(
         back AS (
             SELECT {COLS} FROM raw_records WHERE id = $1
             UNION ALL
-            SELECT {COLS_R} FROM raw_records r JOIN back b ON r.id = b.supersedes
+            SELECT {COLS_R} FROM raw_records r JOIN back b ON r.id = b.supersedes AND r.user_id = $2
         ),
         fwd AS (
             SELECT {COLS} FROM raw_records WHERE id = $1
             UNION ALL
-            SELECT {COLS_R} FROM raw_records r JOIN fwd f ON r.supersedes = f.id
+            SELECT {COLS_R} FROM raw_records r JOIN fwd f ON r.supersedes = f.id AND r.user_id = $2
         )
         SELECT {COLS} FROM (
             SELECT {COLS} FROM back UNION SELECT {COLS} FROM fwd
@@ -564,6 +567,7 @@ pub(crate) async fn lineage_inner(
     );
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(id)
+        .bind(user_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -666,6 +670,26 @@ mod tests {
 
         let line = lineage_inner(&pool, "leslie", v2.id).await.unwrap();
         assert_eq!(line.iter().map(|r| r.id).collect::<Vec<_>>(), vec![v1.id, v2.id]);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn lineage_keeps_branched_siblings(pool: PgPool) {
+        let v1 = ingest_record(&pool, &StubNlp, "leslie", req("weight 180")).await.unwrap();
+        let mut ra = req("weight 178"); ra.supersedes = Some(v1.id);
+        let a = ingest_record(&pool, &StubNlp, "leslie", ra).await.unwrap();
+        let mut rb = req("weight 179"); rb.supersedes = Some(v1.id);
+        let b = ingest_record(&pool, &StubNlp, "leslie", rb).await.unwrap();
+        let mut got: Vec<_> = lineage_inner(&pool, "leslie", v1.id).await.unwrap().iter().map(|r| r.id).collect();
+        got.sort();
+        let mut want = vec![v1.id, a.id, b.id]; want.sort();
+        assert_eq!(got, want); // all three; the branch sibling is not dropped
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn truncate_is_blocked(pool: PgPool) {
+        ingest_record(&pool, &StubNlp, "leslie", req("x")).await.unwrap();
+        let err = sqlx::query("TRUNCATE raw_records CASCADE").execute(&pool).await;
+        assert!(err.is_err(), "TRUNCATE on raw_records must be blocked");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
