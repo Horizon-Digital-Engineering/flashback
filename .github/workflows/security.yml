@@ -31,8 +31,16 @@ jobs:
           # binary) where copyleft licenses don't propagate. Mirroring our
           # cargo allowlist here would force-reject e.g. Swatinem/rust-cache
           # (LGPL-3.0) which is harmless in this context. Instead, deny only
-          # the licenses we'd never accept anywhere.
-          deny-licenses: GPL-3.0, GPL-3.0-or-later, AGPL-3.0, AGPL-3.0-or-later, SSPL-1.0, Commons-Clause
+          # the licenses we'd never accept anywhere. Every entry must be a
+          # valid SPDX identifier — the action rejects non-SPDX tokens (e.g.
+          # the Commons Clause rider, which only ever appears fused onto a
+          # real license and is caught by that license instead).
+          deny-licenses: GPL-3.0, GPL-3.0-or-later, AGPL-3.0, AGPL-3.0-or-later, SSPL-1.0
+          # The secret scanner is AGPL, which the deny list above would flag
+          # whenever its pin changes. It runs only in CI and links nothing into
+          # the shipped binary, so its copyleft never reaches us — exempt it
+          # from the license check (vulnerability checks still apply).
+          allow-dependencies-licenses: pkg:githubactions/trufflesecurity/trufflehog
           comment-summary-in-pr: on-failure
 
   actionlint:
