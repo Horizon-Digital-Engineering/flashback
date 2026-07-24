@@ -2,6 +2,7 @@ mod auth;
 mod chunking;
 mod config;
 mod consolidation;
+mod curation;
 mod db;
 mod error;
 mod models;
@@ -101,6 +102,18 @@ async fn run_serve() -> Result<()> {
         spawn_consolidation_scheduler(state.clone());
     } else {
         tracing::warn!("FLASHBACK_DISABLE_CONSOLIDATION=1 — scheduler not spawned");
+    }
+
+    // Curation scheduler — the NEW raw-derived layer, on its own task so it
+    // never touches the legacy path. FLASHBACK_DISABLE_CURATION=1 turns it off.
+    let disable_curation = matches!(
+        std::env::var("FLASHBACK_DISABLE_CURATION").as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes")
+    );
+    if !disable_curation {
+        spawn_curation_scheduler(state.clone());
+    } else {
+        tracing::warn!("FLASHBACK_DISABLE_CURATION=1 — curation scheduler not spawned");
     }
 
     let app = routes::router(state.clone())
@@ -261,6 +274,31 @@ fn spawn_consolidation_scheduler(state: AppState) {
         weekly_h = weekly_interval,
         "consolidation scheduler armed"
     );
+}
+
+/// Spawn a background task that rebuilds the curated layer (promote + distill)
+/// for every user on an interval. Independent of the legacy consolidation
+/// scheduler — it lists users from `raw_records`, never `memories`, and only
+/// ever INSERTs into `curated_*`. Failures are logged, never fatal.
+fn spawn_curation_scheduler(state: AppState) {
+    let interval_hours = std::env::var("FLASHBACK_CURATION_HOURS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(24);
+
+    tokio::spawn(async move {
+        // Stagger after the legacy scheduler so first-boot logs don't interleave.
+        tokio::time::sleep(std::time::Duration::from_secs(180)).await;
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(interval_hours * 3600));
+        loop {
+            interval.tick().await;
+            tracing::info!("curation: scheduled tick");
+            let _ = curation::rebuild_all_users(&state.pool, &*state.nlp).await;
+        }
+    });
+
+    tracing::info!(interval_h = interval_hours, "curation scheduler armed");
 }
 
 fn take_flag(args: &[String], name: &str) -> Option<String> {

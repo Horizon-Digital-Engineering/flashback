@@ -696,6 +696,32 @@ pub(crate) async fn run_consolidate_kind(
     }
 }
 
+/// Glass-box trigger for the NEW curation layer: promote working raw records to
+/// episodic + distill semantic facts for the caller's user, then redirect back
+/// to the consolidate view. Separate from the legacy consolidate trigger above
+/// — this drives `curation`, never the legacy `memories` path.
+pub async fn curate_trigger(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Response, super::Error> {
+    match crate::curation::rebuild(&state.pool, &*state.nlp, &user.user_id).await {
+        Ok(stats) => {
+            tracing::info!(
+                promoted = stats.promoted,
+                distilled = stats.distilled,
+                clusters = stats.clusters_seen,
+                distill_skipped = stats.skipped_distill,
+                "manual curation run complete"
+            );
+            Ok(Redirect::to("/admin/consolidate").into_response())
+        }
+        Err(e) => {
+            tracing::error!("curation run failed: {e}");
+            Ok((StatusCode::INTERNAL_SERVER_ERROR, "curation failed").into_response())
+        }
+    }
+}
+
 struct MapNode {
     id: Uuid,
     type_: String,

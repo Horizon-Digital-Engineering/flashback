@@ -46,8 +46,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/import", post(import_records))
         .route("/query", post(query_records))
         .route("/context", post(assemble))
+        .route("/rebuild", post(rebuild_curation))
         .route("/{id}", get(get_record))
         .route("/{id}/lineage", get(lineage))
+        .route("/{id}/derivations", get(derivations))
         .with_state(state)
 }
 
@@ -584,6 +586,50 @@ pub(crate) async fn lineage_inner(
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Derivations (glass-box): curated nodes derived from this raw id. Read-only
+// window into the NEW curation layer — the raw door itself is unchanged.
+// ---------------------------------------------------------------------------
+
+async fn derivations(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<crate::curation::DerivationRow>>> {
+    // Authorize on the raw record first (404s a foreign id), then list.
+    let _ = get_record_inner(&state.pool, &auth_user.user_id, id).await?;
+    Ok(Json(
+        crate::curation::derivations_of(&state.pool, &auth_user.user_id, id).await?,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Curation rebuild (admin/glass-box): wipe + re-derive the caller's curated
+// layer from raw. Proves the "curation is rebuildable from raw" contract.
+// Same bearer auth as every other door; scoped to the caller's user.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct RebuildResponse {
+    pub promoted: i64,
+    pub distilled: i64,
+    pub clusters_seen: i64,
+    pub distill_skipped: bool,
+}
+
+async fn rebuild_curation(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> AppResult<Json<RebuildResponse>> {
+    let stats = crate::curation::rebuild(&state.pool, &*state.nlp, &auth_user.user_id).await?;
+    Ok(Json(RebuildResponse {
+        promoted: stats.promoted,
+        distilled: stats.distilled,
+        clusters_seen: stats.clusters_seen,
+        distill_skipped: stats.skipped_distill,
+    }))
 }
 
 #[cfg(test)]

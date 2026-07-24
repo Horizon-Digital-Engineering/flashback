@@ -85,5 +85,6 @@ pub fn router(state: AppState) -> Router<AppState> {
             "/api/consolidate/{kind}",
             post(handlers::consolidate_trigger),
         )
+        .route("/api/curate", post(handlers::curate_trigger))
         .with_state(state)
 }
