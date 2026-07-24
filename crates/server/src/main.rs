@@ -4,12 +4,14 @@ mod config;
 mod consolidation;
 mod curation;
 mod db;
+mod decay;
 mod error;
 mod models;
 mod nlp;
 mod retrieval;
 mod routes;
 mod state;
+mod summaries;
 
 use std::sync::Arc;
 

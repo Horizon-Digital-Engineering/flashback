@@ -46,6 +46,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/import", post(import_records))
         .route("/query", post(query_records))
         .route("/context", post(assemble))
+        .route("/summaries", get(summaries))
         .route("/rebuild", post(rebuild_curation))
         .route("/{id}", get(get_record))
         .route("/{id}/lineage", get(lineage))
@@ -403,9 +404,29 @@ pub(crate) async fn query_records_inner(
 }
 
 // ---------------------------------------------------------------------------
-// Context assemble (getContext): hybrid vector+keyword when a query is present,
-// recency when it isn't. The dumb-but-real fill; the curated view feeds in later.
+// Context assemble (getContext): summary-first, decay/importance-weighted
+// retrieval when a query is present, recency when it isn't.
+//
+// The blended score for a query hit is
+//     w_sem·cosine + w_kw·bm25 + w_rec·recency + w_imp·importance + w_decay·ref_weight
+// applied over the CURATED layer first (summaries + level-0 nodes), which is
+// the primary feed — "summarize first, drill to raw on demand". The curated
+// hits are mapped back to their source raw records (the shape callers already
+// consume), and direct raw retrieval backstops any slot the curated layer
+// hasn't covered yet. Retrieval bumps each returned curated node's decay clock.
 // ---------------------------------------------------------------------------
+
+/// Blend weights. `w_sem` dominates (semantic recall is the point); keyword is
+/// the lexical backstop; recency/importance/decay are the demotion signals that
+/// keep a stale-but-similar node below a fresh one. They need not sum to 1 —
+/// only their relative magnitude ranks.
+const W_SEM: f64 = 0.55;
+const W_KW: f64 = 0.20;
+const W_REC: f64 = 0.10;
+const W_IMP: f64 = 0.075;
+const W_DECAY: f64 = 0.075;
+/// Half-life (hours) of the recency term e^(-age/REC_S). ~30 days.
+const REC_S_HOURS: f64 = 30.0 * 24.0;
 
 #[derive(Debug, Deserialize)]
 pub struct AssembleRequest {
@@ -445,8 +466,8 @@ pub(crate) async fn assemble_inner(
     let limit = req.limit.unwrap_or(50).clamp(1, 200);
     let query = req.query.clone().unwrap_or_default();
 
-    let records = if query.trim().is_empty() {
-        // No query -> pure recency.
+    if query.trim().is_empty() {
+        // No query -> pure recency over raw (the backstop feed; nothing to score).
         let sql = format!(
             r#"
             SELECT {COLS} FROM raw_records
@@ -460,52 +481,289 @@ pub(crate) async fn assemble_inner(
             LIMIT $5
             "#
         );
-        sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+        let records = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
             .bind(user_id)
             .bind(&req.project_id)
             .bind(&req.session_id)
             .bind(&req.mode)
             .bind(limit)
             .fetch_all(pool)
-            .await?
-    } else {
-        // Hybrid: 0.7 * cosine-similarity(query, record) + 0.3 * keyword rank.
-        // LEFT JOIN so records without an embedding still rank on keyword.
-        let qvec = nlp.embed_one(&query).await?;
-        let model = nlp.embedder_model_name().to_string();
-        let sql = format!(
-            r#"
-            SELECT {COLS_R} FROM raw_records r
-            LEFT JOIN raw_embeddings e ON e.record_id = r.id AND e.model = $1
-            WHERE r.user_id = $2
-              AND ($3::text IS NULL OR r.project_id = $3)
-              AND ($4::text IS NULL OR r.session_id = $4)
-              AND ($5::text IS NULL OR r.mode = $5)
-              AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
-              AND (r.ttl IS NULL OR r.ttl > NOW())
+            .await?;
+        return Ok(AssembleResponse { records });
+    }
+
+    let qvec = nlp.embed_one(&query).await?;
+    let model = nlp.embedder_model_name().to_string();
+
+    // 1) Rank the CURATED layer with the full blended score. Summaries and
+    // level-0 nodes compete on the same score; higher `level` breaks ties so a
+    // summary that covers a cluster leads its own children ("summary first").
+    // recency = e^(-age_hours/REC_S); ref_weight = e^(-idle_hours/half_life)
+    // (the Ebbinghaus decay, computed inline from ref_weights; a node with no
+    // ref_weights row scores 1.0 so absence never demotes it).
+    let curated_scored: Vec<(Uuid, i32)> = {
+        let sql = r#"
+            SELECT n.id, n.level
+            FROM curated_nodes n
+            LEFT JOIN curated_embeddings ce ON ce.node_id = n.id AND ce.model = $1
+            LEFT JOIN ref_weights rw ON rw.ref_id = n.id
+            WHERE n.user_id = $2
+              AND ($3::text IS NULL OR n.project_id = $3)
+              AND ($4::text IS NULL OR n.mode = $4)
+              AND NOT EXISTS (
+                  SELECT 1 FROM curated_edges s WHERE s.to_id = n.id AND s.kind = 'supersedes'
+              )
             ORDER BY (
-                -- NULLIF('NaN') guards a zero/degenerate vector: `<=>` returns NaN,
-                -- and Postgres sorts NaN above every finite score under DESC, which
-                -- would float a junk record to the top of every recall.
-                0.7 * COALESCE(NULLIF(1 - (e.embedding <=> $6), 'NaN'::float8), 0)
-                + 0.3 * ts_rank(r.content_tsv, plainto_tsquery('english', $7))
-            ) DESC, r.event_time DESC
-            LIMIT $8
-            "#
-        );
-        sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
-            .bind(model)
+                  $5 * COALESCE(NULLIF(1 - (ce.embedding <=> $6), 'NaN'::float8), 0)
+                + $7 * ts_rank(to_tsvector('english', n.content), plainto_tsquery('english', $8))
+                + $9  * exp(- GREATEST(EXTRACT(EPOCH FROM (NOW() - COALESCE(n.event_time, n.created_at))) / 3600.0, 0) / $10)
+                + $11 * COALESCE(n.importance, 0)
+                + $12 * COALESCE(
+                        exp(- GREATEST(EXTRACT(EPOCH FROM (NOW() - rw.last_access)) / 3600.0, 0)
+                              / COALESCE(rw.s_hours,
+                                  CASE rw.decay_class
+                                      WHEN 'pinned' THEN 2160.0
+                                      WHEN 'ephemeral' THEN 48.0
+                                      ELSE 336.0
+                                  END)),
+                        1.0)
+            ) DESC, n.level DESC, n.created_at DESC
+            LIMIT $13
+        "#;
+        sqlx::query_as::<_, (Uuid, i32)>(sql)
+            .bind(&model)
             .bind(user_id)
             .bind(&req.project_id)
-            .bind(&req.session_id)
             .bind(&req.mode)
-            .bind(Vector::from(qvec))
+            .bind(W_SEM)
+            .bind(Vector::from(qvec.clone()))
+            .bind(W_KW)
             .bind(&query)
+            .bind(W_REC)
+            .bind(REC_S_HOURS)
+            .bind(W_IMP)
+            .bind(W_DECAY)
             .bind(limit)
             .fetch_all(pool)
             .await?
     };
+
+    // Bump the decay clock for every curated node we're serving (accessing a
+    // node resets its retention to 1.0). Never deletes.
+    let touched: Vec<Uuid> = curated_scored.iter().map(|(id, _)| *id).collect();
+    crate::decay::touch_refs(pool, crate::decay::REF_KIND_CURATED, &touched).await?;
+
+    // 2) Resolve curated hits -> source raw ids, in curated-rank order. A
+    // summary resolves through its `summarizes` chain down to level-0 nodes,
+    // then each level-0 node's `derived_from` edges to raw ids.
+    let mut ordered_raw_ids: Vec<Uuid> = Vec::new();
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for (node_id, _level) in &curated_scored {
+        let raw_ids = raw_ids_under_node(pool, *node_id).await?;
+        for rid in raw_ids {
+            if seen.insert(rid) {
+                ordered_raw_ids.push(rid);
+            }
+        }
+        if ordered_raw_ids.len() as i64 >= limit {
+            break;
+        }
+    }
+
+    // 3) Fetch those raw records (still active + owned), preserving curated rank.
+    let mut records = fetch_raw_in_order(pool, user_id, &ordered_raw_ids).await?;
+
+    // 4) Backstop: if the curated layer under-fills the page (e.g. curation
+    // hasn't run yet, or a fresh raw record isn't summarized), top up with a
+    // direct raw hybrid search — the same 0.7·cosine + 0.3·keyword fallback.
+    if (records.len() as i64) < limit {
+        let need = limit - records.len() as i64;
+        let exclude: Vec<Uuid> = records.iter().map(|r| r.id).collect();
+        let backstop =
+            raw_hybrid(pool, user_id, &req, &qvec, &model, &query, need, &exclude).await?;
+        records.extend(backstop);
+    }
+
     Ok(AssembleResponse { records })
+}
+
+/// Every raw id reachable from a curated node: walk `summarizes` down to the
+/// level-0 nodes, then their `derived_from` edges to raw record ids. A level-0
+/// node (no `summarizes` children) resolves straight through its own
+/// `derived_from` edges.
+async fn raw_ids_under_node(pool: &PgPool, node_id: Uuid) -> AppResult<Vec<Uuid>> {
+    let sql = r#"
+        WITH RECURSIVE tree AS (
+            SELECT $1::uuid AS id
+            UNION
+            SELECT e.to_id
+            FROM curated_edges e
+            JOIN tree t ON e.from_id = t.id AND e.kind = 'summarizes'
+        )
+        SELECT DISTINCT df.to_id
+        FROM tree t
+        JOIN curated_edges df ON df.from_id = t.id AND df.kind = 'derived_from'
+    "#;
+    let ids: Vec<Uuid> = sqlx::query_scalar(sql)
+        .bind(node_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(ids)
+}
+
+/// Fetch raw records by id, filtered to the caller + still-active (not
+/// superseded, not expired), returned in the order the ids were given.
+async fn fetch_raw_in_order(
+    pool: &PgPool,
+    user_id: &str,
+    ids: &[Uuid],
+) -> AppResult<Vec<RawRecordRow>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        r#"
+        SELECT {COLS} FROM raw_records
+        WHERE user_id = $1
+          AND id = ANY($2)
+          AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
+          AND (ttl IS NULL OR ttl > NOW())
+        "#
+    );
+    let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+        .bind(user_id)
+        .bind(ids)
+        .fetch_all(pool)
+        .await?;
+    // Re-order to the curated rank (SQL doesn't preserve ANY() order).
+    let pos: std::collections::HashMap<Uuid, usize> =
+        ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let mut rows = rows;
+    rows.sort_by_key(|r| pos.get(&r.id).copied().unwrap_or(usize::MAX));
+    Ok(rows)
+}
+
+/// Direct raw hybrid retrieval (0.7·cosine + 0.3·keyword) used as the backstop
+/// under the curated feed. Excludes ids already returned from the curated pass.
+#[allow(clippy::too_many_arguments)]
+async fn raw_hybrid(
+    pool: &PgPool,
+    user_id: &str,
+    req: &AssembleRequest,
+    qvec: &[f32],
+    model: &str,
+    query: &str,
+    limit: i64,
+    exclude: &[Uuid],
+) -> AppResult<Vec<RawRecordRow>> {
+    let sql = format!(
+        r#"
+        SELECT {COLS_R} FROM raw_records r
+        LEFT JOIN raw_embeddings e ON e.record_id = r.id AND e.model = $1
+        WHERE r.user_id = $2
+          AND ($3::text IS NULL OR r.project_id = $3)
+          AND ($4::text IS NULL OR r.session_id = $4)
+          AND ($5::text IS NULL OR r.mode = $5)
+          AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
+          AND (r.ttl IS NULL OR r.ttl > NOW())
+          AND NOT (r.id = ANY($9))
+        ORDER BY (
+            0.7 * COALESCE(NULLIF(1 - (e.embedding <=> $6), 'NaN'::float8), 0)
+            + 0.3 * ts_rank(r.content_tsv, plainto_tsquery('english', $7))
+        ) DESC, r.event_time DESC
+        LIMIT $8
+        "#
+    );
+    let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+        .bind(model)
+        .bind(user_id)
+        .bind(&req.project_id)
+        .bind(&req.session_id)
+        .bind(&req.mode)
+        .bind(Vector::from(qvec.to_vec()))
+        .bind(query)
+        .bind(limit)
+        .bind(exclude)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Summaries (RAPTOR view): the summary nodes for a scope, for the graph/catalog
+// viz. Read-only window into the curated layer, behind the same bearer auth.
+//   GET /records/summaries?level=&project=&mode=
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SummariesQuery {
+    #[serde(default)]
+    pub level: Option<i32>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct SummaryNodeRow {
+    pub id: Uuid,
+    pub kind: String,
+    pub content: String,
+    pub level: i32,
+    pub user_id: String,
+    pub project_id: Option<String>,
+    pub mode: Option<String>,
+    pub importance: Option<f32>,
+    pub event_time: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    /// Ids of the child nodes this summary covers (`summarizes` edges).
+    pub children: Vec<Uuid>,
+}
+
+async fn summaries(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    axum::extract::Query(q): axum::extract::Query<SummariesQuery>,
+) -> AppResult<Json<Vec<SummaryNodeRow>>> {
+    Ok(Json(
+        summaries_inner(&state.pool, &auth_user.user_id, q).await?,
+    ))
+}
+
+pub(crate) async fn summaries_inner(
+    pool: &PgPool,
+    user_id: &str,
+    q: SummariesQuery,
+) -> AppResult<Vec<SummaryNodeRow>> {
+    // Summary nodes for the caller, optionally filtered by level/project/mode,
+    // each with its `summarizes` children folded into an array. `level=0`
+    // returns none (level 0 is episodic/semantic, not summaries).
+    let sql = r#"
+        SELECT n.id, n.kind, n.content, n.level, n.user_id, n.project_id, n.mode,
+               n.importance, n.event_time, n.created_at,
+               COALESCE(
+                   (SELECT array_agg(e.to_id)
+                    FROM curated_edges e
+                    WHERE e.from_id = n.id AND e.kind = 'summarizes'),
+                   '{}'
+               ) AS children
+        FROM curated_nodes n
+        WHERE n.kind = 'summary'
+          AND n.user_id = $1
+          AND ($2::int  IS NULL OR n.level = $2)
+          AND ($3::text IS NULL OR n.project_id = $3)
+          AND ($4::text IS NULL OR n.mode = $4)
+        ORDER BY n.level DESC, n.created_at ASC
+    "#;
+    let rows = sqlx::query_as::<_, SummaryNodeRow>(sql)
+        .bind(user_id)
+        .bind(q.level)
+        .bind(&q.project)
+        .bind(&q.mode)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +875,8 @@ pub struct RebuildResponse {
     pub distilled: i64,
     pub clusters_seen: i64,
     pub distill_skipped: bool,
+    pub summarized: i64,
+    pub max_level: i32,
 }
 
 async fn rebuild_curation(
@@ -629,6 +889,8 @@ async fn rebuild_curation(
         distilled: stats.distilled,
         clusters_seen: stats.clusters_seen,
         distill_skipped: stats.skipped_distill,
+        summarized: stats.summarized,
+        max_level: stats.max_level,
     }))
 }
 
@@ -990,5 +1252,305 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ctx.records.len(), 1);
+    }
+
+    // -- summary-first + decay-weighted retrieval --------------------------
+
+    /// Insert a level-0 curated node deriving from `raw_id`, embed it (uniform
+    /// via StubNlp so cosine is constant across nodes), and return the node id.
+    async fn curated_node_from(pool: &PgPool, user_id: &str, raw_id: Uuid, content: &str) -> Uuid {
+        let node_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO curated_nodes (id, kind, content, level, user_id, importance, event_time) \
+             VALUES ($1, 'episodic', $2, 0, $3, 0.5, NOW())",
+        )
+        .bind(node_id)
+        .bind(content)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO curated_edges (from_id, to_id, kind) VALUES ($1, $2, 'derived_from')",
+        )
+        .bind(node_id)
+        .bind(raw_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        let emb = StubNlp.embed_one(content).await.unwrap();
+        sqlx::query(
+            "INSERT INTO curated_embeddings (node_id, model, embedding) VALUES ($1, $2, $3)",
+        )
+        .bind(node_id)
+        .bind(StubNlp.embedder_model_name())
+        .bind(Vector::from(emb))
+        .execute(pool)
+        .await
+        .unwrap();
+        node_id
+    }
+
+    fn ctx_req(query: &str) -> AssembleRequest {
+        AssembleRequest {
+            project_id: None,
+            session_id: None,
+            mode: None,
+            query: Some(query.into()),
+            limit: None,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn context_prefers_curated_summary_sources_first(pool: PgPool) {
+        // One raw record has a curated node (the summarized/curated feed); another
+        // raw record is only in the raw layer (backstop). Both match the query on
+        // keyword; the curated-backed one must lead.
+        let curated_raw = ingest_record(&pool, &StubNlp, "leslie", req("deploy target is staging"))
+            .await
+            .unwrap();
+        let raw_only = ingest_record(&pool, &StubNlp, "leslie", req("deploy target notes"))
+            .await
+            .unwrap();
+        curated_node_from(&pool, "leslie", curated_raw.id, "deploy target is staging").await;
+
+        let out = assemble_inner(&pool, &StubNlp, "leslie", ctx_req("deploy target"))
+            .await
+            .unwrap();
+        assert!(out.records.len() >= 2);
+        // The curated-backed raw record leads; the raw-only one is the backstop.
+        assert_eq!(out.records[0].id, curated_raw.id);
+        assert!(out.records.iter().any(|r| r.id == raw_only.id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn context_decays_stale_below_fresh_of_equal_similarity(pool: PgPool) {
+        // Two curated nodes with identical embedding + event_time; only decay
+        // (last_access) differs. The stale one must rank below the fresh one.
+        let raw_old = ingest_record(&pool, &StubNlp, "leslie", req("deploy target one"))
+            .await
+            .unwrap();
+        let raw_new = ingest_record(&pool, &StubNlp, "leslie", req("deploy target two"))
+            .await
+            .unwrap();
+        let n_old = curated_node_from(&pool, "leslie", raw_old.id, "deploy target").await;
+        let n_new = curated_node_from(&pool, "leslie", raw_new.id, "deploy target").await;
+
+        // Pin identical event_time so the recency term is equal; only decay differs.
+        sqlx::query("UPDATE curated_nodes SET event_time = NOW() WHERE id IN ($1, $2)")
+            .bind(n_old)
+            .bind(n_new)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Old: last accessed 60 days ago (deeply decayed). New: just now.
+        sqlx::query(
+            "INSERT INTO ref_weights (ref_id, ref_kind, weight, last_access, decay_class) \
+             VALUES ($1, 'curated', 1.0, NOW() - INTERVAL '60 days', 'default')",
+        )
+        .bind(n_old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ref_weights (ref_id, ref_kind, weight, last_access, decay_class) \
+             VALUES ($1, 'curated', 1.0, NOW(), 'default')",
+        )
+        .bind(n_new)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let out = assemble_inner(&pool, &StubNlp, "leslie", ctx_req("deploy target"))
+            .await
+            .unwrap();
+        let pos_new = out.records.iter().position(|r| r.id == raw_new.id).unwrap();
+        let pos_old = out.records.iter().position(|r| r.id == raw_old.id).unwrap();
+        assert!(
+            pos_new < pos_old,
+            "fresh node must outrank the decayed one (new@{pos_new}, old@{pos_old})"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn context_access_resets_decay_clock(pool: PgPool) {
+        let raw = ingest_record(&pool, &StubNlp, "leslie", req("deploy target reset"))
+            .await
+            .unwrap();
+        let node = curated_node_from(&pool, "leslie", raw.id, "deploy target").await;
+        // Seed a stale last_access.
+        sqlx::query(
+            "INSERT INTO ref_weights (ref_id, ref_kind, weight, last_access, decay_class) \
+             VALUES ($1, 'curated', 1.0, NOW() - INTERVAL '90 days', 'default')",
+        )
+        .bind(node)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A retrieval that returns the node must bump its clock back to ~now.
+        let _ = assemble_inner(&pool, &StubNlp, "leslie", ctx_req("deploy target"))
+            .await
+            .unwrap();
+
+        let idle_secs: f64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - last_access))::float8 FROM ref_weights WHERE ref_id = $1",
+        )
+        .bind(node)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            idle_secs < 5.0,
+            "last_access should be reset to ~now, was {idle_secs}s ago"
+        );
+        // And the decay weight is back to full retention.
+        let w = crate::decay::decay_weight(&pool, node).await.unwrap();
+        assert!((w - 1.0).abs() < 1e-3, "retention reset to 1.0, got {w}");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn context_never_deletes_and_leaves_raw_intact(pool: PgPool) {
+        let raw = ingest_record(&pool, &StubNlp, "leslie", req("deploy target immutable"))
+            .await
+            .unwrap();
+        let node = curated_node_from(&pool, "leslie", raw.id, "deploy target").await;
+        sqlx::query(
+            "INSERT INTO ref_weights (ref_id, ref_kind, weight, last_access, decay_class) \
+             VALUES ($1, 'curated', 1.0, NOW() - INTERVAL '365 days', 'ephemeral')",
+        )
+        .bind(node)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let nodes_before = count_curated(&pool).await;
+        let raw_before = count_raw(&pool).await;
+
+        // Even a deeply-decayed node is still returned (demoted, never deleted).
+        let out = assemble_inner(&pool, &StubNlp, "leslie", ctx_req("deploy target"))
+            .await
+            .unwrap();
+        assert!(out.records.iter().any(|r| r.id == raw.id));
+
+        assert_eq!(count_curated(&pool).await, nodes_before, "nothing deleted");
+        assert_eq!(count_raw(&pool).await, raw_before, "raw untouched");
+        // ref_weights row still there (tombstone-not-delete).
+        let rw: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ref_weights WHERE ref_id = $1")
+            .bind(node)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rw, 1);
+        // Raw content byte-for-byte unchanged.
+        let content: String = sqlx::query_scalar("SELECT content FROM raw_records WHERE id = $1")
+            .bind(raw.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(content, "deploy target immutable");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn context_scope_isolated_across_users(pool: PgPool) {
+        let mine = ingest_record(&pool, &StubNlp, "leslie", req("deploy target mine"))
+            .await
+            .unwrap();
+        let theirs = ingest_record(&pool, &StubNlp, "bob", req("deploy target theirs"))
+            .await
+            .unwrap();
+        curated_node_from(&pool, "leslie", mine.id, "deploy target").await;
+        curated_node_from(&pool, "bob", theirs.id, "deploy target").await;
+
+        let out = assemble_inner(&pool, &StubNlp, "leslie", ctx_req("deploy target"))
+            .await
+            .unwrap();
+        assert!(out.records.iter().all(|r| r.user_id == "leslie"));
+        assert!(out.records.iter().any(|r| r.id == mine.id));
+        assert!(!out.records.iter().any(|r| r.id == theirs.id));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn summaries_endpoint_returns_summary_nodes_with_children(pool: PgPool) {
+        let raw = ingest_record(&pool, &StubNlp, "leslie", req("deploy target summary src"))
+            .await
+            .unwrap();
+        let child = curated_node_from(&pool, "leslie", raw.id, "deploy target").await;
+        // A level-1 summary over that child.
+        let summary_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO curated_nodes (id, kind, content, level, user_id) \
+             VALUES ($1, 'summary', 'rollup', 1, 'leslie')",
+        )
+        .bind(summary_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO curated_edges (from_id, to_id, kind) VALUES ($1, $2, 'summarizes')",
+        )
+        .bind(summary_id)
+        .bind(child)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let all = summaries_inner(
+            &pool,
+            "leslie",
+            SummariesQuery {
+                level: None,
+                project: None,
+                mode: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, summary_id);
+        assert_eq!(all[0].level, 1);
+        assert_eq!(all[0].children, vec![child]);
+
+        // level filter: level 0 has no summaries.
+        let lvl0 = summaries_inner(
+            &pool,
+            "leslie",
+            SummariesQuery {
+                level: Some(0),
+                project: None,
+                mode: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(lvl0.is_empty());
+
+        // Scope isolation: bob sees none of leslie's summaries.
+        let bobs = summaries_inner(
+            &pool,
+            "bob",
+            SummariesQuery {
+                level: None,
+                project: None,
+                mode: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(bobs.is_empty());
+    }
+
+    async fn count_curated(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM curated_nodes")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn count_raw(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM raw_records")
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 }

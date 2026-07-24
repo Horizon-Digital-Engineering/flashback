@@ -45,6 +45,10 @@ pub struct CurationStats {
     pub distilled: i64,
     pub clusters_seen: i64,
     pub skipped_distill: bool,
+    /// Summary nodes built across all RAPTOR levels.
+    pub summarized: i64,
+    /// Deepest summary level reached (0 = flat, no summaries).
+    pub max_level: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -323,10 +327,16 @@ pub async fn rebuild(
         let scope = Scope::new(user_id).with_project(project_id).with_mode(mode);
         let p = promote_working_to_episodic(pool, nlp, &scope).await?;
         let d = distill_semantic(pool, nlp, &scope).await?;
+        // Build the RAPTOR summary tree over the level-0 nodes just derived for
+        // this scope. Scope-bounded and rebuilt from scratch each pass, so the
+        // tree is reproducible.
+        let s = crate::summaries::build_summaries(pool, nlp, &scope).await?;
         total.promoted += p.promoted;
         total.distilled += d.distilled;
         total.clusters_seen += d.clusters_seen;
         total.skipped_distill = total.skipped_distill || d.skipped_distill;
+        total.summarized += s.summaries;
+        total.max_level = total.max_level.max(s.max_level);
     }
     Ok(total)
 }
@@ -400,7 +410,6 @@ pub async fn derivations_of(
 // Shared inserts
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 async fn insert_node(
     pool: &PgPool,
     id: Uuid,
@@ -410,54 +419,90 @@ async fn insert_node(
     importance: Option<f32>,
     event_time: Option<DateTime<Utc>>,
 ) -> AppResult<()> {
-    // `kind` is a trusted constant from this module's call sites, never user
-    // input; content/scope are bound params.
-    sqlx::query(
-        r#"
-        INSERT INTO curated_nodes
-            (id, kind, content, level, user_id, project_id, mode, importance, event_time)
-        VALUES ($1, $2, $3, 0, $4, $5, $6, $7, $8)
-        "#,
-    )
-    .bind(id)
-    .bind(kind)
-    .bind(content)
-    .bind(&scope.user_id)
-    .bind(&scope.project_id)
-    .bind(&scope.mode)
-    .bind(importance)
-    .bind(event_time)
-    .execute(pool)
-    .await?;
-    Ok(())
+    edges::insert_node_at_level(pool, id, kind, content, 0, scope, importance, event_time).await
 }
 
-async fn add_edge(pool: &PgPool, from_id: Uuid, to_id: Uuid, kind: &str) -> AppResult<()> {
-    sqlx::query(
-        "INSERT INTO curated_edges (from_id, to_id, kind) VALUES ($1, $2, $3) \
-         ON CONFLICT (from_id, to_id, kind) DO NOTHING",
-    )
-    .bind(from_id)
-    .bind(to_id)
-    .bind(kind)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
+use edges::add_edge;
+use edges::embed_node;
 
-/// Best-effort embed — mirrors the raw ingest contract. A failed embed never
-/// fails curation; a backfill can fill the gap. The node still exists.
-async fn embed_node(pool: &PgPool, nlp: &dyn NlpService, node_id: Uuid, content: &str) {
-    if let Ok(embedding) = nlp.embed_one(content).await {
-        let _ = sqlx::query(
-            "INSERT INTO curated_embeddings (node_id, model, embedding) VALUES ($1, $2, $3) \
-             ON CONFLICT (node_id, model) DO NOTHING",
+/// Shared curated-layer writers, `pub(crate)` so the summaries module can build
+/// higher levels of the same node/edge/embedding tables without duplicating the
+/// insert idioms (trusted `kind` constant, `AssertSqlSafe`-free bound params,
+/// best-effort embed).
+pub(crate) mod edges {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn insert_node_at_level(
+        pool: &PgPool,
+        id: Uuid,
+        kind: &str,
+        content: &str,
+        level: i32,
+        scope: &Scope,
+        importance: Option<f32>,
+        event_time: Option<DateTime<Utc>>,
+    ) -> AppResult<()> {
+        // `kind` is a trusted constant from this crate's call sites, never user
+        // input; content/level/scope are bound params.
+        sqlx::query(
+            r#"
+            INSERT INTO curated_nodes
+                (id, kind, content, level, user_id, project_id, mode, importance, event_time)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "#,
         )
-        .bind(node_id)
-        .bind(nlp.embedder_model_name())
-        .bind(Vector::from(embedding))
+        .bind(id)
+        .bind(kind)
+        .bind(content)
+        .bind(level)
+        .bind(&scope.user_id)
+        .bind(&scope.project_id)
+        .bind(&scope.mode)
+        .bind(importance)
+        .bind(event_time)
         .execute(pool)
-        .await;
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn add_edge(
+        pool: &PgPool,
+        from_id: Uuid,
+        to_id: Uuid,
+        kind: &str,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "INSERT INTO curated_edges (from_id, to_id, kind) VALUES ($1, $2, $3) \
+             ON CONFLICT (from_id, to_id, kind) DO NOTHING",
+        )
+        .bind(from_id)
+        .bind(to_id)
+        .bind(kind)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Best-effort embed — mirrors the raw ingest contract. A failed embed never
+    /// fails curation; a backfill can fill the gap. The node still exists.
+    pub(crate) async fn embed_node(
+        pool: &PgPool,
+        nlp: &dyn NlpService,
+        node_id: Uuid,
+        content: &str,
+    ) {
+        if let Ok(embedding) = nlp.embed_one(content).await {
+            let _ = sqlx::query(
+                "INSERT INTO curated_embeddings (node_id, model, embedding) VALUES ($1, $2, $3) \
+                 ON CONFLICT (node_id, model) DO NOTHING",
+            )
+            .bind(node_id)
+            .bind(nlp.embedder_model_name())
+            .bind(Vector::from(embedding))
+            .execute(pool)
+            .await;
+        }
     }
 }
 
@@ -468,10 +513,18 @@ async fn embed_node(pool: &PgPool, nlp: &dyn NlpService, node_id: Uuid, content:
 // ---------------------------------------------------------------------------
 
 fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
-    let mut assigned = vec![false; episodes.len()];
+    let entity_sets: Vec<&[String]> = episodes.iter().map(|e| e.entities.as_slice()).collect();
+    cluster_indices_by_jaccard(&entity_sets, CLUSTER_JACCARD)
+}
+
+/// Greedy single-link clustering over index `i` with entity sets `sets[i]`,
+/// merging any pair whose Jaccard ≥ `threshold`. Returns index groups. Shared
+/// with the summaries module so higher RAPTOR levels cluster the same way.
+pub(crate) fn cluster_indices_by_jaccard(sets: &[&[String]], threshold: f32) -> Vec<Vec<usize>> {
+    let mut assigned = vec![false; sets.len()];
     let mut clusters: Vec<Vec<usize>> = Vec::new();
 
-    for i in 0..episodes.len() {
+    for i in 0..sets.len() {
         if assigned[i] {
             continue;
         }
@@ -481,7 +534,7 @@ fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
             if *assigned_j {
                 continue;
             }
-            if jaccard(&episodes[i].entities, &episodes[j].entities) >= CLUSTER_JACCARD {
+            if jaccard(sets[i], sets[j]) >= threshold {
                 group.push(j);
                 *assigned_j = true;
             }
@@ -491,7 +544,7 @@ fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
     clusters
 }
 
-fn jaccard(a: &[String], b: &[String]) -> f32 {
+pub(crate) fn jaccard(a: &[String], b: &[String]) -> f32 {
     let sa: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
     let sb: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
     let inter = sa.intersection(&sb).count() as f32;
