@@ -263,7 +263,11 @@ impl Flashback {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/records/state/{}/{}", args.kind, args.state_key);
+        let path = format!(
+            "/records/state/{}/{}",
+            enc_segment(&args.kind),
+            enc_segment(&args.state_key)
+        );
         let body = json!({
             "data":       args.data,
             "project_id": args.project_id,
@@ -281,7 +285,11 @@ impl Flashback {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/records/state/{}/{}", args.kind, args.state_key);
+        let path = format!(
+            "/records/state/{}/{}",
+            enc_segment(&args.kind),
+            enc_segment(&args.state_key)
+        );
         let res = self.get(&path, &bearer).await?;
         result_ok(res)
     }
@@ -293,7 +301,7 @@ impl Flashback {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/records/state/{}", args.kind);
+        let path = format!("/records/state/{}", enc_segment(&args.kind));
         let res = self.get(&path, &bearer).await?;
         result_ok(res)
     }
@@ -305,7 +313,11 @@ impl Flashback {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let bearer = bearer_or_err(&ctx)?;
-        let path = format!("/records/state/{}/{}/history", args.kind, args.state_key);
+        let path = format!(
+            "/records/state/{}/{}/history",
+            enc_segment(&args.kind),
+            enc_segment(&args.state_key)
+        );
         let res = self.get(&path, &bearer).await?;
         result_ok(res)
     }
@@ -398,6 +410,23 @@ fn bearer_or_err(ctx: &RequestContext<RoleServer>) -> Result<String, McpError> {
 
 fn to_json<T: Serialize>(value: &T) -> Result<Value, McpError> {
     serde_json::to_value(value).map_err(|e| internal(format!("serialize args: {e}")))
+}
+
+/// Percent-encode one URL path segment so a `kind`/`state_key` containing `/`,
+/// `?`, `#`, `%`, or other path-significant bytes can't reshape the request
+/// path (it stays an opaque single segment the server matches on). Unreserved
+/// characters (RFC 3986 `ALPHA / DIGIT / -._~`) pass through untouched.
+fn enc_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn internal(msg: impl Into<String>) -> McpError {
@@ -495,4 +524,32 @@ fn health_response(upstream_ok: bool, url: &str) -> impl IntoResponse {
         "upstream": url,
         "upstream_ok": upstream_ok,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enc_segment_passes_unreserved_through() {
+        assert_eq!(enc_segment("todo_list"), "todo_list");
+        assert_eq!(enc_segment("a-b.c_d~e"), "a-b.c_d~e");
+        assert_eq!(enc_segment("Key123"), "Key123");
+    }
+
+    #[test]
+    fn enc_segment_escapes_path_significant_bytes() {
+        // A key that tries to escape its segment can't reshape the path.
+        assert_eq!(enc_segment("../../catalog"), "..%2F..%2Fcatalog");
+        assert_eq!(enc_segment("foo/history"), "foo%2Fhistory");
+        assert_eq!(enc_segment("a b"), "a%20b");
+        assert_eq!(enc_segment("q?x=1#f"), "q%3Fx%3D1%23f");
+        assert_eq!(enc_segment("100%"), "100%25");
+    }
+
+    #[test]
+    fn enc_segment_escapes_non_ascii() {
+        // Multi-byte UTF-8 is percent-encoded byte-by-byte (no panic, no raw bytes).
+        assert_eq!(enc_segment("café"), "caf%C3%A9");
+    }
 }

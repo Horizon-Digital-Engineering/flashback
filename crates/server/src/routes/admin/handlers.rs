@@ -22,7 +22,7 @@ use crate::{
 };
 
 use super::{
-    projection::{build_graph, GraphInput},
+    projection::{build_graph, GraphInput, GraphLayout},
     style::STYLE_CSS,
     views,
 };
@@ -58,6 +58,9 @@ struct RawRecordDbRow {
     r#type: String,
     content: String,
     source: String,
+    // Selected so the row shape matches the SELECT; ownership is now enforced
+    // in-query (WHERE user_id = $), so nothing reads this after mapping.
+    #[allow(dead_code)]
     user_id: String,
     project_id: Option<String>,
     session_id: Option<String>,
@@ -469,27 +472,28 @@ pub(crate) async fn load_record_detail(
     user_id: &str,
     id: Uuid,
 ) -> Result<(RawAdminRow, Vec<RawAdminRow>), super::Error> {
-    let base = fetch_one_record(pool, id)
+    let base = fetch_one_record(pool, user_id, id)
         .await?
         .ok_or(super::Error::NotFound)?;
-    if base.user_id != user_id {
-        return Err(super::Error::NotFound);
-    }
 
     // Walk the chain: back via supersedes forward-pointers, forward via rows
     // whose supersedes point at us. raw_records.supersedes forms a linked list.
+    // Every hop is scoped to the caller so the chain can never cross a user
+    // boundary (supersede targets are same-user at ingest, but defense in depth).
     let chain_rows: Vec<RawRecordDbRow> = sqlx::query_as::<_, RawRecordDbRow>(
         r#"
         WITH RECURSIVE
         back AS (
-            SELECT r.* FROM raw_records r WHERE r.id = $1
+            SELECT r.* FROM raw_records r WHERE r.id = $1 AND r.user_id = $2
             UNION ALL
             SELECT prev.* FROM raw_records prev JOIN back b ON prev.id = b.supersedes
+                WHERE prev.user_id = $2
         ),
         forward AS (
-            SELECT r.* FROM raw_records r WHERE r.id = $1
+            SELECT r.* FROM raw_records r WHERE r.id = $1 AND r.user_id = $2
             UNION ALL
             SELECT nxt.* FROM raw_records nxt JOIN forward f ON nxt.supersedes = f.id
+                WHERE nxt.user_id = $2
         ),
         chain AS (
             SELECT id FROM back UNION SELECT id FROM forward
@@ -502,11 +506,12 @@ pub(crate) async fn load_record_detail(
                    WHERE n.supersedes = r.id AND n.user_id = r.user_id
                ) AS superseded
         FROM raw_records r
-        WHERE r.id IN (SELECT id FROM chain)
+        WHERE r.id IN (SELECT id FROM chain) AND r.user_id = $2
         ORDER BY r.event_time ASC
         "#,
     )
     .bind(id)
+    .bind(user_id)
     .fetch_all(pool)
     .await?;
 
@@ -522,6 +527,7 @@ pub(crate) async fn load_record_detail(
 
 async fn fetch_one_record(
     pool: &sqlx::PgPool,
+    user_id: &str,
     id: Uuid,
 ) -> Result<Option<RawRecordDbRow>, sqlx::Error> {
     sqlx::query_as::<_, RawRecordDbRow>(
@@ -534,10 +540,11 @@ async fn fetch_one_record(
                    WHERE n.supersedes = r.id AND n.user_id = r.user_id
                ) AS superseded
         FROM raw_records r
-        WHERE r.id = $1
+        WHERE r.id = $1 AND r.user_id = $2
         "#,
     )
     .bind(id)
+    .bind(user_id)
     .fetch_optional(pool)
     .await
 }
@@ -571,6 +578,7 @@ pub(crate) async fn list_state_objects_for(
               WHERE n.supersedes = r.id AND n.user_id = r.user_id
           )
         ORDER BY r.event_time DESC
+        LIMIT 200
         "#,
     )
     .bind(user_id)
@@ -779,19 +787,9 @@ pub async fn map_data(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Json<Value>, super::Error> {
-    let (nodes, _) = compute_graph(&state.pool, &user.user_id).await?;
-    let rows = fetch_for_graph(&state.pool, &user.user_id).await?;
-    let inputs: Vec<GraphInput> = rows
-        .iter()
-        .map(|r| GraphInput {
-            id: r.id,
-            embedding: r.embedding.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
-            entities: r.entities.clone(),
-            session_id: r.session_id.clone(),
-            supersedes: r.supersedes,
-        })
-        .collect();
-    let layout = build_graph(&inputs);
+    // Build the layout once and derive both nodes and edges from it — the
+    // fetch + projection pipeline is the expensive part on this polled endpoint.
+    let (nodes, layout) = compute_graph_with_layout(&state.pool, &user.user_id).await?;
 
     let json_nodes: Vec<Value> = nodes
         .into_iter()
@@ -923,10 +921,23 @@ struct GraphRow {
     entities: Vec<String>,
 }
 
+/// Edge count only — for the map page header. Delegates to the full builder.
 async fn compute_graph(
     pool: &sqlx::PgPool,
     user_id: &str,
 ) -> Result<(Vec<MapNode>, usize), super::Error> {
+    let (nodes, layout) = compute_graph_with_layout(pool, user_id).await?;
+    let edge_count = layout.edges.len();
+    Ok((nodes, edge_count))
+}
+
+/// Fetch the caller's graph rows once, project them, and return both the render
+/// nodes and the full layout (coords + edges). `map_data` needs the edges too,
+/// so it reuses this instead of running the fetch+projection pipeline twice.
+async fn compute_graph_with_layout(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+) -> Result<(Vec<MapNode>, GraphLayout), super::Error> {
     let rows = fetch_for_graph(pool, user_id).await?;
     let inputs: Vec<GraphInput> = rows
         .iter()
@@ -966,8 +977,7 @@ async fn compute_graph(
             }
         })
         .collect::<Vec<_>>();
-    let edge_count = layout.edges.len();
-    Ok((nodes, edge_count))
+    Ok((nodes, layout))
 }
 
 /// The graph pulls terminal + superseded raw records with their default-model
@@ -1190,6 +1200,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, super::super::Error::NotFound));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn load_record_detail_chain_never_crosses_user_boundary(pool: PgPool) {
+        // Alice's record; then a row owned by BOB whose supersedes points at
+        // alice's id (simulates a cross-user supersede pointer — a corrupted or
+        // hostile insert). The chain walk must stay within alice and never pull
+        // bob's row into her detail page.
+        let alice = insert_raw(&pool, "alice", "working", "alice v1", None).await;
+        let bob_cross = insert_raw(&pool, "bob", "episodic", "bob's row", Some(alice)).await;
+
+        let (row, chain) = load_record_detail(&pool, "alice", alice).await.unwrap();
+        assert_eq!(row.id, alice);
+        // Only alice's own row is in the chain — bob's cross-user row is excluded.
+        assert!(chain.iter().all(|r| r.id != bob_cross));
+        assert!(chain.iter().any(|r| r.id == alice));
+    }
+
+    // ---- state object list is capped -------------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn list_state_objects_is_capped(pool: PgPool) {
+        // Insert more terminal state_objects than the 200 cap and confirm the
+        // list never returns an unbounded page.
+        for i in 0..205 {
+            sqlx::query(
+                "INSERT INTO raw_records (type, content, event_time, source, user_id, payload) \
+                 VALUES ('state_object', $1, NOW(), 't', 'alice', \
+                         jsonb_build_object('kind','note','key', $2, 'data', $1))",
+            )
+            .bind(format!("note {i}"))
+            .bind(format!("k{i}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let rows = list_state_objects_for(&pool, "alice").await.unwrap();
+        assert!(
+            rows.len() <= 200,
+            "state list must be capped, got {}",
+            rows.len()
+        );
     }
 
     // ---- state objects ----------------------------------------------------

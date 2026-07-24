@@ -183,12 +183,14 @@ async fn load_level(
               WHERE s.to_id = n.id AND s.kind = 'supersedes'
           )
         ORDER BY n.created_at ASC
+        LIMIT $5
         "#,
     )
     .bind(level)
     .bind(&scope.user_id)
     .bind(&scope.project_id)
     .bind(&scope.mode)
+    .bind(crate::curation::curation_batch_cap())
     .fetch_all(pool)
     .await?;
 

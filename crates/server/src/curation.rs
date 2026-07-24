@@ -43,6 +43,20 @@ use crate::nlp::NlpService;
 /// Jaccard threshold for merging two episodic nodes into one semantic cluster.
 const CLUSTER_JACCARD: f32 = 0.4;
 
+/// Upper bound on how many raw/episodic rows a single curation pass pulls into
+/// memory (and, for distillation, feeds the O(n²) entity clusterer). Promotion
+/// is idempotent and the clusterer is quadratic, so a large backlog is drained
+/// over successive scheduled passes instead of loading a whole corpus at once —
+/// this keeps one rebuild bounded in both memory and CPU. Tunable per deployment
+/// via `FLASHBACK_CURATION_BATCH`.
+pub(crate) fn curation_batch_cap() -> i64 {
+    std::env::var("FLASHBACK_CURATION_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(5_000)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CurationStats {
     pub promoted: i64,
@@ -144,11 +158,13 @@ pub async fn promote_working_to_episodic(
               WHERE e.to_id = r.id AND e.kind = 'derived_from' AND n.kind = 'episodic'
           )
         ORDER BY r.event_time ASC
+        LIMIT $4
     "#;
     let rows = sqlx::query_as::<_, WorkingRaw>(sql)
         .bind(&scope.user_id)
         .bind(&scope.project_id)
         .bind(&scope.mode)
+        .bind(curation_batch_cap())
         .fetch_all(pool)
         .await?;
 
@@ -209,6 +225,10 @@ pub(crate) async fn index_entities(
 /// promotion feeds), so a stale index row never leaks entities for a
 /// superseded record into the cluster.
 async fn entities_for_scope(pool: &PgPool, scope: &Scope) -> AppResult<HashMap<Uuid, Vec<String>>> {
+    // Ceiling on index rows pulled into the map. Entities-per-record is small,
+    // so a generous multiple of the per-pass node cap covers the clustered set
+    // while still bounding memory on a pathologically large index.
+    let cap = curation_batch_cap().saturating_mul(32);
     let rows = sqlx::query_as::<_, (Uuid, String)>(
         r#"
         SELECT ei.record_id, ei.entity
@@ -217,11 +237,13 @@ async fn entities_for_scope(pool: &PgPool, scope: &Scope) -> AppResult<HashMap<U
         WHERE ei.user_id = $1
           AND r.project_id IS NOT DISTINCT FROM $2
           AND r.mode IS NOT DISTINCT FROM $3
+        LIMIT $4
         "#,
     )
     .bind(&scope.user_id)
     .bind(&scope.project_id)
     .bind(&scope.mode)
+    .bind(cap)
     .fetch_all(pool)
     .await?;
 
@@ -282,11 +304,13 @@ pub async fn distill_semantic(
               WHERE s.to_id = n.id AND s.kind = 'supersedes'
           )
         ORDER BY n.created_at ASC
+        LIMIT $4
         "#,
     )
     .bind(&scope.user_id)
     .bind(&scope.project_id)
     .bind(&scope.mode)
+    .bind(curation_batch_cap())
     .fetch_all(pool)
     .await?;
 
@@ -324,15 +348,23 @@ pub async fn distill_semantic(
     for cluster in clusters.iter().filter(|c| c.len() >= 2) {
         let refs: Vec<EpisodeRef> = cluster
             .iter()
-            .map(|&i| EpisodeRef {
+            .filter_map(|&i| {
                 // The distiller identifies sources by the raw id (that's what
                 // the semantic node points back at). One EpisodeRef per raw id.
-                id: episodes[i].source_raw_ids[0],
-                content: episodes[i].content.clone(),
-                topic: None,
-                entities: episodes[i].entities.clone(),
+                // An episode with no source raw id can't be cited, so skip it
+                // rather than index an empty vec.
+                let id = *episodes[i].source_raw_ids.first()?;
+                Some(EpisodeRef {
+                    id,
+                    content: episodes[i].content.clone(),
+                    topic: None,
+                    entities: episodes[i].entities.clone(),
+                })
             })
             .collect();
+        if refs.is_empty() {
+            continue;
+        }
 
         let facts = match nlp.distill_facts(&refs).await {
             Ok(f) => f,
@@ -689,6 +721,9 @@ mod tests {
     use async_trait::async_trait;
     use flashback_nlp::{DistilledFact, Extraction, ProviderError};
 
+    /// Serializes the one test that mutates the process-global batch-cap env var.
+    static BATCH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // -- jaccard / clustering (pure) --------------------------------------
 
     #[test]
@@ -889,6 +924,31 @@ mod tests {
             .unwrap();
         assert_eq!(second.promoted, 0);
         assert_eq!(count_nodes(&pool, "alice", "episodic").await, 1);
+    }
+
+    #[test]
+    fn curation_batch_cap_defaults_and_rejects_bad_env() {
+        // Serialize the process-global env mutation and restore it after.
+        let _lock = BATCH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("FLASHBACK_CURATION_BATCH").ok();
+
+        // SAFETY: this test holds BATCH_ENV_LOCK for the whole mutation window.
+        unsafe { std::env::remove_var("FLASHBACK_CURATION_BATCH") };
+        assert_eq!(curation_batch_cap(), 5_000); // default when unset
+
+        // A positive override is honored; zero/negative/garbage fall back.
+        unsafe { std::env::set_var("FLASHBACK_CURATION_BATCH", "10") };
+        assert_eq!(curation_batch_cap(), 10);
+        for bad in ["0", "-4", "nan"] {
+            unsafe { std::env::set_var("FLASHBACK_CURATION_BATCH", bad) };
+            assert_eq!(curation_batch_cap(), 5_000, "'{bad}' must fall back");
+        }
+
+        // Restore the prior value so no other test observes our mutation.
+        match prev {
+            Some(v) => unsafe { std::env::set_var("FLASHBACK_CURATION_BATCH", v) },
+            None => unsafe { std::env::remove_var("FLASHBACK_CURATION_BATCH") },
+        }
     }
 
     // -- distill -----------------------------------------------------------

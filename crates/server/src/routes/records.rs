@@ -2322,4 +2322,66 @@ mod tests {
         assert!(out.records.iter().all(|r| r.user_id == "leslie"));
         assert!(out.records.iter().any(|r| r.id == mine.id));
     }
+
+    // -- resource bounds: limit is clamped, never unbounded ----------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn query_limit_is_clamped_to_max(pool: PgPool) {
+        // Ingest a handful; an absurd limit must not error or over-return — the
+        // handler clamps to at most 1000.
+        for i in 0..5 {
+            ingest_record(&pool, &StubNlp, "leslie", req(&format!("note {i}")))
+                .await
+                .unwrap();
+        }
+        let mut oversized = q();
+        oversized.limit = Some(1_000_000_000);
+        let rows = query_records_inner(&pool, "leslie", oversized)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            5,
+            "returns the real rows, clamp doesn't inflate"
+        );
+
+        // A zero/negative limit clamps up to 1 (never returns an empty/invalid page).
+        let mut zero = q();
+        zero.limit = Some(0);
+        assert!(!query_records_inner(&pool, "leslie", zero)
+            .await
+            .unwrap()
+            .is_empty());
+        let mut negative = q();
+        negative.limit = Some(-42);
+        assert!(!query_records_inner(&pool, "leslie", negative)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn context_limit_is_clamped_to_max(pool: PgPool) {
+        ingest_record(&pool, &StubNlp, "leslie", req("deploy target one"))
+            .await
+            .unwrap();
+        // An oversized context limit is clamped (to 200) rather than honored or
+        // erroring — a single request can't demand unbounded retrieval work.
+        let out = assemble_inner(
+            &pool,
+            &StubNlp,
+            "leslie",
+            AssembleRequest {
+                project_id: None,
+                session_id: None,
+                mode: None,
+                modes: None,
+                query: Some("deploy".into()),
+                limit: Some(10_000_000),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out.records.len() <= 200, "context limit clamped to 200");
+    }
 }
