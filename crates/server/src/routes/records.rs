@@ -1,11 +1,14 @@
 //! The RAW-records door (medallion "bronze"). Universal typed records, immutable
-//! and append-only. No embeddings/NLP here — raw is pre-curation; the curation
-//! pipeline derives embeddings + views + references from these rows later.
+//! and append-only. Raw itself holds NO embeddings — but on ingest we compute a
+//! DERIVED embedding into `raw_embeddings` (best-effort; raw is the source of
+//! truth, the embedding is rebuildable). `/records/context` does hybrid
+//! vector+keyword retrieval; the curation pipeline (summaries/references/decay)
+//! layers on later behind the same endpoints.
 //!
 //! Endpoints (nested under /records):
-//!   POST /records          ingest a typed record
+//!   POST /records          ingest a typed record (+ derived embedding)
 //!   POST /records/query    structured reads (dashboards)
-//!   POST /records/context  dumb keyword+recency context (the walking-skeleton getContext)
+//!   POST /records/context  hybrid vector+keyword context (getContext)
 //!   GET  /records/:id       one record
 //!   GET  /records/:id/lineage   the supersede chain
 
@@ -15,14 +18,20 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
+use pgvector::Vector;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{AssertSqlSafe, FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::{auth::AuthUser, error::AppResult, error::AppError, AppState};
+use crate::{
+    auth::AuthUser,
+    error::{AppError, AppResult},
+    nlp::NlpService,
+    AppState,
+};
 
-/// The columns of raw_records, in RawRecordRow field order. `content_tsv` is a
+/// Columns of raw_records in RawRecordRow field order. `content_tsv` is a
 /// generated tsvector and is deliberately NOT selected (not on the struct).
 const COLS: &str = "id, type, content, content_hash, event_time, ingest_time, \
     source, source_ref, user_id, project_id, session_id, mode, importance, \
@@ -113,11 +122,14 @@ async fn ingest(
     auth_user: AuthUser,
     Json(req): Json<IngestRecordRequest>,
 ) -> AppResult<Json<IngestRecordResponse>> {
-    Ok(Json(ingest_record(&state.pool, &auth_user.user_id, req).await?))
+    Ok(Json(
+        ingest_record(&state.pool, &*state.nlp, &auth_user.user_id, req).await?,
+    ))
 }
 
 pub(crate) async fn ingest_record(
     pool: &PgPool,
+    nlp: &dyn NlpService,
     user_id: &str,
     req: IngestRecordRequest,
 ) -> AppResult<IngestRecordResponse> {
@@ -170,6 +182,20 @@ pub(crate) async fn ingest_record(
     .bind(&req.payload)
     .execute(pool)
     .await?;
+
+    // Derived embedding — best-effort. Raw is the source of truth; if the
+    // embedder is down a backfill job can fill the gap later. Never fails ingest.
+    if let Ok(embedding) = nlp.embed_one(&req.content).await {
+        let _ = sqlx::query(
+            "INSERT INTO raw_embeddings (record_id, model, embedding) VALUES ($1, $2, $3) \
+             ON CONFLICT (record_id, model) DO NOTHING",
+        )
+        .bind(id)
+        .bind(nlp.embedder_model_name())
+        .bind(Vector::from(embedding))
+        .execute(pool)
+        .await;
+    }
 
     Ok(IngestRecordResponse { id })
 }
@@ -227,7 +253,7 @@ pub(crate) async fn query_records_inner(
         LIMIT $8
         "#
     );
-    // sql is built only from trusted column constants (COLS/COLS_R) + $-params.
+    // sql is built only from trusted column constants (COLS) + $-params.
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(user_id)
         .bind(&req.project_id)
@@ -243,7 +269,8 @@ pub(crate) async fn query_records_inner(
 }
 
 // ---------------------------------------------------------------------------
-// Context assemble (the walking-skeleton getContext: keyword + recency)
+// Context assemble (getContext): hybrid vector+keyword when a query is present,
+// recency when it isn't. The dumb-but-real fill; the curated view feeds in later.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -270,40 +297,77 @@ async fn assemble(
     auth_user: AuthUser,
     Json(req): Json<AssembleRequest>,
 ) -> AppResult<Json<AssembleResponse>> {
-    Ok(Json(assemble_inner(&state.pool, &auth_user.user_id, req).await?))
+    Ok(Json(
+        assemble_inner(&state.pool, &*state.nlp, &auth_user.user_id, req).await?,
+    ))
 }
 
 pub(crate) async fn assemble_inner(
     pool: &PgPool,
+    nlp: &dyn NlpService,
     user_id: &str,
     req: AssembleRequest,
 ) -> AppResult<AssembleResponse> {
     let limit = req.limit.unwrap_or(50).clamp(1, 200);
-    let query = req.query.unwrap_or_default();
-    // Empty query -> ts_rank 0 everywhere -> pure recency. This is the dumb fill;
-    // the smart relevance ranking replaces this SQL behind the same endpoint.
-    let sql = format!(
-        r#"
-        SELECT {COLS} FROM raw_records
-        WHERE user_id = $1
-          AND ($2::text IS NULL OR project_id = $2)
-          AND ($3::text IS NULL OR session_id = $3)
-          AND ($4::text IS NULL OR mode = $4)
-          AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL)
-          AND (ttl IS NULL OR ttl > NOW())
-        ORDER BY ts_rank(content_tsv, plainto_tsquery('english', $5)) DESC, event_time DESC
-        LIMIT $6
-        "#
-    );
-    let records = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
-        .bind(user_id)
-        .bind(&req.project_id)
-        .bind(&req.session_id)
-        .bind(&req.mode)
-        .bind(&query)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?;
+    let query = req.query.clone().unwrap_or_default();
+
+    let records = if query.trim().is_empty() {
+        // No query -> pure recency.
+        let sql = format!(
+            r#"
+            SELECT {COLS} FROM raw_records
+            WHERE user_id = $1
+              AND ($2::text IS NULL OR project_id = $2)
+              AND ($3::text IS NULL OR session_id = $3)
+              AND ($4::text IS NULL OR mode = $4)
+              AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL)
+              AND (ttl IS NULL OR ttl > NOW())
+            ORDER BY event_time DESC
+            LIMIT $5
+            "#
+        );
+        sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+            .bind(user_id)
+            .bind(&req.project_id)
+            .bind(&req.session_id)
+            .bind(&req.mode)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+    } else {
+        // Hybrid: 0.7 * cosine-similarity(query, record) + 0.3 * keyword rank.
+        // LEFT JOIN so records without an embedding still rank on keyword.
+        let qvec = nlp.embed_one(&query).await?;
+        let model = nlp.embedder_model_name().to_string();
+        let sql = format!(
+            r#"
+            SELECT {COLS_R} FROM raw_records r
+            LEFT JOIN raw_embeddings e ON e.record_id = r.id AND e.model = $1
+            WHERE r.user_id = $2
+              AND ($3::text IS NULL OR r.project_id = $3)
+              AND ($4::text IS NULL OR r.session_id = $4)
+              AND ($5::text IS NULL OR r.mode = $5)
+              AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL)
+              AND (r.ttl IS NULL OR r.ttl > NOW())
+            ORDER BY (
+                0.7 * COALESCE(1 - (e.embedding <=> $6), 0)
+                + 0.3 * ts_rank(r.content_tsv, plainto_tsquery('english', $7))
+            ) DESC, r.event_time DESC
+            LIMIT $8
+            "#
+        );
+        sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+            .bind(model)
+            .bind(user_id)
+            .bind(&req.project_id)
+            .bind(&req.session_id)
+            .bind(&req.mode)
+            .bind(Vector::from(qvec))
+            .bind(&query)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+    };
     Ok(AssembleResponse { records })
 }
 
@@ -375,7 +439,6 @@ pub(crate) async fn lineage_inner(
         ORDER BY ingest_time ASC
         "#
     );
-    // sql is built only from trusted column constants (COLS/COLS_R) + $-params.
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(id)
         .fetch_all(pool)
@@ -386,6 +449,32 @@ pub(crate) async fn lineage_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+
+    #[derive(Clone)]
+    struct StubNlp;
+
+    #[async_trait]
+    impl NlpService for StubNlp {
+        fn provider_name(&self) -> &'static str { "stub" }
+        fn provider_can_distill(&self) -> bool { false }
+        fn embedder_model_name(&self) -> &str { "stub-embedder" }
+        fn embedder_dimension(&self) -> usize { 384 }
+        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(vec![0.1_f32; 384]) // non-zero to keep cosine defined
+        }
+        async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+        }
+        fn extract_entities(&self, _text: &str) -> Vec<String> { Vec::new() }
+        async fn extract_full(&self, _text: &str) -> Result<Extraction, AppError> {
+            Ok(Extraction::empty())
+        }
+        async fn distill_facts(&self, _e: &[EpisodeRef]) -> Result<Vec<DistilledFact>, ProviderError> {
+            Err(ProviderError::NotConfigured("stub".into()))
+        }
+    }
 
     fn req(content: &str) -> IngestRecordRequest {
         IngestRecordRequest {
@@ -414,57 +503,56 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_and_query_roundtrip(pool: PgPool) {
-        let out = ingest_record(&pool, "leslie", req("took 5mg lisinopril")).await.unwrap();
+        let out = ingest_record(&pool, &StubNlp, "leslie", req("took 5mg lisinopril")).await.unwrap();
         let rows = query_records_inner(&pool, "leslie", q()).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, out.id);
         assert_eq!(rows[0].content, "took 5mg lisinopril");
         assert_eq!(rows[0].content_hash.len(), 32); // md5 hex
+
+        // The derived embedding landed in the separate table.
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_embeddings WHERE record_id = $1")
+            .bind(out.id).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn raw_records_are_immutable(pool: PgPool) {
-        let out = ingest_record(&pool, "leslie", req("original")).await.unwrap();
-        // A direct UPDATE must be rejected by the trigger.
-        let err = sqlx::query("UPDATE raw_records SET content = 'tampered' WHERE id = $1")
-            .bind(out.id)
-            .execute(&pool)
-            .await;
-        assert!(err.is_err(), "UPDATE on raw_records should be blocked");
-        let err2 = sqlx::query("DELETE FROM raw_records WHERE id = $1")
-            .bind(out.id)
-            .execute(&pool)
-            .await;
-        assert!(err2.is_err(), "DELETE on raw_records should be blocked");
+        let out = ingest_record(&pool, &StubNlp, "leslie", req("original")).await.unwrap();
+        let upd = sqlx::query("UPDATE raw_records SET content = 'tampered' WHERE id = $1")
+            .bind(out.id).execute(&pool).await;
+        assert!(upd.is_err(), "UPDATE on raw_records should be blocked");
+        let del = sqlx::query("DELETE FROM raw_records WHERE id = $1")
+            .bind(out.id).execute(&pool).await;
+        assert!(del.is_err(), "DELETE on raw_records should be blocked");
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn supersede_forward_pointer_hides_old_keeps_it(pool: PgPool) {
-        let v1 = ingest_record(&pool, "leslie", req("weight 180")).await.unwrap();
+        let v1 = ingest_record(&pool, &StubNlp, "leslie", req("weight 180")).await.unwrap();
         let mut r2 = req("weight 178");
         r2.supersedes = Some(v1.id);
-        let v2 = ingest_record(&pool, "leslie", r2).await.unwrap();
+        let v2 = ingest_record(&pool, &StubNlp, "leslie", r2).await.unwrap();
 
-        // Active query shows only the new one.
         let active = query_records_inner(&pool, "leslie", q()).await.unwrap();
         assert_eq!(active.iter().map(|r| r.id).collect::<Vec<_>>(), vec![v2.id]);
 
-        // The old row STILL EXISTS, unmutated (its supersedes is null; we never touched it).
         let old = get_record_inner(&pool, "leslie", v1.id).await.unwrap();
         assert_eq!(old.content, "weight 180");
-        assert_eq!(old.supersedes, None);
+        assert_eq!(old.supersedes, None); // never mutated
 
-        // Lineage returns both, oldest-first.
         let line = lineage_inner(&pool, "leslie", v2.id).await.unwrap();
         assert_eq!(line.iter().map(|r| r.id).collect::<Vec<_>>(), vec![v1.id, v2.id]);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn context_ranks_keyword_over_recency(pool: PgPool) {
-        ingest_record(&pool, "leslie", req("weighed 180 lbs")).await.unwrap();
-        ingest_record(&pool, "leslie", req("discussed lisinopril dosage")).await.unwrap();
-        ingest_record(&pool, "leslie", req("ate lunch")).await.unwrap();
-        let out = assemble_inner(&pool, "leslie", AssembleRequest {
+    async fn context_hybrid_ranks_keyword_over_recency(pool: PgPool) {
+        ingest_record(&pool, &StubNlp, "leslie", req("weighed 180 lbs")).await.unwrap();
+        ingest_record(&pool, &StubNlp, "leslie", req("discussed lisinopril dosage")).await.unwrap();
+        ingest_record(&pool, &StubNlp, "leslie", req("ate lunch")).await.unwrap();
+        // Stub embeddings are uniform, so the vector term is constant and the
+        // keyword term decides — the lisinopril record must come first.
+        let out = assemble_inner(&pool, &StubNlp, "leslie", AssembleRequest {
             project_id: None, session_id: None, mode: None,
             query: Some("lisinopril".into()), limit: None,
         }).await.unwrap();
@@ -472,12 +560,21 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn context_empty_query_is_recency(pool: PgPool) {
+        ingest_record(&pool, &StubNlp, "leslie", req("first")).await.unwrap();
+        let latest = ingest_record(&pool, &StubNlp, "leslie", req("second")).await.unwrap();
+        let out = assemble_inner(&pool, &StubNlp, "leslie", AssembleRequest {
+            project_id: None, session_id: None, mode: None, query: None, limit: None,
+        }).await.unwrap();
+        assert_eq!(out.records[0].id, latest.id); // most recent first
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn scoped_and_isolated_by_user(pool: PgPool) {
-        ingest_record(&pool, "leslie", req("mine")).await.unwrap();
-        ingest_record(&pool, "bob", req("theirs")).await.unwrap();
+        ingest_record(&pool, &StubNlp, "leslie", req("mine")).await.unwrap();
+        ingest_record(&pool, &StubNlp, "bob", req("theirs")).await.unwrap();
         assert_eq!(query_records_inner(&pool, "leslie", q()).await.unwrap().len(), 1);
         assert_eq!(query_records_inner(&pool, "bob", q()).await.unwrap().len(), 1);
-        // bob cannot read leslie's record by id.
         let leslies = query_records_inner(&pool, "leslie", q()).await.unwrap()[0].id;
         assert!(get_record_inner(&pool, "bob", leslies).await.is_err());
     }
