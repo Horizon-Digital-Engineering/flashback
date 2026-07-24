@@ -8,6 +8,7 @@ mod decay;
 mod error;
 mod models;
 mod nlp;
+mod references;
 mod retrieval;
 mod routes;
 mod state;

@@ -33,7 +33,9 @@ use crate::{
 
 /// Columns of raw_records in RawRecordRow field order. `content_tsv` is a
 /// generated tsvector and is deliberately NOT selected (not on the struct).
-const COLS: &str = "id, type, content, content_hash, event_time, ingest_time, \
+/// `state_kind`/`state_key` are promoted state_object columns (010) — read via
+/// the payload on the struct, so also not selected here.
+pub(crate) const COLS: &str = "id, type, content, content_hash, event_time, ingest_time, \
     source, source_ref, user_id, project_id, session_id, mode, importance, \
     supersedes, acl, ttl, payload";
 const COLS_R: &str = "r.id, r.type, r.content, r.content_hash, r.event_time, r.ingest_time, \
@@ -48,6 +50,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/context", post(assemble))
         .route("/summaries", get(summaries))
         .route("/rebuild", post(rebuild_curation))
+        // The raw-native reference surface (state_object records). NEW; the
+        // legacy `memories`-backed /state/* routes are untouched.
+        .nest("/state", crate::references::router(state.clone()))
         .route("/{id}", get(get_record))
         .route("/{id}/lineage", get(lineage))
         .route("/{id}/derivations", get(derivations))
@@ -74,6 +79,27 @@ pub struct RawRecordRow {
     pub acl: Option<Value>,
     pub ttl: Option<DateTime<Utc>>,
     pub payload: Option<Value>,
+}
+
+impl RawRecordRow {
+    /// The reference kind for a state_object row, from the `{kind,...}` payload
+    /// convention (the same value the 010 trigger promotes onto `state_kind`).
+    pub(crate) fn state_kind_of(&self, payload: &Value) -> AppResult<String> {
+        payload
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("state_object payload missing kind")))
+    }
+
+    /// The reference key for a state_object row, from the `{key,...}` payload.
+    pub(crate) fn state_key_of(&self, payload: &Value) -> AppResult<String> {
+        payload
+            .get("key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| AppError::Internal(anyhow::anyhow!("state_object payload missing key")))
+    }
 }
 
 fn validate_type(t: &str) -> AppResult<()> {
@@ -573,6 +599,25 @@ pub(crate) async fn assemble_inner(
     // 3) Fetch those raw records (still active + owned), preserving curated rank.
     let mut records = fetch_raw_in_order(pool, user_id, &ordered_raw_ids).await?;
 
+    // 3b) Reference bias: references describe the PRESENT ("what am I currently
+    // maintaining"); records describe the past. For present-tense / "current"
+    // queries, give a matching reference (a state_object terminal row) a small
+    // additive boost so it floats above episodic noise — the design's "small
+    // bias term". State_objects never enter the curated feed (they aren't
+    // `working`), so this is the surface that makes references first-class in
+    // retrieval. Shape is unchanged: references are ordinary RawRecordRow rows.
+    if is_present_tense(&query) {
+        let ref_hits = reference_hits(pool, user_id, &req, &qvec, &model, &query, limit).await?;
+        let seen_ids: std::collections::HashSet<Uuid> = records.iter().map(|r| r.id).collect();
+        let mut biased: Vec<RawRecordRow> = ref_hits
+            .into_iter()
+            .filter(|r| !seen_ids.contains(&r.id))
+            .collect();
+        biased.extend(records);
+        records = biased;
+        records.truncate(limit as usize);
+    }
+
     // 4) Backstop: if the curated layer under-fills the page (e.g. curation
     // hasn't run yet, or a fresh raw record isn't summarized), top up with a
     // direct raw hybrid search — the same 0.7·cosine + 0.3·keyword fallback.
@@ -585,6 +630,86 @@ pub(crate) async fn assemble_inner(
     }
 
     Ok(AssembleResponse { records })
+}
+
+/// The additive reference bias applied to a matching reference on present-tense
+/// queries — a modest bump, not an override: a strongly on-topic record can
+/// still outrank a weakly-matching reference. Sized to lift a reference above
+/// same-topic episodic noise it would otherwise tie or trail.
+const W_REF_BIAS: f64 = 0.15;
+
+/// Cheap heuristic for "is this query asking about the current/present state?".
+/// References answer the present-tense half of memory, so these cue words gate
+/// the reference bias. Deliberately conservative — past-tense/"what happened"
+/// queries get the normal record ranking with no reference boost.
+fn is_present_tense(query: &str) -> bool {
+    const CUES: &[&str] = &[
+        "current",
+        "currently",
+        "right now",
+        "now",
+        "working on",
+        "what am i",
+        "what's on",
+        "whats on",
+        "what is on",
+        "todo",
+        "to-do",
+        "to do",
+        "status",
+        "state of",
+        "active",
+        "in progress",
+        "latest",
+    ];
+    let q = query.to_lowercase();
+    CUES.iter().any(|c| q.contains(c))
+}
+
+/// Terminal state_object rows ranked by the hybrid score plus the reference
+/// bias, scoped + owned. Only terminal (not-superseded) references are eligible,
+/// so a superseded value never surfaces. Ordered best-first.
+async fn reference_hits(
+    pool: &PgPool,
+    user_id: &str,
+    req: &AssembleRequest,
+    qvec: &[f32],
+    model: &str,
+    query: &str,
+    limit: i64,
+) -> AppResult<Vec<RawRecordRow>> {
+    let sql = format!(
+        r#"
+        SELECT {COLS_R} FROM raw_records r
+        LEFT JOIN raw_embeddings e ON e.record_id = r.id AND e.model = $1
+        WHERE r.user_id = $2
+          AND r.type = 'state_object'
+          AND ($3::text IS NULL OR r.project_id = $3)
+          AND ($4::text IS NULL OR r.session_id = $4)
+          AND ($5::text IS NULL OR r.mode = $5)
+          AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
+          AND (r.ttl IS NULL OR r.ttl > NOW())
+        ORDER BY (
+            $9
+            + 0.7 * COALESCE(NULLIF(1 - (e.embedding <=> $6), 'NaN'::float8), 0)
+            + 0.3 * ts_rank(r.content_tsv, plainto_tsquery('english', $7))
+        ) DESC, r.event_time DESC
+        LIMIT $8
+        "#
+    );
+    let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+        .bind(model)
+        .bind(user_id)
+        .bind(&req.project_id)
+        .bind(&req.session_id)
+        .bind(&req.mode)
+        .bind(Vector::from(qvec.to_vec()))
+        .bind(query)
+        .bind(limit)
+        .bind(W_REF_BIAS)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
 }
 
 /// Every raw id reachable from a curated node: walk `summarizes` down to the
@@ -1538,6 +1663,102 @@ mod tests {
         .await
         .unwrap();
         assert!(bobs.is_empty());
+    }
+
+    // -- reference retrieval bias ------------------------------------------
+
+    #[test]
+    fn present_tense_detects_current_queries() {
+        assert!(is_present_tense("what am I working on"));
+        assert!(is_present_tense("what's on my todo list"));
+        assert!(is_present_tense("current project status"));
+        // Past-tense / "what happened" gets no reference boost.
+        assert!(!is_present_tense("what did I eat last tuesday"));
+        assert!(!is_present_tense("the meeting we had yesterday"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn context_biases_reference_above_episodic_noise(pool: PgPool) {
+        // Episodic noise on the same topic.
+        for note in [
+            "started working on the deploy pipeline",
+            "the deploy pipeline had a flaky test",
+            "notes about the deploy pipeline meeting",
+        ] {
+            ingest_record(&pool, &StubNlp, "leslie", req(note))
+                .await
+                .unwrap();
+        }
+        // A reference (state_object) capturing the current working state.
+        let reference = crate::references::put_value_inner(
+            &pool,
+            &StubNlp,
+            "leslie",
+            "todo_list",
+            "deploy_pipeline",
+            crate::references::PutValueRequest {
+                data: serde_json::json!({ "items": [{ "text": "finish the deploy pipeline" }] }),
+                project_id: Some("health".into()),
+                session_id: None,
+                importance: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Present-tense query: the reference must lead the episodic noise.
+        let out = assemble_inner(
+            &pool,
+            &StubNlp,
+            "leslie",
+            ctx_req("what am I working on deploy pipeline"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.records[0].id, reference.id,
+            "the reference should be biased above episodic noise for a present-tense query"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn context_no_reference_bias_on_past_tense_query(pool: PgPool) {
+        // A reference exists but the query is past-tense, so no bias applies and
+        // the response shape is unchanged (references compete on the normal score).
+        crate::references::put_value_inner(
+            &pool,
+            &StubNlp,
+            "leslie",
+            "todo_list",
+            "deploy_pipeline",
+            crate::references::PutValueRequest {
+                data: serde_json::json!({ "items": [] }),
+                project_id: Some("health".into()),
+                session_id: None,
+                importance: None,
+            },
+        )
+        .await
+        .unwrap();
+        let noise = ingest_record(
+            &pool,
+            &StubNlp,
+            "leslie",
+            req("deploy pipeline retro from last week"),
+        )
+        .await
+        .unwrap();
+
+        let out = assemble_inner(
+            &pool,
+            &StubNlp,
+            "leslie",
+            ctx_req("what happened in the deploy pipeline retro"),
+        )
+        .await
+        .unwrap();
+        // No panic, records returned, and the past-tense episodic hit is present.
+        assert!(out.records.iter().any(|r| r.id == noise.id));
     }
 
     async fn count_curated(pool: &PgPool) -> i64 {

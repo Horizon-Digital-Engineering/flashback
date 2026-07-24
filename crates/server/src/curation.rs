@@ -15,14 +15,19 @@
 //!     the presence of that edge is the "already curated" marker.
 //!
 //!   - `distill_semantic`: clusters active episodic curated nodes by entity
-//!     overlap (entities are extracted on the fly from the source raw content,
-//!     since raw has no `entities[]` column), then asks the configured
-//!     `AiProvider` to distill each cluster into semantic facts. Each fact
-//!     becomes a `kind='semantic'` node with `derived_from` edges to *every*
-//!     source raw id. Requires a provider that can distill; the heuristic
-//!     provider degrades gracefully (logs + no-op).
+//!     overlap, then asks the configured `AiProvider` to distill each cluster
+//!     into semantic facts. Entities come from `entity_index` (the HippoRAG
+//!     pointer table, populated during promotion) so a pass reads them instead
+//!     of re-extracting every time; on-the-fly `extract_entities` is the
+//!     fallback when the index has no row for a raw id yet. Each fact becomes a
+//!     `kind='semantic'` node with `derived_from` edges to *every* source raw
+//!     id. Requires a provider that can distill; the heuristic provider
+//!     degrades gracefully (logs + no-op).
 //!
-//! Every new curated node is embedded into `curated_embeddings`.
+//! Every new curated node is embedded into `curated_embeddings`. Promotion also
+//! populates `entity_index` and emits `curated_edges(kind='entity')` tying the
+//! episodic node to its source raw id, labelled with the entity (the glass-box
+//! view of what a node clustered on; the index is the scan-friendly hop).
 
 use std::collections::{HashMap, HashSet};
 
@@ -148,9 +153,69 @@ pub async fn promote_working_to_episodic(
         .await?;
         add_edge(pool, node_id, r.id, "derived_from").await?;
         embed_node(pool, nlp, node_id, &r.content).await;
+
+        // Populate the entity index for this raw record and emit one labelled
+        // `entity` edge (node -> raw id) per entity. The index is what the
+        // distill pass clusters on; the edge is the glass-box lineage.
+        let entities = nlp.extract_entities(&r.content);
+        index_entities(pool, &scope.user_id, r.id, &entities).await?;
+        for entity in &entities {
+            add_entity_edge(pool, node_id, r.id, entity).await?;
+        }
         stats.promoted += 1;
     }
     Ok(stats)
+}
+
+/// Insert (user_id, entity, record_id) rows into the HippoRAG pointer table.
+/// Idempotent on the composite PK. Populated during promotion so the distill
+/// pass and future graph hops read the index instead of re-extracting.
+pub(crate) async fn index_entities(
+    pool: &PgPool,
+    user_id: &str,
+    record_id: Uuid,
+    entities: &[String],
+) -> AppResult<()> {
+    for entity in entities {
+        sqlx::query(
+            "INSERT INTO entity_index (user_id, entity, record_id) VALUES ($1, $2, $3) \
+             ON CONFLICT (user_id, entity, record_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(entity)
+        .bind(record_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The indexed entities per raw id for a scope, read from `entity_index`. Only
+/// the active `working` raw records in scope are considered (the same set
+/// promotion feeds), so a stale index row never leaks entities for a
+/// superseded record into the cluster.
+async fn entities_for_scope(pool: &PgPool, scope: &Scope) -> AppResult<HashMap<Uuid, Vec<String>>> {
+    let rows = sqlx::query_as::<_, (Uuid, String)>(
+        r#"
+        SELECT ei.record_id, ei.entity
+        FROM entity_index ei
+        JOIN raw_records r ON r.id = ei.record_id
+        WHERE ei.user_id = $1
+          AND r.project_id IS NOT DISTINCT FROM $2
+          AND r.mode IS NOT DISTINCT FROM $3
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .fetch_all(pool)
+    .await?;
+
+    let mut by_raw: HashMap<Uuid, Vec<String>> = HashMap::new();
+    for (raw_id, entity) in rows {
+        by_raw.entry(raw_id).or_default().push(entity);
+    }
+    Ok(by_raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -158,7 +223,8 @@ pub async fn promote_working_to_episodic(
 // ---------------------------------------------------------------------------
 
 /// An active episodic curated node plus the raw source content it derives from,
-/// with entities extracted on the fly (raw has no entities column).
+/// with the entities it clusters on (read from `entity_index`, on-the-fly as
+/// fallback).
 struct EpisodeNode {
     /// Every raw id this episodic node was derived from (usually one).
     source_raw_ids: Vec<Uuid>,
@@ -210,14 +276,25 @@ pub async fn distill_semantic(
     .fetch_all(pool)
     .await?;
 
+    // The entities each raw id was indexed under, read from `entity_index`
+    // (the HippoRAG pointer table). Clustering reads this instead of
+    // re-extracting on every pass; when the index has no row for a raw id yet
+    // (e.g. a record promoted before the index existed), fall back to
+    // on-the-fly extraction so the pass still clusters correctly.
+    let mut entities_by_raw = entities_for_scope(pool, scope).await?;
+
     // Fold (node, raw) rows into one EpisodeNode per node (a node can derive
     // from several raw ids — e.g. a semantic node, but here only episodic).
     let mut by_node: HashMap<Uuid, EpisodeNode> = HashMap::new();
     for (node_id, raw_id, content) in node_rows {
+        let entities = entities_by_raw
+            .remove(&raw_id)
+            .filter(|e| !e.is_empty())
+            .unwrap_or_else(|| nlp.extract_entities(&content));
         let entry = by_node.entry(node_id).or_insert_with(|| EpisodeNode {
             source_raw_ids: Vec::new(),
             content: content.clone(),
-            entities: nlp.extract_entities(&content),
+            entities,
         });
         entry.source_raw_ids.push(raw_id);
     }
@@ -303,6 +380,12 @@ pub async fn rebuild(
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM curated_nodes WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    // Wipe this user's entity index too — promotion repopulates it
+    // deterministically from raw, so a rebuild reproduces the same pointer set.
+    sqlx::query("DELETE FROM entity_index WHERE user_id = $1")
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
@@ -423,6 +506,7 @@ async fn insert_node(
 }
 
 use edges::add_edge;
+use edges::add_entity_edge;
 use edges::embed_node;
 
 /// Shared curated-layer writers, `pub(crate)` so the summaries module can build
@@ -479,6 +563,28 @@ pub(crate) mod edges {
         .bind(from_id)
         .bind(to_id)
         .bind(kind)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// An `entity` edge (curated node -> raw id) carrying the entity string in
+    /// `label`. The edge PK is (from_id, to_id, kind) so one node/raw pair holds
+    /// a single 'entity' edge; the label records the last entity that tied them
+    /// (the scan-friendly per-entity fanout lives in `entity_index`). Idempotent.
+    pub(crate) async fn add_entity_edge(
+        pool: &PgPool,
+        from_id: Uuid,
+        to_id: Uuid,
+        entity: &str,
+    ) -> AppResult<()> {
+        sqlx::query(
+            "INSERT INTO curated_edges (from_id, to_id, kind, label) VALUES ($1, $2, 'entity', $3) \
+             ON CONFLICT (from_id, to_id, kind) DO UPDATE SET label = EXCLUDED.label",
+        )
+        .bind(from_id)
+        .bind(to_id)
+        .bind(entity)
         .execute(pool)
         .await?;
         Ok(())
@@ -920,6 +1026,226 @@ mod tests {
         rebuild(&pool, &DistillingNlp, "bob").await.unwrap();
         assert_eq!(count_nodes(&pool, "alice", "episodic").await, 1);
         assert_eq!(count_nodes(&pool, "bob", "episodic").await, 1);
+    }
+
+    // -- entity index ------------------------------------------------------
+
+    async fn count_entity_index(pool: &PgPool, user_id: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM entity_index WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn promote_populates_entity_index_and_entity_edges(pool: PgPool) {
+        let raw_id = insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        let scope = Scope::new("alice");
+        promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+            .await
+            .unwrap();
+
+        // entity_index has the entities extracted from the raw content, all
+        // pointing at that raw id.
+        let entities: Vec<String> = sqlx::query_scalar(
+            "SELECT entity FROM entity_index WHERE user_id = 'alice' AND record_id = $1 ORDER BY entity",
+        )
+        .bind(raw_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let expected = flashback_nlp::extract_entities(
+            "the deploy target for the pgvector service is staging",
+        );
+        assert!(!entities.is_empty());
+        assert_eq!(entities.len(), expected.len());
+
+        // A single labelled 'entity' edge (node -> raw id) marks the lineage;
+        // the per-entity fanout is the entity_index (asserted above). The edge
+        // PK is (from_id, to_id, kind), so one edge per node/raw pair carrying
+        // one of the entities as its label.
+        let edge_labels: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT label FROM curated_edges WHERE kind = 'entity' AND to_id = $1",
+        )
+        .bind(raw_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(edge_labels.len(), 1);
+        let label = edge_labels[0].as_ref().unwrap();
+        assert!(
+            expected.contains(label),
+            "edge label is one of the entities"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn distill_clusters_using_the_entity_index(pool: PgPool) {
+        // Two records with identical entity sets → jaccard 1.0 → one cluster.
+        // Promotion fills the index; distill must read it (no on-the-fly needed).
+        insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+        let scope = Scope::new("alice");
+        promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+            .await
+            .unwrap();
+        assert!(count_entity_index(&pool, "alice").await > 0);
+
+        // A NlpService whose extract_entities panics if called — proves distill
+        // read the index, not the on-the-fly fallback.
+        #[derive(Clone)]
+        struct IndexOnlyNlp;
+        #[async_trait]
+        impl NlpService for IndexOnlyNlp {
+            fn provider_name(&self) -> &'static str {
+                "index-only"
+            }
+            fn provider_can_distill(&self) -> bool {
+                true
+            }
+            fn embedder_model_name(&self) -> &str {
+                "test-embedder"
+            }
+            fn embedder_dimension(&self) -> usize {
+                384
+            }
+            async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
+                Ok(vec![0.1_f32; 384])
+            }
+            async fn embed_batch(&self, t: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+                Ok((0..t.len()).map(|_| vec![0.1_f32; 384]).collect())
+            }
+            fn extract_entities(&self, _t: &str) -> Vec<String> {
+                panic!("distill must cluster from entity_index, not on-the-fly extraction");
+            }
+            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
+                Ok(Extraction::empty())
+            }
+            async fn distill_facts(
+                &self,
+                episodes: &[EpisodeRef],
+            ) -> Result<Vec<DistilledFact>, ProviderError> {
+                Ok(vec![DistilledFact {
+                    content: "distilled".into(),
+                    topic: None,
+                    source_episode_ids: episodes.iter().map(|e| e.id).collect(),
+                    confidence: 0.9,
+                }])
+            }
+        }
+
+        let stats = distill_semantic(&pool, &IndexOnlyNlp, &scope)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.distilled, 1,
+            "the two records clustered into one fact"
+        );
+        assert_eq!(count_nodes(&pool, "alice", "semantic").await, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn distill_falls_back_when_index_empty(pool: PgPool) {
+        // Promote via a path that leaves entity_index empty (insert episodic
+        // nodes directly, bypassing promote's indexing), then distill — the
+        // fallback on-the-fly extraction must still cluster the two records.
+        let r1 = insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        let r2 = insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+        for raw in [r1, r2] {
+            let node = Uuid::new_v4();
+            let content: String =
+                sqlx::query_scalar("SELECT content FROM raw_records WHERE id = $1")
+                    .bind(raw)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            insert_node(
+                &pool,
+                node,
+                "episodic",
+                &content,
+                &Scope::new("alice"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            add_edge(&pool, node, raw, "derived_from").await.unwrap();
+        }
+        assert_eq!(count_entity_index(&pool, "alice").await, 0);
+
+        let stats = distill_semantic(&pool, &DistillingNlp, &Scope::new("alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.distilled, 1,
+            "fallback extraction clustered the records"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rebuild_repopulates_entity_index_deterministically(pool: PgPool) {
+        insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_working_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+
+        rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
+        let first = count_entity_index(&pool, "alice").await;
+        assert!(first > 0);
+
+        // Rebuild wipes + re-derives; the index count is identical (no dupes,
+        // no leaks) — deterministic repopulation.
+        rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(count_entity_index(&pool, "alice").await, first);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
