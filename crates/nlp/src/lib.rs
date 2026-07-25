@@ -16,6 +16,11 @@ pub mod embed;
 pub mod heuristic;
 pub mod provider;
 
+/// True when this binary was compiled with the `embedded-llm` feature.
+/// Lets callers (e.g. `flashback doctor`) report capability without paying
+/// for a provider construction attempt that is known to fail.
+pub const EMBEDDED_LLM_COMPILED: bool = cfg!(feature = "embedded-llm");
+
 pub use embed::{model_for_key, model_name_for_key, EmbedError, Embedder, EmbedderConfig};
 pub use heuristic::extract_entities;
 pub use provider::{

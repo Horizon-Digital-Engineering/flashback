@@ -119,6 +119,15 @@ sudo rm -rf /opt/flashback
 
 ## Troubleshooting
 
+First move for any issue — the built-in diagnostic:
+
+```bash
+cd /opt/flashback && ./bin/flashback doctor
+```
+
+It checks config, Postgres, pgvector, migrations, the embedding cache, and
+provider reachability, and exits non-zero on failures.
+
 - **`CREATE EXTENSION vector` fails** — Homebrew's `pgvector` formula builds
   against one Postgres major. If you run a different `postgresql@N`, either
   switch (`PG_FORMULA=postgresql@N ./deploy/macos/install.sh` after installing

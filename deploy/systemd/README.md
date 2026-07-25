@@ -78,6 +78,12 @@ curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8082/health
 ```
 
+If anything misbehaves, run the built-in diagnostic:
+
+```bash
+cd /opt/flashback && sudo -u flashback ./bin/flashback doctor
+```
+
 ## 5. First token
 
 ```bash

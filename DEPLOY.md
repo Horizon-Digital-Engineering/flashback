@@ -58,7 +58,7 @@ Each tarball contains `flashback`, `flashback-mcp`, `flashback-nlp-prefetch` (pr
 
 ## Roadmap
 
-- `flashback setup` / `flashback doctor` / `flashback upgrade` subcommands — the binary becomes its own cross-platform installer (detect init system, provision Postgres, write service files, mint the first token).
+- `flashback setup` / `flashback upgrade` subcommands — the binary becomes its own cross-platform installer (detect init system, provision Postgres, write service files, mint the first token). `flashback doctor`, the read-only deployment diagnostic, already ships.
 - Managed/embedded Postgres option (zero-dependency single-binary install).
 - Homebrew tap (macOS + Linux), then winget/scoop manifests for Windows.
 - Kubernetes manifests if demand shows up — open an issue.

@@ -4,6 +4,7 @@ mod config;
 mod curation;
 mod db;
 mod decay;
+mod doctor;
 mod error;
 mod modes;
 mod nlp;
@@ -39,10 +40,11 @@ async fn main() -> Result<()> {
 
     match subcommand.as_deref() {
         Some("migrate") => run_migrate().await,
+        Some("doctor") => doctor::run().await,
         Some("token") => run_token(rest).await,
         Some("serve") | None => run_serve().await,
         Some(other) => Err(anyhow!(
-            "Unknown subcommand: {other}. Try: serve | migrate | token mint|list|revoke"
+            "Unknown subcommand: {other}. Try: serve | migrate | doctor | token mint|list|revoke"
         )),
     }
 }
