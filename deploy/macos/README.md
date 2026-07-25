@@ -109,13 +109,13 @@ Schedule it (launchd or cron) and ship the file off-box.
 ## Uninstall
 
 ```bash
-sudo launchctl bootout system/com.flashback.server
-sudo launchctl bootout system/com.flashback.mcp
-sudo rm /Library/LaunchDaemons/com.flashback.{server,mcp}.plist
-sudo rm -rf /opt/flashback
-# Optional — removes the database and its data:
-/opt/homebrew/opt/postgresql@17/bin/dropdb -h 127.0.0.1 flashback
+./deploy/macos/uninstall.sh              # keeps the database — reinstall reconnects to it
+./deploy/macos/uninstall.sh --purge-db   # drops the database too, after a final backup to ~
 ```
+
+Asks for confirmation before touching anything; `--yes` skips the prompt and
+`--no-backup` skips the final dump. Homebrew packages (postgresql, pgvector,
+ollama, rustup) are never removed — use `brew uninstall` for those.
 
 ## Troubleshooting
 

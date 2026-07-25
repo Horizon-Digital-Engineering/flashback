@@ -134,6 +134,22 @@ sudo systemctl restart flashback flashback-mcp
 sudo -u postgres pg_dump flashback | gzip > flashback-backup-$(date +%F).sql.gz
 ```
 
+## Uninstall
+
+```bash
+sudo systemctl disable --now flashback flashback-mcp
+sudo rm /etc/systemd/system/flashback.service /etc/systemd/system/flashback-mcp.service
+sudo systemctl daemon-reload
+sudo rm -rf /opt/flashback
+sudo userdel flashback
+# Only if you also want the data gone — take a final backup first (above):
+sudo -u postgres dropdb --if-exists flashback
+sudo -u postgres psql -qc "DROP ROLE IF EXISTS flashback"
+```
+
+The database survives everything above except the last two lines — a later
+reinstall reconnects to it.
+
 ## Networking
 
 Same guidance as every deploy: bearer tokens over plain HTTP are fine on a
