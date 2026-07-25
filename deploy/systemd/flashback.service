@@ -1,0 +1,28 @@
+# Flashback REST server + admin UI. Install to /etc/systemd/system/ — see
+# deploy/systemd/README.md for the full native-Linux setup.
+[Unit]
+Description=Flashback memory server (REST + admin UI)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+User=flashback
+Group=flashback
+WorkingDirectory=/opt/flashback
+# Runtime config lives in /opt/flashback/.env; the binary also loads it from
+# its working directory, EnvironmentFile just makes `systemctl show` honest.
+EnvironmentFile=-/opt/flashback/.env
+ExecStart=/opt/flashback/bin/flashback serve
+Restart=always
+RestartSec=5
+
+# Hardening: the process only needs to write its embedding cache under
+# /opt/flashback; everything else is read-only.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/flashback
+
+[Install]
+WantedBy=multi-user.target
