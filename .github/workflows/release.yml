@@ -70,14 +70,19 @@ jobs:
 
       - name: Package
         shell: bash
+        # TARGET comes through env, not inline expansion: shellcheck can reason
+        # about a real variable (SC2193), and the matrix value never lands in
+        # the script text.
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           ext=""
-          [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
-          stage="flashback-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+          stage="flashback-${GITHUB_REF_NAME}-${TARGET}"
           mkdir -p "$stage/deploy"
-          cp "target/${{ matrix.target }}/release/flashback${ext}" \
-             "target/${{ matrix.target }}/release/flashback-mcp${ext}" \
-             "target/${{ matrix.target }}/release/flashback-nlp-prefetch${ext}" \
+          cp "target/${TARGET}/release/flashback${ext}" \
+             "target/${TARGET}/release/flashback-mcp${ext}" \
+             "target/${TARGET}/release/flashback-nlp-prefetch${ext}" \
              "$stage/"
           cp -R migrations LICENSE README.md DEPLOY.md "$stage/"
           cp -R deploy/macos deploy/systemd "$stage/deploy/"
