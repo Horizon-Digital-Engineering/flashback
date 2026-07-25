@@ -1156,12 +1156,10 @@ mod tests {
         insert_raw(&pool, "bob", "working", "b", None).await;
         let svc = crate::auth::AuthUser {
             user_id: "alice".into(),
-            token_id: uuid::Uuid::nil(),
             role: crate::auth::TokenRole::Service,
         };
         let op = crate::auth::AuthUser {
             user_id: "alice".into(),
-            token_id: uuid::Uuid::nil(),
             role: crate::auth::TokenRole::Operator,
         };
         assert_eq!(svc.scope(), "alice");

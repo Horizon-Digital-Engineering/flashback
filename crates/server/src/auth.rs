@@ -55,7 +55,6 @@ impl TokenRole {
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub user_id: String,
-    pub token_id: uuid::Uuid,
     pub role: TokenRole,
 }
 
@@ -113,7 +112,6 @@ pub async fn require_bearer(
         };
         req.extensions_mut().insert(AuthUser {
             user_id: "dev".to_string(),
-            token_id: uuid::Uuid::nil(),
             role,
         });
         return Ok(next.run(req).await);
@@ -213,12 +211,12 @@ pub(crate) async fn validate_token(pool: &PgPool, token: &str) -> Result<AuthUse
     }
     let hash = sha256_hex(token);
 
-    let row: Option<(uuid::Uuid, String, String)> = sqlx::query_as(
+    let row: Option<(String, String)> = sqlx::query_as(
         r#"
         UPDATE tokens
         SET last_used_at = NOW()
         WHERE token_hash = $1 AND revoked_at IS NULL
-        RETURNING id, user_id, role
+        RETURNING user_id, role
         "#,
     )
     .bind(&hash)
@@ -226,13 +224,9 @@ pub(crate) async fn validate_token(pool: &PgPool, token: &str) -> Result<AuthUse
     .await
     .map_err(|_| ())?;
 
-    let (token_id, user_id, role) = row.ok_or(())?;
+    let (user_id, role) = row.ok_or(())?;
     let role = TokenRole::parse(&role).ok_or(())?;
-    Ok(AuthUser {
-        user_id,
-        token_id,
-        role,
-    })
+    Ok(AuthUser { user_id, role })
 }
 
 pub fn sha256_hex(s: &str) -> String {
@@ -563,7 +557,7 @@ mod tests {
 
         let principal = validate_token(&pool, &minted.plaintext).await.unwrap();
         assert_eq!(principal.user_id, "alice");
-        assert_eq!(principal.token_id, minted.id);
+        assert_eq!(principal.role, TokenRole::Service);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
