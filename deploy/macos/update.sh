@@ -27,6 +27,7 @@ sudo install -m 755 \
     target/release/flashback-mcp \
     target/release/flashback-nlp-prefetch \
     "$FLASHBACK_HOME/bin/"
+sudo install -m 755 "$SCRIPT_DIR/backup.sh" "$FLASHBACK_HOME/bin/backup.sh"
 sudo rm -rf "$FLASHBACK_HOME/migrations"
 sudo cp -R migrations "$FLASHBACK_HOME/migrations"
 

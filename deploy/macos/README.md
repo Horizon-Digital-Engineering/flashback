@@ -97,14 +97,26 @@ Disables system sleep and auto-restarts after power loss. Two boot caveats:
 
 ## Backups
 
-Postgres is the only state:
+Automatic: the installer sets up `com.flashback.backup`, a nightly launchd
+job (03:30, fires on wake if the Mac was asleep) that gzips a `pg_dump` into
+`/opt/flashback/backups/` and keeps the newest 14. Run one any time:
 
 ```bash
-/opt/homebrew/opt/postgresql@17/bin/pg_dump -h 127.0.0.1 -U flashback flashback \
-    | gzip > flashback-backup-$(date +%F).sql.gz
+/opt/flashback/bin/backup.sh
+tail /opt/flashback/logs/backup.log
 ```
 
-Schedule it (launchd or cron) and ship the file off-box.
+Restore into an empty database:
+
+```bash
+gunzip -c /opt/flashback/backups/flashback-<date>.sql.gz \
+    | /opt/homebrew/opt/postgresql@17/bin/psql -h 127.0.0.1 -U flashback flashback
+```
+
+The dumps live on the same disk as the database — ship them off-box too
+(rsync to another machine, a NAS over Tailscale, or a cloud folder) for real
+disaster coverage. Retention is tunable via `FLASHBACK_BACKUP_KEEP` in the
+backup plist's environment.
 
 ## Uninstall
 

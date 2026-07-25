@@ -97,6 +97,7 @@ sudo install -m 755 \
     target/release/flashback-mcp \
     target/release/flashback-nlp-prefetch \
     "$FLASHBACK_HOME/bin/"
+sudo install -m 755 "$SCRIPT_DIR/backup.sh" "$FLASHBACK_HOME/bin/backup.sh"
 sudo rm -rf "$FLASHBACK_HOME/migrations"
 sudo cp -R migrations "$FLASHBACK_HOME/migrations"
 
@@ -138,8 +139,8 @@ if [ -z "$(ls -A "$FLASHBACK_HOME/fastembed-cache" 2>/dev/null)" ]; then
         "$FLASHBACK_HOME/bin/flashback-nlp-prefetch"
 fi
 
-# --- launchd daemons ------------------------------------------------------
-for svc in server mcp; do
+# --- launchd daemons (server, mcp, nightly backup) ------------------------
+for svc in server mcp backup; do
     plist_dst="/Library/LaunchDaemons/com.flashback.${svc}.plist"
     plist_tmp="$(mktemp)"
     sed -e "s|__FLASHBACK_HOME__|$FLASHBACK_HOME|g" \

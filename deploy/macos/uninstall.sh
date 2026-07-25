@@ -32,8 +32,8 @@ die() { printf '\033[1;31m[flashback] error:\033[0m %s\n' "$*" >&2; exit 1; }
 [[ "$(uname -s)" == "Darwin" ]] || die "macOS only."
 
 echo "This will remove:"
-echo "  - LaunchDaemons com.flashback.server + com.flashback.mcp"
-echo "  - $FLASHBACK_HOME (binaries, logs, .env, FLASHBACK_TOKEN.txt, model cache)"
+echo "  - LaunchDaemons com.flashback.server + com.flashback.mcp + com.flashback.backup"
+echo "  - $FLASHBACK_HOME (binaries, logs, .env, FLASHBACK_TOKEN.txt, model cache, nightly backups)"
 if [ "$PURGE_DB" -eq 1 ]; then
     echo "  - the 'flashback' database and role"
     [ "$BACKUP" -eq 1 ] && echo "    (a final backup lands in $HOME first)"
@@ -46,7 +46,7 @@ if [ "$ASSUME_YES" -ne 1 ]; then
 fi
 
 # --- Stop and remove the daemons ------------------------------------------
-for svc in server mcp; do
+for svc in server mcp backup; do
     sudo launchctl bootout "system/com.flashback.${svc}" 2>/dev/null || true
     sudo rm -f "/Library/LaunchDaemons/com.flashback.${svc}.plist"
 done
