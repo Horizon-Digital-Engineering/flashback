@@ -1,0 +1,107 @@
+name: Release
+
+# Tag-triggered binary releases: build the workspace for each supported
+# target, attach tarballs + checksums to a draft release, then publish.
+# Publishing fires the `release: published` trigger, so sbom.yml attaches
+# SBOMs + provenance + cosign signatures to the same release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Create the draft release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+                 --title "flashback $GITHUB_REF_NAME" \
+                 --notes "Binaries for macOS (Apple Silicon), Linux (x86_64 / aarch64), and Windows (experimental). Each tarball bundles flashback, flashback-mcp, flashback-nlp-prefetch, migrations, and the launchd/systemd deploy templates — see DEPLOY.md for install paths. Verify checksums with: openssl dgst -sha256 -r <file>."
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    # Windows is experimental: not yet exercised in CI, so a failure there
+    # must not block the release.
+    continue-on-error: ${{ matrix.experimental }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon runner
+            target: aarch64-apple-darwin
+            experimental: false
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            experimental: false
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            experimental: false
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            experimental: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # post-v2.9.1
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          ext=""
+          [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          stage="flashback-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$stage/deploy"
+          cp "target/${{ matrix.target }}/release/flashback${ext}" \
+             "target/${{ matrix.target }}/release/flashback-mcp${ext}" \
+             "target/${{ matrix.target }}/release/flashback-nlp-prefetch${ext}" \
+             "$stage/"
+          cp -R migrations LICENSE README.md DEPLOY.md "$stage/"
+          cp -R deploy/macos deploy/systemd "$stage/deploy/"
+          tar czf "${stage}.tar.gz" "$stage"
+          openssl dgst -sha256 -r "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+
+      - name: Upload to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            flashback-*.tar.gz flashback-*.tar.gz.sha256 --clobber
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Flip the draft live
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false
