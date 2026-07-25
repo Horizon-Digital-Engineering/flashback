@@ -7,6 +7,12 @@ Two paths:
 
 Both produce the same product. Pick by cost vs. clickiness.
 
+These are the Docker paths. For native installs — macOS + launchd (a Mac mini
+as a dedicated server, with Metal available for local inference) or Linux +
+systemd (DGX / bare metal) — and for prebuilt release binaries, see the
+platform matrix in [DEPLOY.md](../DEPLOY.md), [macos/](macos/README.md), and
+[systemd/](systemd/README.md).
+
 ## DigitalOcean App Platform (one-click)
 
 [![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/Horizon-Digital-Engineering/flashback/tree/main)
