@@ -153,15 +153,25 @@ pub(crate) async fn token_dispatch(pool: &sqlx::PgPool, args: &[String]) -> Resu
 }
 
 async fn token_mint_cli(pool: &sqlx::PgPool, args: &[String]) -> Result<String> {
-    let user = take_flag(args, "--user")
-        .ok_or_else(|| anyhow!("usage: flashback token mint --user=<user_id> [--name=<label>]"))?;
+    let user = take_flag(args, "--user").ok_or_else(|| {
+        anyhow!("usage: flashback token mint --user=<user_id> [--name=<label>] [--role=service|operator]")
+    })?;
     let name = take_flag(args, "--name");
-    let minted = auth::mint_token(pool, &user, name.as_deref()).await?;
+    let role = match take_flag(args, "--role").as_deref() {
+        None => auth::TokenRole::Service,
+        Some(r) => auth::TokenRole::parse(r).ok_or_else(|| {
+            anyhow!("--role must be 'service' (API/MCP) or 'operator' (admin UI)")
+        })?,
+    };
+    let minted = auth::mint_token(pool, &user, name.as_deref(), role).await?;
 
     // Print exactly once. Never log this. Never store this plaintext.
     let mut out = String::new();
     out.push('\n');
-    out.push_str(&format!("  Token minted for user={user}\n"));
+    out.push_str(&format!(
+        "  Token minted for user={user} role={}\n",
+        role.as_str()
+    ));
     if let Some(n) = name {
         out.push_str(&format!("  Name:   {n}\n"));
     }
@@ -361,10 +371,12 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn token_list_shows_minted_tokens(pool: PgPool) {
-        auth::mint_token(&pool, "alice", Some("primary"))
+        auth::mint_token(&pool, "alice", Some("primary"), auth::TokenRole::Service)
             .await
             .unwrap();
-        auth::mint_token(&pool, "bob", None).await.unwrap();
+        auth::mint_token(&pool, "bob", None, auth::TokenRole::Service)
+            .await
+            .unwrap();
 
         let all = token_dispatch(&pool, &args(&["list"])).await.unwrap();
         assert!(all.contains("alice"));
@@ -404,7 +416,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn token_revoke_marks_existing_token(pool: PgPool) {
-        let minted = auth::mint_token(&pool, "alice", None).await.unwrap();
+        let minted = auth::mint_token(&pool, "alice", None, auth::TokenRole::Service)
+            .await
+            .unwrap();
         let out = token_dispatch(&pool, &args(&["revoke", &minted.id.to_string()]))
             .await
             .unwrap();

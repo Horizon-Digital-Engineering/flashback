@@ -175,7 +175,7 @@ async fn load_level(
         SELECT n.id, n.content, n.importance
         FROM curated_nodes n
         WHERE n.level = $1
-          AND n.user_id = $2
+          AND ($2 = '*' OR n.user_id = $2)
           AND n.project_id IS NOT DISTINCT FROM $3
           AND n.mode IS NOT DISTINCT FROM $4
           AND NOT EXISTS (
@@ -462,20 +462,24 @@ mod tests {
     }
 
     async fn count_by_kind(pool: &PgPool, user_id: &str, kind: &str) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM curated_nodes WHERE user_id = $1 AND kind = $2")
-            .bind(user_id)
-            .bind(kind)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes WHERE ($1 = '*' OR user_id = $1) AND kind = $2",
+        )
+        .bind(user_id)
+        .bind(kind)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     async fn max_level(pool: &PgPool, user_id: &str) -> i32 {
-        sqlx::query_scalar("SELECT COALESCE(MAX(level), 0) FROM curated_nodes WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
+        sqlx::query_scalar(
+            "SELECT COALESCE(MAX(level), 0) FROM curated_nodes WHERE ($1 = '*' OR user_id = $1)",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
     }
 
     async fn count_summarizes_edges(pool: &PgPool) -> i64 {

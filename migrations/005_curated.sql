@@ -1,0 +1,53 @@
+-- ---------------------------------------------------------------------------
+-- Curated layer (derived, rebuildable from raw; INSERT-only by the pipeline).
+--   kind='episodic'|'semantic' at level 0; kind='summary' at level N+1
+--   (RAPTOR tiers). Scope columns mirror raw so curation never crosses
+--   user/project/mode.
+-- ---------------------------------------------------------------------------
+CREATE TABLE curated_nodes (
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    kind        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    level       INT  NOT NULL DEFAULT 0,
+    user_id     TEXT NOT NULL,
+    project_id  TEXT,
+    mode        TEXT,
+    importance  REAL,
+    decay_class TEXT,
+    event_time  TIMESTAMPTZ,
+    meta        JSONB,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX curated_nodes_scope_idx       ON curated_nodes (user_id, project_id, mode, kind);
+CREATE INDEX curated_nodes_level_scope_idx ON curated_nodes (user_id, project_id, mode, level);
+
+CREATE TABLE curated_embeddings (
+    node_id        UUID NOT NULL REFERENCES curated_nodes(id) ON DELETE CASCADE,
+    model          TEXT NOT NULL,
+    embedding      vector(384),
+    embedding_768  vector(768),
+    embedding_1024 vector(1024),
+    PRIMARY KEY (node_id, model)
+);
+CREATE INDEX curated_embeddings_vec_idx
+    ON curated_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
+    WHERE embedding IS NOT NULL;
+CREATE INDEX curated_embeddings_vec768_idx
+    ON curated_embeddings USING ivfflat (embedding_768 vector_cosine_ops) WITH (lists = 100)
+    WHERE embedding_768 IS NOT NULL;
+CREATE INDEX curated_embeddings_vec1024_idx
+    ON curated_embeddings USING ivfflat (embedding_1024 vector_cosine_ops) WITH (lists = 100)
+    WHERE embedding_1024 IS NOT NULL;
+
+-- Lineage edges. Kinds: 'derived_from' (node -> raw), 'supersedes'
+-- (node -> node), 'summarizes' (summary -> child), 'entity' (node -> raw,
+-- label = entity string).
+CREATE TABLE curated_edges (
+    from_id UUID NOT NULL,
+    to_id   UUID NOT NULL,
+    kind    TEXT NOT NULL,
+    label   TEXT,
+    PRIMARY KEY (from_id, to_id, kind)
+);
+CREATE INDEX curated_edges_to_kind_idx   ON curated_edges (to_id, kind);
+CREATE INDEX curated_edges_from_kind_idx ON curated_edges (from_id, kind);

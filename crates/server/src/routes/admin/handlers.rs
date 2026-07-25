@@ -101,7 +101,7 @@ async fn entities_for(
     record_id: Uuid,
 ) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
-        "SELECT entity FROM entity_index WHERE user_id = $1 AND record_id = $2 ORDER BY entity",
+        "SELECT entity FROM entity_index WHERE ($1 = '*' OR user_id = $1) AND record_id = $2 ORDER BY entity",
     )
     .bind(user_id)
     .bind(record_id)
@@ -135,6 +135,7 @@ pub async fn login_form(Query(q): Query<LoginQuery>) -> Response {
     let err = match q.reason.as_deref() {
         Some("unauth") => Some("Your session expired or no token was set."),
         Some("bad-token") => Some("That token is invalid or revoked."),
+        Some("role") => Some("That is a service token. The admin UI requires an operator token (flashback token mint --role=operator)."),
         _ => None,
     };
     Html(super::views::login_page(err)).into_response()
@@ -151,11 +152,12 @@ pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginF
         return Redirect::to("/admin/login?reason=bad-token").into_response();
     }
     // Validate by attempting a token lookup. Same algorithm as the auth
-    // middleware uses for Bearer headers.
+    // middleware uses for Bearer headers. Only operator tokens may hold an
+    // admin session — service tokens get a pointed error, not a cookie.
     let hash = auth::sha256_hex(token);
-    let row: Result<Option<(Uuid, String)>, _> = sqlx::query_as(
+    let row: Result<Option<(Uuid, String, String)>, _> = sqlx::query_as(
         r#"
-        SELECT id, user_id FROM tokens
+        SELECT id, user_id, role FROM tokens
         WHERE token_hash = $1 AND revoked_at IS NULL
         LIMIT 1
         "#,
@@ -164,9 +166,12 @@ pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginF
     .fetch_optional(&state.pool)
     .await;
 
-    let valid = matches!(row, Ok(Some(_)));
-    if !valid {
-        return Redirect::to("/admin/login?reason=bad-token").into_response();
+    let role = match row {
+        Ok(Some((_, _, role))) => role,
+        _ => return Redirect::to("/admin/login?reason=bad-token").into_response(),
+    };
+    if auth::TokenRole::parse(&role) != Some(auth::TokenRole::Operator) {
+        return Redirect::to("/admin/login?reason=role").into_response();
     }
 
     let cookie =
@@ -201,8 +206,8 @@ pub async fn dashboard(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let counts = dashboard_counts(&state.pool, &user.user_id).await?;
-    let recent = fetch_records(&state.pool, &user.user_id, &RecordQuery::default(), 10, 0).await?;
+    let counts = dashboard_counts(&state.pool, user.scope()).await?;
+    let recent = fetch_records(&state.pool, user.scope(), &RecordQuery::default(), 10, 0).await?;
     let stats = views::DashboardStats {
         records_total: counts.records_total,
         records_terminal: counts.records_terminal,
@@ -214,7 +219,7 @@ pub async fn dashboard(
         embedder_model: state.nlp.embedder_model_name().to_string(),
         embedder_dim: state.nlp.embedder_dimension(),
     };
-    Ok(Html(views::dashboard(&user.user_id, stats, &recent)))
+    Ok(Html(views::dashboard(user.scope(), stats, &recent)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -235,17 +240,17 @@ pub(crate) async fn dashboard_counts(
     user_id: &str,
 ) -> Result<DashboardCounts, super::Error> {
     let records_total: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM raw_records WHERE user_id = $1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM raw_records WHERE ($1 = '*' OR user_id = $1)")
             .bind(user_id)
             .fetch_one(pool)
             .await?;
     let records_terminal: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*) FROM raw_records r
-        WHERE r.user_id = $1
+        WHERE ($1 = '*' OR r.user_id = $1)
           AND NOT EXISTS (
               SELECT 1 FROM raw_records n
-              WHERE n.supersedes = r.id AND n.user_id = $1
+              WHERE n.supersedes = r.id AND ($1 = '*' OR n.user_id = $1)
           )
         "#,
     )
@@ -255,10 +260,10 @@ pub(crate) async fn dashboard_counts(
     let state_objects: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*) FROM raw_records r
-        WHERE r.user_id = $1 AND r.type = 'state_object'
+        WHERE ($1 = '*' OR r.user_id = $1) AND r.type = 'state_object'
           AND NOT EXISTS (
               SELECT 1 FROM raw_records n
-              WHERE n.supersedes = r.id AND n.user_id = $1
+              WHERE n.supersedes = r.id AND ($1 = '*' OR n.user_id = $1)
           )
         "#,
     )
@@ -266,21 +271,22 @@ pub(crate) async fn dashboard_counts(
     .fetch_one(pool)
     .await?;
     let curated_nodes: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM curated_nodes WHERE user_id = $1")
+        sqlx::query_scalar("SELECT COUNT(*) FROM curated_nodes WHERE ($1 = '*' OR user_id = $1)")
             .bind(user_id)
             .fetch_one(pool)
             .await?;
     let proposals_pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM proposals WHERE user_id = $1 AND status = 'proposed'",
+        "SELECT COUNT(*) FROM proposals WHERE ($1 = '*' OR user_id = $1) AND status = 'proposed'",
     )
     .bind(user_id)
     .fetch_one(pool)
     .await?;
-    let tokens_active: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM tokens WHERE user_id = $1 AND revoked_at IS NULL")
-            .bind(user_id)
-            .fetch_one(pool)
-            .await?;
+    let tokens_active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tokens WHERE ($1 = '*' OR user_id = $1) AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
     Ok(DashboardCounts {
         records_total,
         records_terminal,
@@ -346,11 +352,11 @@ pub async fn records_list(
     Query(q): Query<RecordQuery>,
 ) -> Result<Html<String>, super::Error> {
     let q = q.clean();
-    let records = fetch_records(&state.pool, &user.user_id, &q, 200, 0).await?;
-    let total = count_records(&state.pool, &user.user_id, &q).await?;
+    let records = fetch_records(&state.pool, user.scope(), &q, 200, 0).await?;
+    let total = count_records(&state.pool, user.scope(), &q).await?;
 
     // The user's registers, for the (native) mode-filter dropdown.
-    let mode_names: Vec<String> = crate::modes::list_modes(&state.pool, &user.user_id)
+    let mode_names: Vec<String> = crate::modes::list_modes(&state.pool, user.scope())
         .await
         .map(|ms| ms.into_iter().map(|m| m.name).collect())
         .unwrap_or_default();
@@ -363,7 +369,7 @@ pub async fn records_list(
         include_superseded: q.include_super(),
     };
     Ok(Html(views::records_list(
-        &user.user_id,
+        user.scope(),
         &filter,
         &mode_names,
         &records,
@@ -390,7 +396,7 @@ async fn fetch_records(
                    WHERE n.supersedes = r.id AND n.user_id = r.user_id
                ) AS superseded
         FROM raw_records r
-        WHERE r.user_id = $1
+        WHERE ($1 = '*' OR r.user_id = $1)
           AND ($2::TEXT IS NULL OR r.type = $2)
           AND ($3::TEXT IS NULL OR r.project_id = $3)
           AND ($4::TEXT IS NULL OR r.session_id = $4)
@@ -430,7 +436,7 @@ async fn count_records(
     sqlx::query_scalar(
         r#"
         SELECT COUNT(*) FROM raw_records r
-        WHERE r.user_id = $1
+        WHERE ($1 = '*' OR r.user_id = $1)
           AND ($2::TEXT IS NULL OR r.type = $2)
           AND ($3::TEXT IS NULL OR r.project_id = $3)
           AND ($4::TEXT IS NULL OR r.session_id = $4)
@@ -460,8 +466,8 @@ pub async fn record_detail(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Html<String>, super::Error> {
-    let (row, chain) = load_record_detail(&state.pool, &user.user_id, id).await?;
-    Ok(Html(views::record_detail(&user.user_id, &row, &chain)))
+    let (row, chain) = load_record_detail(&state.pool, user.scope(), id).await?;
+    Ok(Html(views::record_detail(user.scope(), &row, &chain)))
 }
 
 /// Load a single raw record + its supersede chain (oldest → newest), each row
@@ -484,16 +490,16 @@ pub(crate) async fn load_record_detail(
         r#"
         WITH RECURSIVE
         back AS (
-            SELECT r.* FROM raw_records r WHERE r.id = $1 AND r.user_id = $2
+            SELECT r.* FROM raw_records r WHERE r.id = $1 AND ($2 = '*' OR r.user_id = $2)
             UNION ALL
             SELECT prev.* FROM raw_records prev JOIN back b ON prev.id = b.supersedes
-                WHERE prev.user_id = $2
+                WHERE ($2 = '*' OR prev.user_id = $2)
         ),
         forward AS (
-            SELECT r.* FROM raw_records r WHERE r.id = $1 AND r.user_id = $2
+            SELECT r.* FROM raw_records r WHERE r.id = $1 AND ($2 = '*' OR r.user_id = $2)
             UNION ALL
             SELECT nxt.* FROM raw_records nxt JOIN forward f ON nxt.supersedes = f.id
-                WHERE nxt.user_id = $2
+                WHERE ($2 = '*' OR nxt.user_id = $2)
         ),
         chain AS (
             SELECT id FROM back UNION SELECT id FROM forward
@@ -506,7 +512,7 @@ pub(crate) async fn load_record_detail(
                    WHERE n.supersedes = r.id AND n.user_id = r.user_id
                ) AS superseded
         FROM raw_records r
-        WHERE r.id IN (SELECT id FROM chain) AND r.user_id = $2
+        WHERE r.id IN (SELECT id FROM chain) AND ($2 = '*' OR r.user_id = $2)
         ORDER BY r.event_time ASC
         "#,
     )
@@ -540,7 +546,7 @@ async fn fetch_one_record(
                    WHERE n.supersedes = r.id AND n.user_id = r.user_id
                ) AS superseded
         FROM raw_records r
-        WHERE r.id = $1 AND r.user_id = $2
+        WHERE r.id = $1 AND ($2 = '*' OR r.user_id = $2)
         "#,
     )
     .bind(id)
@@ -557,8 +563,8 @@ pub async fn state_list(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let rows = list_state_objects_for(&state.pool, &user.user_id).await?;
-    Ok(Html(views::state_list(&user.user_id, &rows)))
+    let rows = list_state_objects_for(&state.pool, user.scope()).await?;
+    Ok(Html(views::state_list(user.scope(), &rows)))
 }
 
 /// Terminal (non-superseded) state_object raw records owned by `user_id`.
@@ -572,7 +578,7 @@ pub(crate) async fn list_state_objects_for(
                r.mode, r.importance, r.state_kind, r.state_key, r.payload,
                r.event_time, FALSE AS superseded
         FROM raw_records r
-        WHERE r.user_id = $1 AND r.type = 'state_object'
+        WHERE ($1 = '*' OR r.user_id = $1) AND r.type = 'state_object'
           AND NOT EXISTS (
               SELECT 1 FROM raw_records n
               WHERE n.supersedes = r.id AND n.user_id = r.user_id
@@ -595,8 +601,8 @@ pub async fn curated_list(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let nodes = list_curated_nodes_for(&state.pool, &user.user_id).await?;
-    Ok(Html(views::curated_list(&user.user_id, &nodes)))
+    let nodes = list_curated_nodes_for(&state.pool, user.scope()).await?;
+    Ok(Html(views::curated_list(user.scope(), &nodes)))
 }
 
 pub(crate) async fn list_curated_nodes_for(
@@ -607,7 +613,7 @@ pub(crate) async fn list_curated_nodes_for(
         r#"
         SELECT kind, content, level, created_at
         FROM curated_nodes
-        WHERE user_id = $1
+        WHERE ($1 = '*' OR user_id = $1)
         ORDER BY level DESC, created_at DESC
         LIMIT 200
         "#,
@@ -642,10 +648,10 @@ pub async fn catalog_view(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let catalog = crate::catalog::list_catalog_inner(&state.pool, &user.user_id)
+    let catalog = crate::catalog::list_catalog_inner(&state.pool, user.scope())
         .await
         .map_err(app_err_to_admin)?;
-    Ok(Html(views::catalog_view(&user.user_id, &catalog)))
+    Ok(Html(views::catalog_view(user.scope(), &catalog)))
 }
 
 // ---------------------------------------------------------------------------
@@ -656,10 +662,10 @@ pub async fn proposals_view(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let proposals = crate::proposals::list_proposals_inner(&state.pool, &user.user_id, None)
+    let proposals = crate::proposals::list_proposals_inner(&state.pool, user.scope(), None)
         .await
         .map_err(app_err_to_admin)?;
-    Ok(Html(views::proposals_view(&user.user_id, &proposals)))
+    Ok(Html(views::proposals_view(user.scope(), &proposals)))
 }
 
 pub async fn proposal_approve(
@@ -669,7 +675,7 @@ pub async fn proposal_approve(
 ) -> Result<Response, super::Error> {
     // Best-effort decision; a stale/foreign id just refreshes the queue.
     let _ =
-        crate::proposals::approve_inner(&state.pool, &user.user_id, id, Some(&user.user_id)).await;
+        crate::proposals::approve_inner(&state.pool, user.scope(), id, Some(&user.user_id)).await;
     Ok(Redirect::to("/admin/proposals").into_response())
 }
 
@@ -678,7 +684,7 @@ pub async fn proposal_deny(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Response, super::Error> {
-    let _ = crate::proposals::deny_inner(&state.pool, &user.user_id, id, Some(&user.user_id)).await;
+    let _ = crate::proposals::deny_inner(&state.pool, user.scope(), id, Some(&user.user_id)).await;
     Ok(Redirect::to("/admin/proposals").into_response())
 }
 
@@ -700,8 +706,8 @@ pub async fn tokens_list(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let views = load_token_views_for(&state.pool, &user.user_id).await?;
-    Ok(Html(views::tokens_list(&user.user_id, &views)))
+    let views = load_token_views_for(&state.pool, user.scope()).await?;
+    Ok(Html(views::tokens_list(user.scope(), &views)))
 }
 
 /// Fetch every token owned by `user_id` (active + revoked, newest first) and
@@ -723,7 +729,7 @@ pub(crate) async fn load_token_views_for(
     let rows: Vec<Row> = sqlx::query_as(
         r#"
         SELECT id, token_prefix, user_id, name, created_at, last_used_at, revoked_at
-        FROM tokens WHERE user_id = $1
+        FROM tokens WHERE ($1 = '*' OR user_id = $1)
         ORDER BY created_at DESC
         "#,
     )
@@ -749,7 +755,7 @@ pub async fn token_revoke(
     user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Response, super::Error> {
-    revoke_token_owned_by(&state.pool, &user.user_id, id).await?;
+    revoke_token_owned_by(&state.pool, user.scope(), id).await?;
     Ok(Redirect::to("/admin/tokens").into_response())
 }
 
@@ -762,7 +768,7 @@ pub(crate) async fn revoke_token_owned_by(
     id: Uuid,
 ) -> Result<(), super::Error> {
     sqlx::query(
-        "UPDATE tokens SET revoked_at = NOW() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
+        "UPDATE tokens SET revoked_at = NOW() WHERE id = $1 AND ($2 = '*' OR user_id = $2) AND revoked_at IS NULL",
     )
     .bind(id)
     .bind(user_id)
@@ -779,8 +785,8 @@ pub async fn map_view(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let (nodes, edges) = compute_graph(&state.pool, &user.user_id).await?;
-    Ok(Html(views::map_view(&user.user_id, nodes.len(), edges)))
+    let (nodes, edges) = compute_graph(&state.pool, user.scope()).await?;
+    Ok(Html(views::map_view(user.scope(), nodes.len(), edges)))
 }
 
 pub async fn map_data(
@@ -789,7 +795,7 @@ pub async fn map_data(
 ) -> Result<Json<Value>, super::Error> {
     // Build the layout once and derive both nodes and edges from it — the
     // fetch + projection pipeline is the expensive part on this polled endpoint.
-    let (nodes, layout) = compute_graph_with_layout(&state.pool, &user.user_id).await?;
+    let (nodes, layout) = compute_graph_with_layout(&state.pool, user.scope()).await?;
 
     let json_nodes: Vec<Value> = nodes
         .into_iter()
@@ -837,9 +843,9 @@ pub async fn curate_view(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Html<String>, super::Error> {
-    let counts = curated_summary(&state.pool, &user.user_id).await?;
+    let counts = curated_summary(&state.pool, user.scope()).await?;
     Ok(Html(views::curate_view(
-        &user.user_id,
+        user.scope(),
         &counts,
         state.nlp.provider_can_distill(),
         state.nlp.provider_name(),
@@ -855,7 +861,7 @@ pub(crate) async fn curated_summary(
         r#"
         SELECT kind, COUNT(*) AS n
         FROM curated_nodes
-        WHERE user_id = $1
+        WHERE ($1 = '*' OR user_id = $1)
         GROUP BY kind
         ORDER BY kind
         "#,
@@ -872,7 +878,7 @@ pub async fn curate_trigger(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Response, super::Error> {
-    match crate::curation::rebuild(&state.pool, &*state.nlp, &user.user_id).await {
+    match crate::curation::rebuild(&state.pool, &*state.nlp, user.scope()).await {
         Ok(stats) => {
             tracing::info!(
                 promoted = stats.promoted,
@@ -1007,7 +1013,7 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
                e.embedding AS embedding
         FROM raw_records r
         LEFT JOIN raw_embeddings e ON e.record_id = r.id
-        WHERE r.user_id = $1
+        WHERE ($1 = '*' OR r.user_id = $1)
         ORDER BY r.event_time DESC
         LIMIT 500
         "#,
@@ -1121,6 +1127,59 @@ mod tests {
         insert_raw(&pool, "bob", "working", "b", None).await;
         let c = dashboard_counts(&pool, "alice").await.unwrap();
         assert_eq!(c.records_total, 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn operator_scope_sees_every_user(pool: PgPool) {
+        insert_raw(&pool, "alice", "working", "a", None).await;
+        insert_raw(&pool, "bob", "working", "b", None).await;
+        let c = dashboard_counts(&pool, crate::auth::ALL_USERS)
+            .await
+            .unwrap();
+        assert_eq!(c.records_total, 2);
+        let rows = fetch_records(
+            &pool,
+            crate::auth::ALL_USERS,
+            &RecordQuery::default(),
+            50,
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn auth_user_scope_depends_on_role(pool: PgPool) {
+        // A service principal stays inside its own rows; an operator widens.
+        insert_raw(&pool, "alice", "working", "a", None).await;
+        insert_raw(&pool, "bob", "working", "b", None).await;
+        let svc = crate::auth::AuthUser {
+            user_id: "alice".into(),
+            token_id: uuid::Uuid::nil(),
+            role: crate::auth::TokenRole::Service,
+        };
+        let op = crate::auth::AuthUser {
+            user_id: "alice".into(),
+            token_id: uuid::Uuid::nil(),
+            role: crate::auth::TokenRole::Operator,
+        };
+        assert_eq!(svc.scope(), "alice");
+        assert_eq!(op.scope(), crate::auth::ALL_USERS);
+        assert_eq!(
+            dashboard_counts(&pool, svc.scope())
+                .await
+                .unwrap()
+                .records_total,
+            1
+        );
+        assert_eq!(
+            dashboard_counts(&pool, op.scope())
+                .await
+                .unwrap()
+                .records_total,
+            2
+        );
     }
 
     // ---- fetch_records / mode filter -------------------------------------
@@ -1259,7 +1318,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn revoke_token_owned_by_marks_revoked(pool: PgPool) {
-        let minted = crate::auth::mint_token(&pool, "alice", None).await.unwrap();
+        let minted = crate::auth::mint_token(&pool, "alice", None, crate::auth::TokenRole::Service)
+            .await
+            .unwrap();
         revoke_token_owned_by(&pool, "alice", minted.id)
             .await
             .unwrap();
@@ -1274,7 +1335,10 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn revoke_token_owned_by_doesnt_affect_other_users_tokens(pool: PgPool) {
-        let alice_token = crate::auth::mint_token(&pool, "alice", None).await.unwrap();
+        let alice_token =
+            crate::auth::mint_token(&pool, "alice", None, crate::auth::TokenRole::Service)
+                .await
+                .unwrap();
         revoke_token_owned_by(&pool, "bob", alice_token.id)
             .await
             .unwrap();

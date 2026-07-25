@@ -135,12 +135,13 @@ async fn validate_evidence(pool: &PgPool, user_id: &str, evidence: &[Uuid]) -> A
     if evidence.is_empty() {
         return Ok(());
     }
-    let owned: Vec<Uuid> =
-        sqlx::query_scalar("SELECT id FROM raw_records WHERE user_id = $1 AND id = ANY($2)")
-            .bind(user_id)
-            .bind(evidence)
-            .fetch_all(pool)
-            .await?;
+    let owned: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM raw_records WHERE ($1 = '*' OR user_id = $1) AND id = ANY($2)",
+    )
+    .bind(user_id)
+    .bind(evidence)
+    .fetch_all(pool)
+    .await?;
     let owned_set: std::collections::HashSet<Uuid> = owned.into_iter().collect();
     for id in evidence {
         if !owned_set.contains(id) {
@@ -181,7 +182,7 @@ pub(crate) async fn list_proposals_inner(
         r#"
         SELECT id, user_id, kind, title, body, status, created_at, decided_at, decided_by
         FROM proposals
-        WHERE user_id = $1
+        WHERE ($1 = '*' OR user_id = $1)
           AND ($2::text IS NULL OR status = $2)
         ORDER BY created_at DESC
         "#,
@@ -328,7 +329,7 @@ async fn transition(
         r#"
         UPDATE proposals
            SET status = $3, decided_at = NOW(), decided_by = $4
-         WHERE id = $1 AND user_id = $2 AND status = $5
+         WHERE id = $1 AND ($2 = '*' OR user_id = $2) AND status = $5
         RETURNING id, user_id, kind, title, body, status, created_at, decided_at, decided_by
         "#,
     )

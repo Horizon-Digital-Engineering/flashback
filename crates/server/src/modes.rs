@@ -60,7 +60,7 @@ pub async fn ensure_builtin_modes(pool: &PgPool, user_id: &str) -> AppResult<()>
             (user_id, name, embedder, embedding_dim, description, default_decay, prompt_overrides, is_default)
         SELECT $1, name, embedder, embedding_dim, description, default_decay, prompt_overrides, is_default
         FROM modes
-        WHERE user_id = $2
+        WHERE ($2 = '*' OR user_id = $2)
         ON CONFLICT (user_id, name) DO NOTHING
         "#,
     )
@@ -80,7 +80,7 @@ pub async fn list_modes(pool: &PgPool, user_id: &str) -> AppResult<Vec<Mode>> {
         SELECT user_id, name, embedder, embedding_dim, description, default_decay,
                prompt_overrides, is_default, created_at
         FROM modes
-        WHERE user_id = $1
+        WHERE ($1 = '*' OR user_id = $1)
         ORDER BY is_default DESC, name ASC
         "#,
     )
@@ -99,7 +99,7 @@ pub async fn get_mode(pool: &PgPool, user_id: &str, name: &str) -> AppResult<Opt
         SELECT user_id, name, embedder, embedding_dim, description, default_decay,
                prompt_overrides, is_default, created_at
         FROM modes
-        WHERE user_id = $1 AND name = $2
+        WHERE ($1 = '*' OR user_id = $1) AND name = $2
         "#,
     )
     .bind(user_id)
@@ -118,7 +118,7 @@ pub async fn default_mode(pool: &PgPool, user_id: &str) -> AppResult<Mode> {
         SELECT user_id, name, embedder, embedding_dim, description, default_decay,
                prompt_overrides, is_default, created_at
         FROM modes
-        WHERE user_id = $1 AND is_default
+        WHERE ($1 = '*' OR user_id = $1) AND is_default
         LIMIT 1
         "#,
     )
@@ -253,7 +253,7 @@ pub async fn update_mode(
         UPDATE modes
         SET embedder = $3, embedding_dim = $4, description = $5,
             default_decay = $6, prompt_overrides = $7, is_default = $8
-        WHERE user_id = $1 AND name = $2
+        WHERE ($1 = '*' OR user_id = $1) AND name = $2
         "#,
     )
     .bind(user_id)
@@ -290,7 +290,7 @@ pub async fn delete_mode(pool: &PgPool, user_id: &str, name: &str) -> AppResult<
             "cannot delete the default mode; set another default first",
         ));
     }
-    sqlx::query("DELETE FROM modes WHERE user_id = $1 AND name = $2")
+    sqlx::query("DELETE FROM modes WHERE ($1 = '*' OR user_id = $1) AND name = $2")
         .bind(user_id)
         .bind(name)
         .execute(pool)
@@ -322,10 +322,12 @@ async fn clear_default(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: &str,
 ) -> AppResult<()> {
-    sqlx::query("UPDATE modes SET is_default = false WHERE user_id = $1 AND is_default")
-        .bind(user_id)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "UPDATE modes SET is_default = false WHERE ($1 = '*' OR user_id = $1) AND is_default",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
