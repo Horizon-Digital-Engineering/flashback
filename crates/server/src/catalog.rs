@@ -118,7 +118,7 @@ pub(crate) async fn list_catalog_inner(pool: &PgPool, user_id: &str) -> AppResul
         SELECT id, user_id, name, kind, schema, access, description,
                created_at, updated_at, last_synced_at
         FROM catalog_stores
-        WHERE user_id = $1
+        WHERE ($1 = '*' OR user_id = $1)
         ORDER BY kind, name
         "#,
     )
@@ -247,16 +247,18 @@ fn curated_schema() -> Value {
 async fn store_record_count(pool: &PgPool, user_id: &str, store: &StoreRow) -> AppResult<i64> {
     let count = match (store.kind.as_str(), store.name.as_str()) {
         ("raw", RAW_STORE) => {
-            sqlx::query_scalar("SELECT COUNT(*) FROM raw_records WHERE user_id = $1")
+            sqlx::query_scalar("SELECT COUNT(*) FROM raw_records WHERE ($1 = '*' OR user_id = $1)")
                 .bind(user_id)
                 .fetch_one(pool)
                 .await?
         }
         ("curated", CURATED_STORE) => {
-            sqlx::query_scalar("SELECT COUNT(*) FROM curated_nodes WHERE user_id = $1")
-                .bind(user_id)
-                .fetch_one(pool)
-                .await?
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM curated_nodes WHERE ($1 = '*' OR user_id = $1)",
+            )
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?
         }
         _ => {
             sqlx::query_scalar("SELECT COUNT(*) FROM catalog_published_facts WHERE store_id = $1")

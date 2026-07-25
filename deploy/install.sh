@@ -116,14 +116,19 @@ mint_initial_token() {
         log "$TOKEN_FILE already exists — skipping initial mint"
         return
     fi
-    log "Minting initial bearer token for user=$INITIAL_USER"
-    local public_ip token
+    log "Minting initial tokens for user=$INITIAL_USER"
+    local public_ip token operator_token
     public_ip=$(curl -s --max-time 5 https://api.ipify.org || echo "<your-host>")
+    # Two surfaces, two tokens: operator opens the admin UI, service is what
+    # MCP/REST clients carry. Neither works on the other.
     token=$(docker compose exec -T server ./flashback token mint \
-        --user="$INITIAL_USER" --name=initial \
+        --user="$INITIAL_USER" --name=initial-client \
         2>&1 | awk '/TOKEN:/ {print $2}')
-    if [ -z "$token" ]; then
-        echo "Failed to mint initial token. Check: docker compose logs server" >&2
+    operator_token=$(docker compose exec -T server ./flashback token mint \
+        --user="$INITIAL_USER" --name=admin-ui --role=operator \
+        2>&1 | awk '/TOKEN:/ {print $2}')
+    if [ -z "$token" ] || [ -z "$operator_token" ]; then
+        echo "Failed to mint initial tokens. Check: docker compose logs server" >&2
         exit 1
     fi
 
@@ -133,19 +138,23 @@ Flashback is up.
 
   REST endpoint:  http://$public_ip:8080
   MCP endpoint:   http://$public_ip:8082/mcp
+  Admin UI:       http://$public_ip:8080/admin
 
-  Bearer token (user=$INITIAL_USER): $token
+  SERVICE token  (MCP/REST clients):  $token
+  OPERATOR token (admin UI sign-in):  $operator_token
 
 How to use:
-  - Add the MCP endpoint + bearer to your MCP client config
-    (Claude Desktop / Cursor / Claude Code).
-  - Use the REST endpoint with the same bearer for direct API calls.
+  - Add the MCP endpoint + the SERVICE token to your MCP client config
+    (Claude Desktop / Cursor / Claude Code); the same token works for
+    direct REST calls.
+  - Sign in to the admin UI with the OPERATOR token. It sees every user's
+    data and cannot call the API; the service token cannot open the UI.
 
 Token plaintext is in this file only. Save it and delete this file when done:
   shred -u $TOKEN_FILE
 
 Mint more tokens (one per client / user):
-  cd $INSTALL_DIR && docker compose exec server ./flashback token mint --user=<u> --name=<label>
+  cd $INSTALL_DIR && docker compose exec server ./flashback token mint --user=<u> --name=<label> [--role=operator]
 
 List / revoke:
   docker compose exec server ./flashback token list

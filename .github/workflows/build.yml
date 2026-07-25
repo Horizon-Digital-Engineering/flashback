@@ -13,6 +13,10 @@ jobs:
   sonarqube:
     name: SonarQube
     runs-on: ubuntu-latest
+    # Advisory: code quality/coverage reporting, not a merge gate. An expired
+    # SONAR_TOKEN or a SonarCloud outage must not block a green build — the
+    # blocking gates are Test, Clippy, Format, and the secret scanners.
+    continue-on-error: true
     # Postgres + pgvector so #[sqlx::test] tests execute under
     # `cargo llvm-cov`. The coverage tool doesn't distinguish unit from
     # integration; same lcov.info, same Sonar metric.

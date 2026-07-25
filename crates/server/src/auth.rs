@@ -25,11 +25,53 @@ use crate::AppState;
 const TOKEN_PREFIX: &str = "fb_";
 const TOKEN_RANDOM_LEN: usize = 32;
 
+/// Which surface a token may touch. Exactly one of two; the middleware
+/// enforces the wall in both directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenRole {
+    /// REST/MCP API (ingest, query, context) — what integrations hold.
+    Service,
+    /// The /admin UI — sees the whole estate, cannot call the API.
+    Operator,
+}
+
+impl TokenRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenRole::Service => "service",
+            TokenRole::Operator => "operator",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "service" => Some(TokenRole::Service),
+            "operator" => Some(TokenRole::Operator),
+            _ => None,
+        }
+    }
+}
+
 /// A successfully-authenticated principal, attached to every request.
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub user_id: String,
     pub token_id: uuid::Uuid,
+    pub role: TokenRole,
+}
+
+/// Scope value that matches every user. Reserved (it is also the modes
+/// template user), so no real user_id can collide with it.
+pub const ALL_USERS: &str = "*";
+
+impl AuthUser {
+    /// The user_id to scope admin reads by: an operator sees the whole
+    /// estate, a service principal only its own rows.
+    pub fn scope(&self) -> &str {
+        match self.role {
+            TokenRole::Operator => ALL_USERS,
+            TokenRole::Service => &self.user_id,
+        }
+    }
 }
 
 impl<S> FromRequestParts<S> for AuthUser
@@ -60,12 +102,19 @@ pub async fn require_bearer(
         return Ok(next.run(req).await);
     }
 
-    // DEV MODE: skip token validation entirely. Inject a synthetic user.
+    // DEV MODE: skip token validation entirely. Inject a synthetic user whose
+    // role matches the surface so the wall stays invisible in dev.
     // The startup banner warns about this; the admin UI also shows a banner.
     if state.cfg.dev_mode {
+        let role = if is_admin_surface(path) {
+            TokenRole::Operator
+        } else {
+            TokenRole::Service
+        };
         req.extensions_mut().insert(AuthUser {
             user_id: "dev".to_string(),
             token_id: uuid::Uuid::nil(),
+            role,
         });
         return Ok(next.run(req).await);
     }
@@ -80,8 +129,31 @@ pub async fn require_bearer(
         .await
         .map_err(|_| unauthorized(path, "invalid or revoked token"))?;
 
+    // The role wall, both directions: service tokens never reach /admin,
+    // operator tokens never call the API.
+    match (is_admin_surface(path), principal.role) {
+        (true, TokenRole::Operator) | (false, TokenRole::Service) => {}
+        (true, TokenRole::Service) => {
+            return Err(unauthorized(
+                path,
+                "service tokens cannot access the admin UI",
+            ));
+        }
+        (false, TokenRole::Operator) => {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "operator tokens cannot call the service API" })),
+            )
+                .into_response());
+        }
+    }
+
     req.extensions_mut().insert(principal);
     Ok(next.run(req).await)
+}
+
+fn is_admin_surface(path: &str) -> bool {
+    path == "/admin" || path.starts_with("/admin/")
 }
 
 fn is_exempt(path: &str) -> bool {
@@ -135,18 +207,18 @@ fn extract_bearer(req: &Request<Body>) -> Option<String> {
     }
 }
 
-async fn validate_token(pool: &PgPool, token: &str) -> Result<AuthUser, ()> {
+pub(crate) async fn validate_token(pool: &PgPool, token: &str) -> Result<AuthUser, ()> {
     if !token.starts_with(TOKEN_PREFIX) {
         return Err(());
     }
     let hash = sha256_hex(token);
 
-    let row: Option<(uuid::Uuid, String)> = sqlx::query_as(
+    let row: Option<(uuid::Uuid, String, String)> = sqlx::query_as(
         r#"
         UPDATE tokens
         SET last_used_at = NOW()
         WHERE token_hash = $1 AND revoked_at IS NULL
-        RETURNING id, user_id
+        RETURNING id, user_id, role
         "#,
     )
     .bind(&hash)
@@ -154,8 +226,13 @@ async fn validate_token(pool: &PgPool, token: &str) -> Result<AuthUser, ()> {
     .await
     .map_err(|_| ())?;
 
-    let (token_id, user_id) = row.ok_or(())?;
-    Ok(AuthUser { user_id, token_id })
+    let (token_id, user_id, role) = row.ok_or(())?;
+    let role = TokenRole::parse(&role).ok_or(())?;
+    Ok(AuthUser {
+        user_id,
+        token_id,
+        role,
+    })
 }
 
 pub fn sha256_hex(s: &str) -> String {
@@ -193,6 +270,7 @@ pub async fn mint_token(
     pool: &PgPool,
     user_id: &str,
     name: Option<&str>,
+    role: TokenRole,
 ) -> anyhow::Result<MintedToken> {
     let plaintext = generate_token();
     let hash = sha256_hex(&plaintext);
@@ -200,8 +278,8 @@ pub async fn mint_token(
 
     let id: uuid::Uuid = sqlx::query_scalar(
         r#"
-        INSERT INTO tokens (token_hash, token_prefix, user_id, name)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO tokens (token_hash, token_prefix, user_id, name, role)
+        VALUES ($1, $2, $3, $4, $5)
         RETURNING id
         "#,
     )
@@ -209,6 +287,7 @@ pub async fn mint_token(
     .bind(&prefix)
     .bind(user_id)
     .bind(name)
+    .bind(role.as_str())
     .fetch_one(pool)
     .await?;
 
@@ -225,6 +304,7 @@ pub struct TokenListRow {
     pub token_prefix: String,
     pub user_id: String,
     pub name: Option<String>,
+    pub role: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -236,7 +316,7 @@ pub async fn list_tokens(
 ) -> anyhow::Result<Vec<TokenListRow>> {
     let rows = sqlx::query_as::<_, TokenListRow>(
         r#"
-        SELECT id, token_prefix, user_id, name, created_at, last_used_at, revoked_at
+        SELECT id, token_prefix, user_id, name, role, created_at, last_used_at, revoked_at
         FROM tokens
         WHERE ($1::TEXT IS NULL OR user_id = $1)
         ORDER BY created_at DESC
@@ -441,7 +521,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn mint_then_list_finds_the_token(pool: PgPool) {
-        let minted = mint_token(&pool, "alice", Some("test-token"))
+        let minted = mint_token(&pool, "alice", Some("test-token"), TokenRole::Service)
             .await
             .unwrap();
         assert!(minted.plaintext.starts_with("fb_"));
@@ -457,9 +537,15 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn list_tokens_filters_by_user(pool: PgPool) {
-        mint_token(&pool, "alice", None).await.unwrap();
-        mint_token(&pool, "bob", None).await.unwrap();
-        mint_token(&pool, "alice", None).await.unwrap();
+        mint_token(&pool, "alice", None, TokenRole::Service)
+            .await
+            .unwrap();
+        mint_token(&pool, "bob", None, TokenRole::Service)
+            .await
+            .unwrap();
+        mint_token(&pool, "alice", None, TokenRole::Service)
+            .await
+            .unwrap();
 
         let alice = list_tokens(&pool, Some("alice")).await.unwrap();
         assert_eq!(alice.len(), 2);
@@ -471,7 +557,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn validate_token_round_trip(pool: PgPool) {
-        let minted = mint_token(&pool, "alice", None).await.unwrap();
+        let minted = mint_token(&pool, "alice", None, TokenRole::Service)
+            .await
+            .unwrap();
 
         let principal = validate_token(&pool, &minted.plaintext).await.unwrap();
         assert_eq!(principal.user_id, "alice");
@@ -490,7 +578,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn revoke_token_makes_it_unvalidatable(pool: PgPool) {
-        let minted = mint_token(&pool, "alice", None).await.unwrap();
+        let minted = mint_token(&pool, "alice", None, TokenRole::Service)
+            .await
+            .unwrap();
         assert!(validate_token(&pool, &minted.plaintext).await.is_ok());
 
         let revoked = revoke_token(&pool, minted.id).await.unwrap();
@@ -506,11 +596,58 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn revoked_tokens_still_listed_with_revoked_at_populated(pool: PgPool) {
-        let minted = mint_token(&pool, "alice", None).await.unwrap();
+        let minted = mint_token(&pool, "alice", None, TokenRole::Service)
+            .await
+            .unwrap();
         revoke_token(&pool, minted.id).await.unwrap();
 
         let rows = list_tokens(&pool, Some("alice")).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].revoked_at.is_some());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn minted_role_round_trips_through_validate(pool: PgPool) {
+        let svc = mint_token(&pool, "alice", None, TokenRole::Service)
+            .await
+            .unwrap();
+        let op = mint_token(&pool, "alice", None, TokenRole::Operator)
+            .await
+            .unwrap();
+        assert_eq!(
+            validate_token(&pool, &svc.plaintext).await.unwrap().role,
+            TokenRole::Service
+        );
+        assert_eq!(
+            validate_token(&pool, &op.plaintext).await.unwrap().role,
+            TokenRole::Operator
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn role_defaults_to_service_and_is_listed(pool: PgPool) {
+        mint_token(&pool, "alice", Some("ritsu"), TokenRole::Service)
+            .await
+            .unwrap();
+        let rows = list_tokens(&pool, Some("alice")).await.unwrap();
+        assert_eq!(rows[0].role, "service");
+    }
+
+    #[test]
+    fn admin_surface_detection_covers_admin_only() {
+        assert!(is_admin_surface("/admin"));
+        assert!(is_admin_surface("/admin/records"));
+        // The API surface must never be mistaken for the admin one.
+        assert!(!is_admin_surface("/records"));
+        assert!(!is_admin_surface("/records/context"));
+        assert!(!is_admin_surface("/administrative"));
+    }
+
+    #[test]
+    fn role_parse_rejects_unknown_values() {
+        assert_eq!(TokenRole::parse("service"), Some(TokenRole::Service));
+        assert_eq!(TokenRole::parse("operator"), Some(TokenRole::Operator));
+        assert_eq!(TokenRole::parse("admin"), None);
+        assert_eq!(TokenRole::parse(""), None);
     }
 }

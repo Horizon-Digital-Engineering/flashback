@@ -5,6 +5,18 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and Flashback adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Token roles: `service` vs `operator`.** A service token reaches the REST/MCP
+  API only; an operator token reaches `/admin` only. The middleware enforces
+  the wall in both directions, and the admin login refuses service tokens.
+- **The admin UI is the operator plane** — it now shows every user's records,
+  curated nodes, references, catalog, proposals, and map, instead of only the
+  logged-in token's own rows.
+- Schema is declared from scratch in `migrations/` (one file per subsystem, all
+  `CREATE`, no `ALTER` archaeology).
+
 ## [0.1.0] — 2026-05-23
 
 Initial public release. Flashback is a self-contained Rust microservice that

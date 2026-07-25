@@ -180,11 +180,23 @@ curl http://localhost:8082/health
 
 ### Mint a token
 
-Every request to the REST API or MCP server requires `Authorization: Bearer <token>`. Mint per-client tokens:
+Tokens carry a **role**, and the two surfaces are walled off from each other:
+
+| Role | Reaches | Sees |
+|---|---|---|
+| `service` (default) | REST API + MCP | its own user's records |
+| `operator` | the `/admin` UI | the whole estate, every user |
+
+A service token cannot open the admin UI; an operator token cannot call the
+API. Mint what the client actually needs:
 
 ```bash
+# integration credential (ritsu, Claude Code, Cursor …)
 docker compose exec server ./flashback token mint --user=alice --name=claude-code
-#   Token minted for user=alice
+
+# your own admin login
+docker compose exec server ./flashback token mint --user=alice --name=admin --role=operator
+#   Token minted for user=alice role=operator
 #   ID:     <uuid>
 #   TOKEN:  fb_<32 base32-ish chars>     ← shown ONCE; save it now
 
@@ -292,7 +304,7 @@ App Platform reads [`.do/app.yaml`](.do/app.yaml) and provisions: a managed Post
 ```bash
 doctl apps list                                # find your app id
 doctl apps exec <app-id> server -- \
-    ./flashback token mint --user=admin --name=initial
+    ./flashback token mint --user=admin --name=initial --role=operator
 ```
 
 Your MCP URL is `https://<app>.ondigitalocean.app/mcp`. Paste it + the bearer into your client config.

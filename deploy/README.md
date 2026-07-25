@@ -7,6 +7,12 @@ Two paths:
 
 Both produce the same product. Pick by cost vs. clickiness.
 
+These are the Docker paths. For native installs — macOS + launchd (a Mac mini
+as a dedicated server, with Metal available for local inference) or Linux +
+systemd (DGX / bare metal) — and for prebuilt release binaries, see the
+platform matrix in [DEPLOY.md](../DEPLOY.md), [macos/](macos/README.md), and
+[systemd/](systemd/README.md).
+
 ## DigitalOcean App Platform (one-click)
 
 [![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/Horizon-Digital-Engineering/flashback/tree/main)
@@ -28,7 +34,9 @@ App Platform handles HTTPS, the public URL (`https://<app>.ondigitalocean.app`),
 doctl auth init                              # if you haven't already
 doctl apps list                              # find your app id
 doctl apps exec <app-id> server -- \
-    ./flashback token mint --user=admin --name=initial
+    ./flashback token mint --user=admin --name=admin-ui --role=operator   # admin UI
+doctl apps exec <app-id> server -- \
+    ./flashback token mint --user=admin --name=initial-client            # MCP/REST clients
 ```
 
 The token plaintext is printed once. Paste it + the MCP URL into your Claude Desktop / Cursor / Claude Code config (see [the main README](../README.md#wire-up-an-mcp-client)).

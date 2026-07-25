@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.flashback.mcp</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__FLASHBACK_HOME__/bin/flashback-mcp</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__FLASHBACK_HOME__</string>
+	<key>UserName</key>
+	<string>__RUN_USER__</string>
+
+	<!-- The MCP server needs no secrets — it forwards each client's Bearer to
+	     the REST server — so its whole config fits here. -->
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>FLASHBACK_URL</key>
+		<string>http://127.0.0.1:8080</string>
+		<key>MCP_HOST</key>
+		<string>0.0.0.0</string>
+		<key>MCP_PORT</key>
+		<string>8082</string>
+		<key>RUST_LOG</key>
+		<string>flashback_mcp=info</string>
+	</dict>
+
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+
+	<key>StandardOutPath</key>
+	<string>__FLASHBACK_HOME__/logs/mcp.log</string>
+	<key>StandardErrorPath</key>
+	<string>__FLASHBACK_HOME__/logs/mcp.log</string>
+</dict>
+</plist>

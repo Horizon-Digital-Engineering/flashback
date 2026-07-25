@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.flashback.backup</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>__FLASHBACK_HOME__/bin/backup.sh</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>__FLASHBACK_HOME__</string>
+	<key>UserName</key>
+	<string>__RUN_USER__</string>
+
+	<!-- 03:30 nightly. StartCalendarInterval fires missed runs on wake, so a
+	     sleeping mini still gets its backup. -->
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>3</integer>
+		<key>Minute</key>
+		<integer>30</integer>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>__FLASHBACK_HOME__/logs/backup.log</string>
+	<key>StandardErrorPath</key>
+	<string>__FLASHBACK_HOME__/logs/backup.log</string>
+</dict>
+</plist>
