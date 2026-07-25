@@ -173,11 +173,18 @@ done
 TOKEN_FILE="$FLASHBACK_HOME/FLASHBACK_TOKEN.txt"
 LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo 127.0.0.1)"
 if [ ! -f "$TOKEN_FILE" ]; then
-    log "Minting the initial admin token (shown once, saved to $TOKEN_FILE)..."
+    log "Minting the initial tokens (shown once, saved to $TOKEN_FILE)..."
+    # Two surfaces, two tokens: the operator token opens the admin UI, the
+    # service token is what MCP/REST clients carry. Neither works on the other.
     {
         echo "REST endpoint:  http://${LAN_IP}:8080"
         echo "MCP endpoint:   http://${LAN_IP}:8082/mcp"
-        (cd "$FLASHBACK_HOME" && ./bin/flashback token mint --user=admin --name=initial)
+        echo "Admin UI:       http://${LAN_IP}:8080/admin"
+        echo
+        echo "=== OPERATOR token — sign in to the admin UI with this ==="
+        (cd "$FLASHBACK_HOME" && ./bin/flashback token mint --user=admin --name=admin-ui --role=operator)
+        echo "=== SERVICE token — for MCP/REST clients ==="
+        (cd "$FLASHBACK_HOME" && ./bin/flashback token mint --user=admin --name=initial-client)
     } | tee "$TOKEN_FILE"
     chmod 600 "$TOKEN_FILE"
 fi

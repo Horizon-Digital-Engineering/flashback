@@ -87,7 +87,10 @@ cd /opt/flashback && sudo -u flashback ./bin/flashback doctor
 ## 5. First token
 
 ```bash
-cd /opt/flashback && sudo -u flashback ./bin/flashback token mint --user=admin --name=initial
+# operator token — signs in to the admin UI (sees every user)
+cd /opt/flashback && sudo -u flashback ./bin/flashback token mint --user=admin --name=admin-ui --role=operator
+# service token — what MCP/REST clients carry
+cd /opt/flashback && sudo -u flashback ./bin/flashback token mint --user=admin --name=initial-client
 ```
 
 Shown once — save it. Point MCP clients at `http://<box>:8082/mcp` with the

@@ -34,7 +34,9 @@ App Platform handles HTTPS, the public URL (`https://<app>.ondigitalocean.app`),
 doctl auth init                              # if you haven't already
 doctl apps list                              # find your app id
 doctl apps exec <app-id> server -- \
-    ./flashback token mint --user=admin --name=initial
+    ./flashback token mint --user=admin --name=admin-ui --role=operator   # admin UI
+doctl apps exec <app-id> server -- \
+    ./flashback token mint --user=admin --name=initial-client            # MCP/REST clients
 ```
 
 The token plaintext is printed once. Paste it + the MCP URL into your Claude Desktop / Cursor / Claude Code config (see [the main README](../README.md#wire-up-an-mcp-client)).
