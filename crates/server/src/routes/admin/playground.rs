@@ -75,6 +75,51 @@ pub struct TurnRequest {
     pub api_key: Option<String>,
 }
 
+/// Reject an endpoint the server should never be talked into calling.
+///
+/// This is a deliberately narrow guard, because the *intended* endpoint is a
+/// local model server — blanket-blocking private ranges would ban the only
+/// configuration anyone actually uses. What it does stop is the classic SSRF
+/// payload: cloud instance-metadata services, which hand out credentials to
+/// anything that asks from inside the host.
+///
+/// The real containment is elsewhere and layered: only an authenticated
+/// operator can save settings, and the CSRF guard keeps a page you merely
+/// visit from saving them on your behalf.
+fn validate_base_url(raw: &str) -> Result<(), String> {
+    let url = raw.trim();
+    let rest = match url.split_once("://") {
+        Some(("http", rest)) | Some(("https", rest)) => rest,
+        Some((scheme, _)) => {
+            return Err(format!(
+                "scheme '{scheme}' is not allowed (http/https only)"
+            ))
+        }
+        None => return Err("must start with http:// or https://".into()),
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit('@') // strip any user:pass@
+        .next()
+        .unwrap_or("");
+    let hostname = host
+        .rsplit_once(':')
+        .map_or(host, |(h, _)| h)
+        .trim_matches(['[', ']']);
+    if hostname.is_empty() {
+        return Err("no host in URL".into());
+    }
+    // Link-local: 169.254.0.0/16 and fd00:ec2::254 — the metadata endpoints on
+    // every major cloud. Nothing legitimate here ever lives there.
+    if hostname.starts_with("169.254.") || hostname.eq_ignore_ascii_case("metadata.google.internal")
+    {
+        return Err(format!("{hostname} is a cloud metadata address"));
+    }
+    Ok(())
+}
+
 /// The default framing. Deliberately plain: it tells the model the memories are
 /// available without insisting they're relevant, so a bad retrieval shows up as
 /// the model ignoring them rather than being forced to use them.
@@ -176,6 +221,9 @@ async fn call_llm_stream(
     messages: &[PromptMessage],
     tx: &tokio::sync::mpsc::Sender<Event>,
 ) -> Result<(String, LlmStats), String> {
+    // Re-checked here, not just on save: a row written before this guard
+    // existed (or by any future path) must not become an outbound request.
+    validate_base_url(&cfg.base_url)?;
     let started = std::time::Instant::now();
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let client = reqwest::Client::builder()
@@ -508,6 +556,9 @@ pub async fn save_settings(
 ) -> AppResult<Json<Settings>> {
     let norm = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let base_url = norm(req.base_url);
+    if let Some(u) = base_url.as_deref() {
+        validate_base_url(u).map_err(AppError::bad_request)?;
+    }
     let model = norm(req.model);
     let system_prompt = norm(req.system_prompt);
     let context_limit = req.context_limit.filter(|n| *n > 0 && *n <= 200);
@@ -534,4 +585,38 @@ pub async fn save_settings(
         system_prompt,
         context_limit,
     }))
+}
+
+#[cfg(test)]
+mod ssrf_tests {
+    use super::validate_base_url;
+
+    #[test]
+    fn allows_the_local_model_servers_people_actually_run() {
+        for ok in [
+            "http://127.0.0.1:1234/v1",
+            "http://localhost:11434/v1",
+            "https://openrouter.ai/api/v1",
+        ] {
+            assert!(validate_base_url(ok).is_ok(), "{ok} should be allowed");
+        }
+    }
+
+    #[test]
+    fn blocks_cloud_metadata_and_odd_schemes() {
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "file:///etc/passwd",
+            "gopher://127.0.0.1:6379/_FLUSHALL",
+            "not-a-url",
+        ] {
+            assert!(validate_base_url(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn credentials_in_the_url_cannot_disguise_the_host() {
+        assert!(validate_base_url("http://evil@169.254.169.254/").is_err());
+    }
 }

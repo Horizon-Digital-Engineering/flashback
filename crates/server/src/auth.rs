@@ -119,9 +119,26 @@ pub async fn require_bearer(
 
     // Accept token from either Authorization: Bearer header OR a cookie set
     // by /admin/login. Bearer wins if both are present.
-    let token = extract_bearer(&req)
+    let bearer = extract_bearer(&req);
+    let from_cookie = bearer.is_none();
+    let token = bearer
         .or_else(|| extract_cookie_token(&req))
         .ok_or_else(|| unauthorized(path, "missing or malformed token"))?;
+
+    // CSRF: a cookie rides along automatically on cross-site requests, so a
+    // page you merely visit could drive the admin API as you. A Bearer token
+    // cannot be forged that way — an attacker's page has no way to read it —
+    // so the check applies only to cookie-authenticated, state-changing calls.
+    if from_cookie && is_state_changing(req.method()) {
+        reject_cross_site(&req).map_err(|why| {
+            tracing::warn!(path, "CSRF check failed: {why}");
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({ "error": "cross-site request refused" })),
+            )
+                .into_response()
+        })?;
+    }
 
     let principal = validate_token(&state.pool, &token)
         .await
@@ -159,6 +176,53 @@ fn is_exempt(path: &str) -> bool {
         path,
         "/health" | "/admin/login" | "/admin/style.css" | "/favicon.ico"
     )
+}
+
+fn is_state_changing(method: &axum::http::Method) -> bool {
+    !matches!(
+        *method,
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    )
+}
+
+/// Refuse a cookie-authenticated write that didn't originate from this site.
+///
+/// `Sec-Fetch-Site` is the authoritative signal and every current browser sends
+/// it; `Origin` is the fallback for anything that doesn't. A request with
+/// neither header isn't a browser, and a non-browser has no ambient cookie to
+/// abuse — it would have to present the cookie deliberately, which means it
+/// already holds the credential.
+fn reject_cross_site(req: &Request<Body>) -> Result<(), String> {
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+
+    if let Some(site) = header("sec-fetch-site") {
+        return match site.as_str() {
+            "same-origin" | "none" => Ok(()),
+            other => Err(format!("Sec-Fetch-Site: {other}")),
+        };
+    }
+
+    match header("origin") {
+        None => Ok(()), // not a browser-issued request
+        Some(origin) => {
+            let host = header("host").unwrap_or_default();
+            let origin_host = origin
+                .split("://")
+                .nth(1)
+                .unwrap_or_default()
+                .trim_end_matches('/');
+            if !host.is_empty() && origin_host == host {
+                Ok(())
+            } else {
+                Err(format!("Origin {origin} does not match Host {host}"))
+            }
+        }
+    }
 }
 
 fn extract_cookie_token(req: &Request<Body>) -> Option<String> {
@@ -628,6 +692,52 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn csrf_allows_same_origin_and_non_browser_writes() {
+        // Sec-Fetch-Site is what a current browser sends.
+        let r = req_with_header("Sec-Fetch-Site", "same-origin");
+        assert!(reject_cross_site(&r).is_ok());
+        // "none" = typed in the address bar / bookmark.
+        let r = req_with_header("Sec-Fetch-Site", "none");
+        assert!(reject_cross_site(&r).is_ok());
+        // curl and friends send neither header; they have no ambient cookie to
+        // abuse, so refusing them would only break legitimate tooling.
+        let r = Request::builder().body(Body::empty()).unwrap();
+        assert!(reject_cross_site(&r).is_ok());
+    }
+
+    #[test]
+    fn csrf_refuses_a_write_driven_by_another_site() {
+        let r = req_with_header("Sec-Fetch-Site", "cross-site");
+        assert!(reject_cross_site(&r).is_err());
+        let r = req_with_header("Sec-Fetch-Site", "same-site");
+        assert!(reject_cross_site(&r).is_err());
+    }
+
+    #[test]
+    fn csrf_origin_fallback_compares_against_host() {
+        let ok = Request::builder()
+            .header("Origin", "http://localhost:8080")
+            .header("Host", "localhost:8080")
+            .body(Body::empty())
+            .unwrap();
+        assert!(reject_cross_site(&ok).is_ok());
+
+        let evil = Request::builder()
+            .header("Origin", "https://evil.example")
+            .header("Host", "localhost:8080")
+            .body(Body::empty())
+            .unwrap();
+        assert!(reject_cross_site(&evil).is_err());
+    }
+
+    #[test]
+    fn only_writes_are_csrf_checked() {
+        assert!(!is_state_changing(&axum::http::Method::GET));
+        assert!(is_state_changing(&axum::http::Method::POST));
+        assert!(is_state_changing(&axum::http::Method::DELETE));
+    }
+
     fn admin_surface_detection_covers_admin_only() {
         assert!(is_admin_surface("/admin"));
         assert!(is_admin_surface("/admin/records"));
