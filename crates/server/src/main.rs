@@ -25,6 +25,44 @@ pub struct AppState {
     pub cfg: Arc<config::Config>,
 }
 
+/// Ceiling on a single request body. A bulk import of a few hundred
+/// conversations is comfortably inside this; unbounded is what lets one
+/// request exhaust the process.
+const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Headers that cost nothing and remove whole bug classes. The admin UI is
+/// server-rendered with inline styles and inline scripts of our own, so the CSP
+/// permits those and nothing else — notably no remote script origins, so an
+/// injected `<script src>` has nowhere to load from.
+async fn security_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::header::{HeaderName, HeaderValue};
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    for (name, value) in [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+        (
+            "content-security-policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; \
+             style-src 'self' 'unsafe-inline'; img-src 'self' data:; \
+             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; \
+             form-action 'self'",
+        ),
+    ] {
+        if let (Ok(n), Ok(v)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            h.insert(n, v);
+        }
+    }
+    res
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = dotenvy::dotenv();
@@ -112,11 +150,23 @@ async fn run_serve() -> Result<()> {
             state.clone(),
             auth::require_bearer,
         ))
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(axum::middleware::from_fn(security_headers))
+        // No CORS layer. Every browser client of this server — the admin UI,
+        // the playground — is same-origin, and hosts that call the API (ritsu,
+        // the MCP wrapper) are server-side, where CORS does not apply. A
+        // permissive layer here only ever widened what a foreign page could do.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let addr = cfg_arc.listen_addr();
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    if addr.starts_with("0.0.0.0") && !cfg_arc.dev_mode {
+        tracing::warn!(
+            "listening on all interfaces ({addr}) — every host that can route here \
+             reaches the admin UI and API. Bind a specific address (HOST=...) unless \
+             that is intended."
+        );
+    }
     tracing::info!("Listening on {addr}");
 
     axum::serve(listener, app).await?;
