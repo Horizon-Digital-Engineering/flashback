@@ -36,11 +36,11 @@ use crate::{
 /// `state_kind`/`state_key` are promoted state_object columns (010) — read via
 /// the payload on the struct, so also not selected here.
 pub(crate) const COLS: &str = "id, type, content, content_hash, event_time, ingest_time, \
-    source, source_ref, user_id, project_id, session_id, mode, importance, \
-    supersedes, acl, ttl, payload";
+    source, source_ref, user_id, project_id, container_id, mode, importance, \
+    supersedes, payload";
 const COLS_R: &str = "r.id, r.type, r.content, r.content_hash, r.event_time, r.ingest_time, \
-    r.source, r.source_ref, r.user_id, r.project_id, r.session_id, r.mode, r.importance, \
-    r.supersedes, r.acl, r.ttl, r.payload";
+    r.source, r.source_ref, r.user_id, r.project_id, r.container_id, r.mode, r.importance, \
+    r.supersedes, r.payload";
 
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
@@ -71,12 +71,10 @@ pub struct RawRecordRow {
     pub source_ref: Option<String>,
     pub user_id: String,
     pub project_id: Option<String>,
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     pub mode: Option<String>,
     pub importance: Option<f32>,
     pub supersedes: Option<Uuid>,
-    pub acl: Option<Value>,
-    pub ttl: Option<DateTime<Utc>>,
     pub payload: Option<Value>,
 }
 
@@ -101,9 +99,14 @@ impl RawRecordRow {
     }
 }
 
+/// A raw type is HOW A RECORD MUST BE PROCESSED, not a memory tier and not what
+/// it is about — a writer says what arrived, curation says what it became. Only
+/// types with a real processing rule are accepted: an accepted-but-unread type
+/// is a silent data hole. Kept in lockstep with the CHECK in
+/// `003_raw_records.sql`; add a value here only alongside its extractor.
 fn validate_type(t: &str) -> AppResult<()> {
     match t {
-        "episodic" | "semantic" | "working" | "document" | "procedural" | "state_object" => Ok(()),
+        "conversation" | "document" | "state_object" => Ok(()),
         other => Err(AppError::bad_request(format!("unknown type: {other}"))),
     }
 }
@@ -125,7 +128,7 @@ pub struct IngestRecordRequest {
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -133,10 +136,9 @@ pub struct IngestRecordRequest {
     /// id this record supersedes (forward pointer; the old row is never mutated).
     #[serde(default)]
     pub supersedes: Option<Uuid>,
-    #[serde(default)]
-    pub ttl_hours: Option<i64>,
-    #[serde(default)]
-    pub acl: Option<Value>,
+    /// Metadata the SOURCE handed us, verbatim — the exporting model, a
+    /// conversation title, the folder a file was dropped in. Never normalised on
+    /// the way in: normalising is interpreting, and interpreting is deriving.
     #[serde(default)]
     pub payload: Option<Value>,
 }
@@ -187,7 +189,6 @@ pub(crate) async fn ingest_record(
     let id = Uuid::new_v4();
     let event_time = req.event_time.unwrap_or_else(Utc::now);
     let importance = req.importance.map(|i| i.clamp(0.0, 1.0));
-    let ttl = req.ttl_hours.map(|h| Utc::now() + Duration::hours(h));
 
     // Resolve the mode by precedence: caller override → LLM auto-classify →
     // project default → general. The LLM classification only fires for an
@@ -200,8 +201,8 @@ pub(crate) async fn ingest_record(
         r#"
         INSERT INTO raw_records
             (id, type, content, event_time, source, source_ref,
-             user_id, project_id, session_id, mode, importance, supersedes, acl, ttl, payload)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+             user_id, project_id, container_id, mode, importance, supersedes, payload)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         "#,
     )
     .bind(id)
@@ -212,12 +213,10 @@ pub(crate) async fn ingest_record(
     .bind(&req.source_ref)
     .bind(user_id)
     .bind(&req.project_id)
-    .bind(&req.session_id)
+    .bind(&req.container_id)
     .bind(mode.as_ref().map(|m| m.name.as_str()))
     .bind(importance)
     .bind(req.supersedes)
-    .bind(&req.acl)
-    .bind(ttl)
     .bind(&req.payload)
     .execute(pool)
     .await?;
@@ -341,11 +340,15 @@ pub struct ImportRecord {
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
     pub importance: Option<f32>,
+    /// Metadata the source handed us, verbatim. `conversation_title` here is
+    /// what episode formation prefers when naming a conversation. An export's
+    /// own grouping (a ChatGPT "project") belongs here too, NOT in `project_id`
+    /// — `project_id` partitions and would fragment the curated layer.
     #[serde(default)]
     pub payload: Option<Value>,
 }
@@ -408,7 +411,7 @@ pub(crate) async fn import_records_inner(
             r#"
             INSERT INTO raw_records
                 (id, type, content, event_time, source, source_ref,
-                 user_id, project_id, session_id, mode, importance, payload)
+                 user_id, project_id, container_id, mode, importance, payload)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
             ON CONFLICT (user_id, source, source_ref) WHERE source_ref IS NOT NULL
             DO NOTHING
@@ -423,7 +426,7 @@ pub(crate) async fn import_records_inner(
         .bind(&r.source_ref)
         .bind(user_id)
         .bind(&r.project_id)
-        .bind(&r.session_id)
+        .bind(&r.container_id)
         .bind(mode.as_ref().map(|m| m.name.as_str()))
         .bind(importance)
         .bind(&r.payload)
@@ -477,7 +480,7 @@ pub struct QueryRecordsRequest {
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -512,13 +515,12 @@ pub(crate) async fn query_records_inner(
         SELECT {COLS} FROM raw_records
         WHERE user_id = $1
           AND ($2::text IS NULL OR project_id = $2)
-          AND ($3::text IS NULL OR session_id = $3)
+          AND ($3::text IS NULL OR container_id = $3)
           AND ($4::text IS NULL OR mode = $4)
           AND ($5::text IS NULL OR type = $5)
           AND ($6::timestamptz IS NULL OR event_time >= $6)
           AND ($7::timestamptz IS NULL OR event_time <= $7)
           AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
-          AND (ttl IS NULL OR ttl > NOW())
         ORDER BY event_time DESC
         LIMIT $8
         "#
@@ -527,7 +529,7 @@ pub(crate) async fn query_records_inner(
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(user_id)
         .bind(&req.project_id)
-        .bind(&req.session_id)
+        .bind(&req.container_id)
         .bind(&req.mode)
         .bind(&req.r#type)
         .bind(req.since)
@@ -568,7 +570,7 @@ pub struct AssembleRequest {
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     /// The cognitive register to search. A single mode name uses that mode's
     /// vector geometry. `"all"` (or `modes` = `["all"]`) is a cross-mode
     /// request that can't compare cosine across mismatched dims, so it degrades
@@ -583,6 +585,12 @@ pub struct AssembleRequest {
     pub query: Option<String>,
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Leave out the conversation the caller is currently IN. The host already
+    /// replays the live thread in its own window; injecting it again is an echo
+    /// — it crowds out the cross-conversation memory this endpoint exists for,
+    /// and a query's nearest neighbour is otherwise its own previous turn.
+    #[serde(default)]
+    pub exclude_container_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -652,10 +660,10 @@ pub(crate) async fn assemble_inner(
             SELECT {COLS} FROM raw_records
             WHERE user_id = $1
               AND ($2::text IS NULL OR project_id = $2)
-              AND ($3::text IS NULL OR session_id = $3)
+              AND ($3::text IS NULL OR container_id = $3)
               AND ($4::text IS NULL OR mode = $4)
+              AND ($6::text IS NULL OR container_id IS DISTINCT FROM $6)
               AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
-              AND (ttl IS NULL OR ttl > NOW())
             ORDER BY event_time DESC
             LIMIT $5
             "#
@@ -663,9 +671,10 @@ pub(crate) async fn assemble_inner(
         let records = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
             .bind(user_id)
             .bind(&req.project_id)
-            .bind(&req.session_id)
+            .bind(&req.container_id)
             .bind(&scope_mode)
             .bind(limit)
+            .bind(&req.exclude_container_id)
             .fetch_all(pool)
             .await?;
         return Ok(AssembleResponse {
@@ -717,6 +726,7 @@ pub(crate) async fn assemble_inner(
               AND NOT EXISTS (
                   SELECT 1 FROM curated_edges s WHERE s.to_id = n.id AND s.kind = 'supersedes'
               )
+              AND ($14::text IS NULL OR n.meta->>'container_id' IS DISTINCT FROM $14)
             ORDER BY (
                   $5 * COALESCE(NULLIF(1 - (ce.{emb_col} <=> $6), 'NaN'::float8), 0)
                 + $7 * ts_rank(to_tsvector('english', n.content), plainto_tsquery('english', $8))
@@ -751,6 +761,7 @@ pub(crate) async fn assemble_inner(
             .bind(W_IMP)
             .bind(W_DECAY)
             .bind(limit)
+            .bind(&req.exclude_container_id)
             .fetch_all(pool)
             .await?
     };
@@ -778,7 +789,13 @@ pub(crate) async fn assemble_inner(
     }
 
     // 3) Fetch those raw records (still active + owned), preserving curated rank.
-    let mut records = fetch_raw_in_order(pool, user_id, &ordered_raw_ids).await?;
+    let mut records = fetch_raw_in_order(
+        pool,
+        user_id,
+        &ordered_raw_ids,
+        req.exclude_container_id.as_deref(),
+    )
+    .await?;
 
     // 3b) Reference bias: references describe the PRESENT ("what am I currently
     // maintaining"); records describe the past. For present-tense / "current"
@@ -881,9 +898,9 @@ async fn cross_mode_degraded(
         ) ent ON ent.record_id = r.id
         WHERE r.user_id = $2
           AND ($3::text IS NULL OR r.project_id = $3)
-          AND ($4::text IS NULL OR r.session_id = $4)
+          AND ($4::text IS NULL OR r.container_id = $4)
+          AND ($7::text IS NULL OR r.container_id IS DISTINCT FROM $7)
           AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
-          AND (r.ttl IS NULL OR r.ttl > NOW())
         ORDER BY (
             0.5 * ts_rank(r.content_tsv, plainto_tsquery('english', $1))
           + 0.3 * LEAST(COALESCE(ent.hits, 0) / 3.0, 1.0)
@@ -896,9 +913,10 @@ async fn cross_mode_degraded(
         .bind(query)
         .bind(user_id)
         .bind(&req.project_id)
-        .bind(&req.session_id)
+        .bind(&req.container_id)
         .bind(&entities)
         .bind(limit)
+        .bind(&req.exclude_container_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -961,10 +979,10 @@ async fn reference_hits(
         WHERE r.user_id = $2
           AND r.type = 'state_object'
           AND ($3::text IS NULL OR r.project_id = $3)
-          AND ($4::text IS NULL OR r.session_id = $4)
+          AND ($4::text IS NULL OR r.container_id = $4)
+          AND ($10::text IS NULL OR r.container_id IS DISTINCT FROM $10)
           AND r.mode IS NOT DISTINCT FROM $5
           AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
-          AND (r.ttl IS NULL OR r.ttl > NOW())
         ORDER BY (
             $9
             + 0.7 * COALESCE(NULLIF(1 - (e.{emb_col} <=> $6), 'NaN'::float8), 0)
@@ -977,12 +995,13 @@ async fn reference_hits(
         .bind(model)
         .bind(user_id)
         .bind(&req.project_id)
-        .bind(&req.session_id)
+        .bind(&req.container_id)
         .bind(scope_mode)
         .bind(Vector::from(qvec.to_vec()))
         .bind(query)
         .bind(limit)
         .bind(W_REF_BIAS)
+        .bind(&req.exclude_container_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -1018,22 +1037,27 @@ async fn fetch_raw_in_order(
     pool: &PgPool,
     user_id: &str,
     ids: &[Uuid],
+    exclude_container: Option<&str>,
 ) -> AppResult<Vec<RawRecordRow>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
+    // The container exclusion is enforced HERE, at the last fetch, not only at
+    // node selection — a summary node spans containers and carries no container
+    // of its own, so its raw ids can smuggle the live conversation back in.
     let sql = format!(
         r#"
         SELECT {COLS} FROM raw_records
         WHERE user_id = $1
           AND id = ANY($2)
+          AND ($3::text IS NULL OR container_id IS DISTINCT FROM $3)
           AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
-          AND (ttl IS NULL OR ttl > NOW())
         "#
     );
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(user_id)
         .bind(ids)
+        .bind(exclude_container)
         .fetch_all(pool)
         .await?;
     // Re-order to the curated rank (SQL doesn't preserve ANY() order).
@@ -1066,10 +1090,10 @@ async fn raw_hybrid(
         LEFT JOIN raw_embeddings e ON e.record_id = r.id AND e.model = $1
         WHERE r.user_id = $2
           AND ($3::text IS NULL OR r.project_id = $3)
-          AND ($4::text IS NULL OR r.session_id = $4)
+          AND ($4::text IS NULL OR r.container_id = $4)
+          AND ($10::text IS NULL OR r.container_id IS DISTINCT FROM $10)
           AND r.mode IS NOT DISTINCT FROM $5
           AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
-          AND (r.ttl IS NULL OR r.ttl > NOW())
           AND NOT (r.id = ANY($9))
         ORDER BY (
             0.7 * COALESCE(NULLIF(1 - (e.{emb_col} <=> $6), 'NaN'::float8), 0)
@@ -1082,12 +1106,13 @@ async fn raw_hybrid(
         .bind(model)
         .bind(user_id)
         .bind(&req.project_id)
-        .bind(&req.session_id)
+        .bind(&req.container_id)
         .bind(scope_mode)
         .bind(Vector::from(qvec.to_vec()))
         .bind(query)
         .bind(limit)
         .bind(exclude)
+        .bind(&req.exclude_container_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -1394,18 +1419,16 @@ mod tests {
 
     fn req(content: &str) -> IngestRecordRequest {
         IngestRecordRequest {
-            r#type: "episodic".into(),
+            r#type: "document".into(),
             content: content.into(),
             event_time: None,
             source: "test".into(),
             source_ref: None,
             project_id: Some("health".into()),
-            session_id: None,
+            container_id: None,
             mode: None,
             importance: None,
             supersedes: None,
-            ttl_hours: None,
-            acl: None,
             payload: None,
         }
     }
@@ -1413,7 +1436,7 @@ mod tests {
     fn q() -> QueryRecordsRequest {
         QueryRecordsRequest {
             project_id: None,
-            session_id: None,
+            container_id: None,
             mode: None,
             r#type: None,
             since: None,
@@ -1540,11 +1563,12 @@ mod tests {
             "leslie",
             AssembleRequest {
                 project_id: None,
-                session_id: None,
+                container_id: None,
                 mode: None,
                 modes: None,
                 query: Some("lisinopril".into()),
                 limit: None,
+                exclude_container_id: None,
             },
         )
         .await
@@ -1566,11 +1590,12 @@ mod tests {
             "leslie",
             AssembleRequest {
                 project_id: None,
-                session_id: None,
+                container_id: None,
                 mode: None,
                 modes: None,
                 query: None,
                 limit: None,
+                exclude_container_id: None,
             },
         )
         .await
@@ -1603,13 +1628,13 @@ mod tests {
 
     fn imp(content: &str, source_ref: Option<&str>) -> ImportRecord {
         ImportRecord {
-            r#type: "episodic".into(),
+            r#type: "conversation".into(),
             content: content.into(),
             event_time: None,
             source: "chatgpt".into(),
             source_ref: source_ref.map(|s| s.into()),
             project_id: None,
-            session_id: None,
+            container_id: None,
             mode: None,
             importance: None,
             payload: None,
@@ -1700,11 +1725,12 @@ mod tests {
             "leslie",
             AssembleRequest {
                 project_id: None,
-                session_id: None,
+                container_id: None,
                 mode: None,
                 modes: None,
                 query: Some("lisinopril".into()),
                 limit: None,
+                exclude_container_id: None,
             },
         )
         .await
@@ -1756,14 +1782,67 @@ mod tests {
         node_id
     }
 
+    /// The echo filter: a caller's own conversation must not come back as
+    /// "memory" — the host already has the live thread in its window, and a
+    /// query's nearest neighbour is otherwise its own previous turn.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn assemble_excludes_the_callers_own_container(pool: PgPool) {
+        let nlp = StubNlp;
+        for (container, text) in [
+            ("conv-live", "what is on the release checklist right now"),
+            ("conv-old", "the release needs the changelog written first"),
+        ] {
+            ingest_record(
+                &pool,
+                &nlp,
+                "alice",
+                IngestRecordRequest {
+                    r#type: "conversation".into(),
+                    content: text.into(),
+                    event_time: None,
+                    source: "test".into(),
+                    source_ref: None,
+                    project_id: None,
+                    container_id: Some(container.into()),
+                    mode: None,
+                    importance: None,
+                    supersedes: None,
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // Once curated, a summary node spans BOTH conversations and carries no
+        // container of its own — the exclusion must hold through that path too,
+        // not just on direct raw hits.
+        crate::curation::rebuild(&pool, &nlp, "alice")
+            .await
+            .unwrap();
+
+        let mut req = ctx_req("release checklist");
+        req.exclude_container_id = Some("conv-live".into());
+        let out = assemble_inner(&pool, &nlp, "alice", req).await.unwrap();
+
+        assert!(!out.records.is_empty(), "the other conversation should hit");
+        assert!(
+            out.records
+                .iter()
+                .all(|r| r.container_id.as_deref() != Some("conv-live")),
+            "own-container rows must never come back as memory"
+        );
+    }
+
     fn ctx_req(query: &str) -> AssembleRequest {
         AssembleRequest {
             project_id: None,
-            session_id: None,
+            container_id: None,
             mode: None,
             modes: None,
             query: Some(query.into()),
             limit: None,
+            exclude_container_id: None,
         }
     }
 
@@ -2040,7 +2119,7 @@ mod tests {
             crate::references::PutValueRequest {
                 data: serde_json::json!({ "items": [{ "text": "finish the deploy pipeline" }] }),
                 project_id: Some("health".into()),
-                session_id: None,
+                container_id: None,
                 importance: None,
             },
         )
@@ -2075,7 +2154,7 @@ mod tests {
             crate::references::PutValueRequest {
                 data: serde_json::json!({ "items": [] }),
                 project_id: Some("health".into()),
-                session_id: None,
+                container_id: None,
                 importance: None,
             },
         )
@@ -2122,18 +2201,16 @@ mod tests {
     /// the only scoping axis under test).
     fn req_in_mode(content: &str, mode: &str) -> IngestRecordRequest {
         IngestRecordRequest {
-            r#type: "episodic".into(),
+            r#type: "document".into(),
             content: content.into(),
             event_time: None,
             source: "test".into(),
             source_ref: None,
             project_id: None,
-            session_id: None,
+            container_id: None,
             mode: Some(mode.into()),
             importance: None,
             supersedes: None,
-            ttl_hours: None,
-            acl: None,
             payload: None,
         }
     }
@@ -2141,11 +2218,12 @@ mod tests {
     fn ctx_mode(query: &str, mode: &str) -> AssembleRequest {
         AssembleRequest {
             project_id: None,
-            session_id: None,
+            container_id: None,
             mode: Some(mode.into()),
             modes: None,
             query: Some(query.into()),
             limit: None,
+            exclude_container_id: None,
         }
     }
 
@@ -2244,11 +2322,12 @@ mod tests {
             "leslie",
             AssembleRequest {
                 project_id: None,
-                session_id: None,
+                container_id: None,
                 mode: Some("all".into()),
                 modes: None,
                 query: Some("deploy".into()),
                 limit: None,
+                exclude_container_id: None,
             },
         )
         .await
@@ -2280,11 +2359,12 @@ mod tests {
             "leslie",
             AssembleRequest {
                 project_id: None,
-                session_id: None,
+                container_id: None,
                 mode: None,
                 modes: Some(vec!["code".into(), "journal".into()]),
                 query: Some("x".into()),
                 limit: None,
+                exclude_container_id: None,
             },
         )
         .await
@@ -2373,11 +2453,12 @@ mod tests {
             "leslie",
             AssembleRequest {
                 project_id: None,
-                session_id: None,
+                container_id: None,
                 mode: None,
                 modes: None,
                 query: Some("deploy".into()),
                 limit: Some(10_000_000),
+                exclude_container_id: None,
             },
         )
         .await

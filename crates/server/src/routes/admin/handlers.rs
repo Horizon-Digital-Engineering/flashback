@@ -41,7 +41,7 @@ pub(crate) struct RawAdminRow {
     pub content: String,
     pub source: String,
     pub project_id: Option<String>,
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     pub mode: Option<String>,
     pub importance: Option<f32>,
     pub superseded: bool,
@@ -63,7 +63,7 @@ struct RawRecordDbRow {
     #[allow(dead_code)]
     user_id: String,
     project_id: Option<String>,
-    session_id: Option<String>,
+    container_id: Option<String>,
     mode: Option<String>,
     importance: Option<f32>,
     superseded: bool,
@@ -81,7 +81,7 @@ impl RawRecordDbRow {
             content: self.content,
             source: self.source,
             project_id: self.project_id,
-            session_id: self.session_id,
+            container_id: self.container_id,
             mode: self.mode,
             importance: self.importance,
             superseded: self.superseded,
@@ -308,7 +308,7 @@ pub struct RecordQuery {
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -326,7 +326,7 @@ impl RecordQuery {
         Self {
             r#type: self.r#type.as_deref().and_then(empty_to_none),
             project_id: self.project_id.as_deref().and_then(empty_to_none),
-            session_id: self.session_id.as_deref().and_then(empty_to_none),
+            container_id: self.container_id.as_deref().and_then(empty_to_none),
             mode: self.mode.as_deref().and_then(empty_to_none),
             include_superseded: if self.include_super() {
                 Some("1".to_string())
@@ -364,17 +364,49 @@ pub async fn records_list(
     let filter = views::RecordsFilter {
         r#type: q.r#type.clone(),
         project_id: q.project_id.clone(),
-        session_id: q.session_id.clone(),
+        container_id: q.container_id.clone(),
         mode: q.mode.clone(),
         include_superseded: q.include_super(),
     };
+    let payload_keys = payload_key_census(&state.pool, user.scope()).await?;
+
     Ok(Html(views::records_list(
         user.scope(),
         &filter,
         &mode_names,
         &records,
         total,
+        &payload_keys,
     )))
+}
+
+/// How often each `payload` key appears across a user's raw records.
+///
+/// `payload` is the open key:value bag for arrived metadata, which keeps
+/// capture liberal but leaves the schema hard to browse. This is the signal
+/// that makes "promote a key to a real column once we lean on it" a decision
+/// instead of a hunch. Frequency is only a hint — a key on every row nobody
+/// filters by earns nothing, while a rare key you always filter by earns a
+/// column — but it is the part that can actually be measured.
+pub(crate) async fn payload_key_census(
+    pool: &sqlx::PgPool,
+    user_id: &str,
+) -> Result<Vec<(String, i64)>, super::Error> {
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT kv.key, COUNT(*)::bigint
+        FROM raw_records r, jsonb_each_text(r.payload) AS kv
+        WHERE ($1 = '*' OR r.user_id = $1)
+          AND r.payload IS NOT NULL
+        GROUP BY kv.key
+        ORDER BY 2 DESC, 1 ASC
+        LIMIT 40
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 /// Fetch raw records for the list, with the derived `superseded` flag and each
@@ -388,7 +420,7 @@ async fn fetch_records(
 ) -> Result<Vec<RawAdminRow>, sqlx::Error> {
     let rows = sqlx::query_as::<_, RawRecordDbRow>(
         r#"
-        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.session_id,
+        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.container_id,
                r.mode, r.importance, r.state_kind, r.state_key, r.payload,
                r.event_time,
                EXISTS (
@@ -399,7 +431,7 @@ async fn fetch_records(
         WHERE ($1 = '*' OR r.user_id = $1)
           AND ($2::TEXT IS NULL OR r.type = $2)
           AND ($3::TEXT IS NULL OR r.project_id = $3)
-          AND ($4::TEXT IS NULL OR r.session_id = $4)
+          AND ($4::TEXT IS NULL OR r.container_id = $4)
           AND ($5::TEXT IS NULL OR r.mode = $5)
           AND ($6::BOOLEAN OR NOT EXISTS (
               SELECT 1 FROM raw_records n
@@ -412,7 +444,7 @@ async fn fetch_records(
     .bind(user_id)
     .bind(&q.r#type)
     .bind(&q.project_id)
-    .bind(&q.session_id)
+    .bind(&q.container_id)
     .bind(&q.mode)
     .bind(q.include_super())
     .bind(limit)
@@ -439,7 +471,7 @@ async fn count_records(
         WHERE ($1 = '*' OR r.user_id = $1)
           AND ($2::TEXT IS NULL OR r.type = $2)
           AND ($3::TEXT IS NULL OR r.project_id = $3)
-          AND ($4::TEXT IS NULL OR r.session_id = $4)
+          AND ($4::TEXT IS NULL OR r.container_id = $4)
           AND ($5::TEXT IS NULL OR r.mode = $5)
           AND ($6::BOOLEAN OR NOT EXISTS (
               SELECT 1 FROM raw_records n
@@ -450,7 +482,7 @@ async fn count_records(
     .bind(user_id)
     .bind(&q.r#type)
     .bind(&q.project_id)
-    .bind(&q.session_id)
+    .bind(&q.container_id)
     .bind(&q.mode)
     .bind(q.include_super())
     .fetch_one(pool)
@@ -504,7 +536,7 @@ pub(crate) async fn load_record_detail(
         chain AS (
             SELECT id FROM back UNION SELECT id FROM forward
         )
-        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.session_id,
+        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.container_id,
                r.mode, r.importance, r.state_kind, r.state_key, r.payload,
                r.event_time,
                EXISTS (
@@ -538,7 +570,7 @@ async fn fetch_one_record(
 ) -> Result<Option<RawRecordDbRow>, sqlx::Error> {
     sqlx::query_as::<_, RawRecordDbRow>(
         r#"
-        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.session_id,
+        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.container_id,
                r.mode, r.importance, r.state_kind, r.state_key, r.payload,
                r.event_time,
                EXISTS (
@@ -574,7 +606,7 @@ pub(crate) async fn list_state_objects_for(
 ) -> Result<Vec<RawAdminRow>, sqlx::Error> {
     let rows = sqlx::query_as::<_, RawRecordDbRow>(
         r#"
-        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.session_id,
+        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.container_id,
                r.mode, r.importance, r.state_kind, r.state_key, r.payload,
                r.event_time, FALSE AS superseded
         FROM raw_records r
@@ -920,7 +952,7 @@ struct GraphRow {
     content: String,
     importance: f32,
     superseded: bool,
-    session_id: Option<String>,
+    container_id: Option<String>,
     supersedes: Option<Uuid>,
     state_key: Option<String>,
     embedding: Option<Vector>,
@@ -951,7 +983,7 @@ async fn compute_graph_with_layout(
             id: r.id,
             embedding: r.embedding.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
             entities: r.entities.clone(),
-            session_id: r.session_id.clone(),
+            container_id: r.container_id.clone(),
             supersedes: r.supersedes,
         })
         .collect();
@@ -998,14 +1030,14 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
         content: String,
         importance: Option<f32>,
         superseded: bool,
-        session_id: Option<String>,
+        container_id: Option<String>,
         supersedes: Option<Uuid>,
         state_key: Option<String>,
         embedding: Option<Vector>,
     }
     let rows = sqlx::query_as::<_, Row>(
         r#"
-        SELECT r.id, r.type, r.content, r.importance, r.session_id, r.supersedes, r.state_key,
+        SELECT r.id, r.type, r.content, r.importance, r.container_id, r.supersedes, r.state_key,
                EXISTS (
                    SELECT 1 FROM raw_records n
                    WHERE n.supersedes = r.id AND n.user_id = r.user_id
@@ -1031,7 +1063,7 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
             content: r.content,
             importance: r.importance.unwrap_or(0.5),
             superseded: r.superseded,
-            session_id: r.session_id,
+            container_id: r.container_id,
             supersedes: r.supersedes,
             state_key: r.state_key,
             embedding: r.embedding,
@@ -1107,9 +1139,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn dashboard_counts_reflect_raw_world(pool: PgPool) {
-        let old = insert_raw(&pool, "alice", "working", "first", None).await;
+        let old = insert_raw(&pool, "alice", "document", "first", None).await;
         // A newer row supersedes `old`; `old` is no longer terminal.
-        insert_raw(&pool, "alice", "episodic", "second", Some(old)).await;
+        insert_raw(&pool, "alice", "document", "second", Some(old)).await;
         insert_raw(&pool, "alice", "state_object", "todo", None).await;
 
         let c = dashboard_counts(&pool, "alice").await.unwrap();
@@ -1123,16 +1155,16 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn dashboard_counts_scoped_by_user(pool: PgPool) {
-        insert_raw(&pool, "alice", "working", "a", None).await;
-        insert_raw(&pool, "bob", "working", "b", None).await;
+        insert_raw(&pool, "alice", "document", "a", None).await;
+        insert_raw(&pool, "bob", "document", "b", None).await;
         let c = dashboard_counts(&pool, "alice").await.unwrap();
         assert_eq!(c.records_total, 1);
     }
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn operator_scope_sees_every_user(pool: PgPool) {
-        insert_raw(&pool, "alice", "working", "a", None).await;
-        insert_raw(&pool, "bob", "working", "b", None).await;
+        insert_raw(&pool, "alice", "document", "a", None).await;
+        insert_raw(&pool, "bob", "document", "b", None).await;
         let c = dashboard_counts(&pool, crate::auth::ALL_USERS)
             .await
             .unwrap();
@@ -1152,8 +1184,8 @@ mod tests {
     #[sqlx::test(migrations = "../../migrations")]
     async fn auth_user_scope_depends_on_role(pool: PgPool) {
         // A service principal stays inside its own rows; an operator widens.
-        insert_raw(&pool, "alice", "working", "a", None).await;
-        insert_raw(&pool, "bob", "working", "b", None).await;
+        insert_raw(&pool, "alice", "document", "a", None).await;
+        insert_raw(&pool, "bob", "document", "b", None).await;
         let svc = crate::auth::AuthUser {
             user_id: "alice".into(),
             token_id: uuid::Uuid::nil(),
@@ -1188,14 +1220,14 @@ mod tests {
     async fn fetch_records_native_mode_filter(pool: PgPool) {
         sqlx::query(
             "INSERT INTO raw_records (type, content, event_time, source, user_id, mode)
-             VALUES ('working', 'code note', NOW(), 't', 'alice', 'code')",
+             VALUES ('document', 'code note', NOW(), 't', 'alice', 'code')",
         )
         .execute(&pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO raw_records (type, content, event_time, source, user_id, mode)
-             VALUES ('working', 'journal note', NOW(), 't', 'alice', 'journal')",
+             VALUES ('document', 'journal note', NOW(), 't', 'alice', 'journal')",
         )
         .execute(&pool)
         .await
@@ -1213,8 +1245,8 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn fetch_records_excludes_superseded_by_default(pool: PgPool) {
-        let old = insert_raw(&pool, "alice", "working", "old", None).await;
-        insert_raw(&pool, "alice", "episodic", "new", Some(old)).await;
+        let old = insert_raw(&pool, "alice", "document", "old", None).await;
+        insert_raw(&pool, "alice", "document", "new", Some(old)).await;
 
         let terminal_only = fetch_records(&pool, "alice", &RecordQuery::default(), 50, 0)
             .await
@@ -1236,8 +1268,8 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn load_record_detail_returns_chain(pool: PgPool) {
-        let old = insert_raw(&pool, "alice", "working", "v1", None).await;
-        let new = insert_raw(&pool, "alice", "episodic", "v2", Some(old)).await;
+        let old = insert_raw(&pool, "alice", "document", "v1", None).await;
+        let new = insert_raw(&pool, "alice", "document", "v2", Some(old)).await;
         let (row, chain) = load_record_detail(&pool, "alice", new).await.unwrap();
         assert_eq!(row.id, new);
         assert_eq!(chain.len(), 2);
@@ -1248,7 +1280,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn load_record_detail_rejects_wrong_user(pool: PgPool) {
-        let id = insert_raw(&pool, "alice", "working", "x", None).await;
+        let id = insert_raw(&pool, "alice", "document", "x", None).await;
         let err = load_record_detail(&pool, "bob", id).await.unwrap_err();
         assert!(matches!(err, super::super::Error::NotFound));
     }
@@ -1267,8 +1299,8 @@ mod tests {
         // alice's id (simulates a cross-user supersede pointer — a corrupted or
         // hostile insert). The chain walk must stay within alice and never pull
         // bob's row into her detail page.
-        let alice = insert_raw(&pool, "alice", "working", "alice v1", None).await;
-        let bob_cross = insert_raw(&pool, "bob", "episodic", "bob's row", Some(alice)).await;
+        let alice = insert_raw(&pool, "alice", "document", "alice v1", None).await;
+        let bob_cross = insert_raw(&pool, "bob", "document", "bob's row", Some(alice)).await;
 
         let (row, chain) = load_record_detail(&pool, "alice", alice).await.unwrap();
         assert_eq!(row.id, alice);
@@ -1397,4 +1429,22 @@ mod tests {
         assert!(p.chars().count() <= 11); // 10 + ellipsis
         assert!(p.ends_with('…'));
     }
+}
+
+/// The playground page. State lives in the browser; the server only serves the
+/// shell and answers `/api/playground/turn`.
+pub async fn playground_view(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Html<String>, super::Error> {
+    // Settings are a convenience, not a precondition — a lookup failure should
+    // still render the page (with the "configure me" banner) rather than 500.
+    let settings = super::playground::load_settings(&state.pool, &user.user_id)
+        .await
+        .unwrap_or_default();
+    Ok(Html(views::playground_view(
+        user.scope(),
+        state.nlp.provider_can_distill(),
+        &settings,
+    )))
 }

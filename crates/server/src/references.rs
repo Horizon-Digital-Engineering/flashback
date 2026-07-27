@@ -60,7 +60,7 @@ pub struct ReferenceView {
     pub state_key: String,
     pub user_id: String,
     pub project_id: Option<String>,
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     /// The COMPLETE current value (never a delta).
     pub state_data: Value,
     pub supersedes: Option<Uuid>,
@@ -81,7 +81,7 @@ fn to_view(row: RawRecordRow) -> AppResult<ReferenceView> {
         state_key,
         user_id: row.user_id,
         project_id: row.project_id,
-        session_id: row.session_id,
+        container_id: row.container_id,
         state_data,
         supersedes: row.supersedes,
         event_time: row.event_time,
@@ -201,7 +201,7 @@ pub struct PutValueRequest {
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     #[serde(default)]
     pub importance: Option<f32>,
 }
@@ -250,9 +250,9 @@ pub(crate) async fn put_value_inner(
     let project_id = req
         .project_id
         .or_else(|| prior.as_ref().and_then(|r| r.project_id.clone()));
-    let session_id = req
-        .session_id
-        .or_else(|| prior.as_ref().and_then(|r| r.session_id.clone()));
+    let container_id = req
+        .container_id
+        .or_else(|| prior.as_ref().and_then(|r| r.container_id.clone()));
 
     // The payload carries the reference convention {kind, key, data}; the DB
     // trigger promotes kind/key onto the indexed columns at insert. `content` is
@@ -267,12 +267,10 @@ pub(crate) async fn put_value_inner(
         source: REF_SOURCE.to_string(),
         source_ref: None,
         project_id,
-        session_id,
+        container_id,
         mode: None,
         importance: req.importance,
         supersedes,
-        ttl_hours: None,
-        acl: None,
         payload: Some(payload),
     };
     let out = ingest_record(pool, nlp, user_id, ingest).await?;
@@ -413,7 +411,7 @@ mod tests {
         PutValueRequest {
             data,
             project_id: None,
-            session_id: None,
+            container_id: None,
             importance: None,
         }
     }
