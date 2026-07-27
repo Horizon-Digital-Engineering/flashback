@@ -12,8 +12,18 @@ What it lacks is:
 
 - **No tenant boundary.** All `user_id`s share one global namespace. No notion of "this group of users belongs together."
 - **No visibility scoping.** A memory belongs to exactly one user. Memories can't be shared without copying.
-- **No admin role.** Admin pages are authenticated but not user-scoped — any valid token sees every user's data. Single-user dev: fine. Multi-tenant prod: broken privacy model.
 - **No real auth flow.** Tokens are minted via CLI by the operator. No signup, no password reset, no per-user provisioning.
+
+What it *does* have is a role split, walled in both directions:
+
+- **`service`** (the default) reaches REST + MCP only, and sees just its own `user_id`'s rows. This is what an integration holds.
+- **`operator`** reaches the `/admin` UI only, and sees every user's rows. This is what you sign in with.
+
+A service token is bounced from `/admin`; an operator token gets a 403 from the API. Mint with
+`flashback token mint --user=<u> --name=<label> [--role=operator]`. `*` is reserved (operator
+wildcard + the modes template) and must never be minted as a real user.
+
+So the operator-vs-user boundary exists. What's still missing below is the *between-users* one.
 
 The trait shape is right; the policy layer is missing.
 

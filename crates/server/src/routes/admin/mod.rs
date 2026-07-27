@@ -32,6 +32,7 @@ use axum::{
 use crate::AppState;
 
 mod handlers;
+pub(crate) mod playground;
 mod projection;
 mod style;
 pub mod views;
@@ -88,5 +89,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/map.json", get(handlers::map_data))
         .route("/curate", get(handlers::curate_view))
         .route("/api/curate", post(handlers::curate_trigger))
+        .route("/playground", get(handlers::playground_view))
+        .route("/api/playground/turn", post(playground::turn))
+        .route("/api/playground/settings", post(playground::save_settings))
         .with_state(state)
 }
