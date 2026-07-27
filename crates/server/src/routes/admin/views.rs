@@ -46,10 +46,27 @@ pub fn page(active: &str, user_id: &str, content: &str) -> String {
 <main class="page">
 {content}
 </main>
+{LOCAL_TIME_JS}
 </body>
 </html>"#
     )
 }
+
+/// Rewrite every `<time class="ts">` into the viewer's own timezone. Kept inline
+/// and dependency-free; if it never runs the server-rendered "… UTC" text is
+/// still correct, just not local.
+const LOCAL_TIME_JS: &str = r##"<script>
+for (const el of document.querySelectorAll("time.ts")) {
+  const d = new Date(el.getAttribute("datetime"));
+  if (!isNaN(d)) {
+    el.textContent = d.toLocaleString(undefined, {
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    });
+    el.title = el.getAttribute("datetime");
+  }
+}
+</script>"##;
 
 fn render_nav(active: &str, user_id: &str) -> String {
     let item = |name: &str, href: &str, label: &str| -> String {
@@ -68,6 +85,7 @@ fn render_nav(active: &str, user_id: &str) -> String {
   {g}
   {h}
   {i}
+  {j}
   <span class="spacer"></span>
   <span class="user">{user_id}</span>
   <a href="/admin/logout">logout</a>
@@ -80,7 +98,8 @@ fn render_nav(active: &str, user_id: &str) -> String {
         f = item("proposals", "/admin/proposals", "Proposals"),
         g = item("map", "/admin/map", "Map"),
         h = item("curate", "/admin/curate", "Curate"),
-        i = item("tokens", "/admin/tokens", "Tokens"),
+        i = item("playground", "/admin/playground", "Playground"),
+        j = item("tokens", "/admin/tokens", "Tokens"),
     )
 }
 
@@ -184,6 +203,7 @@ pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[RawAdminRow]) -
   </div>
   <div class="card">
     <h2 style="margin-top:0">Quick links</h2>
+    <p><a href="/admin/playground">Playground — watch a turn end to end →</a></p>
     <p><a href="/admin/records">Browse records →</a></p>
     <p><a href="/admin/curated">Curated layer →</a></p>
     <p><a href="/admin/map">Embedding map →</a></p>
@@ -214,7 +234,7 @@ pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[RawAdminRow]) -
 pub struct RecordsFilter {
     pub r#type: Option<String>,
     pub project_id: Option<String>,
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     /// Cognitive register (mode) filter — a NATIVE `raw_records.mode` predicate.
     pub mode: Option<String>,
     pub include_superseded: bool,
@@ -226,6 +246,7 @@ pub fn records_list(
     mode_names: &[String],
     records: &[RawAdminRow],
     total: i64,
+    payload_keys: &[(String, i64)],
 ) -> String {
     let q = build_query_string(filter);
     let mut filter_form = String::from(
@@ -238,7 +259,7 @@ pub fn records_list(
               {opts}
             </select></div>"#,
         sel_any = if filter.r#type.is_none() { "selected" } else { "" },
-        opts = ["working", "episodic", "semantic", "document", "procedural", "state_object"]
+        opts = ["conversation", "document", "state_object"]
             .iter()
             .map(|t| {
                 let sel = if filter.r#type.as_deref() == Some(*t) { "selected" } else { "" };
@@ -254,8 +275,8 @@ pub fn records_list(
     ));
     filter_form.push_str(&format!(
         r#"<div><label class="muted">Session</label><br />
-            <input type="text" name="session_id" value="{}" placeholder="any" style="min-width:160px" /></div>"#,
-        esc(filter.session_id.as_deref().unwrap_or(""))
+            <input type="text" name="container_id" value="{}" placeholder="any" style="min-width:160px" /></div>"#,
+        esc(filter.container_id.as_deref().unwrap_or(""))
     ));
     filter_form.push_str(&format!(
         r#"<div><label class="muted">Mode</label><br />
@@ -331,13 +352,49 @@ pub fn records_list(
         r#"<h1>Records</h1>
 <p class="muted">{total} total matching this filter. URL state: <code>?{q}</code></p>
 {filter_form}
-{table}"#,
+{table}
+{keys}"#,
         total = total,
         q = esc(&q),
         filter_form = filter_form,
         table = table,
+        keys = payload_key_panel(payload_keys),
     );
     page("records", user_id, &content)
+}
+
+/// Census of the open metadata bag. `payload` keeps capture liberal — a writer
+/// records every circumstance it knows without waiting for a migration — at the
+/// cost of a shape you can't see at a glance. This is the counterweight: it
+/// shows what is actually accumulating in there, so promoting a key to a real
+/// column becomes an observation rather than a guess.
+///
+/// Read it as a hint, not a verdict. A key present on every row that nothing
+/// ever filters by has earned nothing; a rare key you filter by constantly has
+/// earned a column. Frequency is merely the half that can be measured.
+fn payload_key_panel(keys: &[(String, i64)]) -> String {
+    if keys.is_empty() {
+        return String::new();
+    }
+    let mut rows = String::new();
+    for (k, n) in keys {
+        rows.push_str(&format!(
+            r#"<tr><td class="mono">{k}</td><td class="muted">{n}</td></tr>"#,
+            k = esc(k),
+            n = n,
+        ));
+    }
+    format!(
+        r#"<div class="card" style="margin-top:20px">
+  <h2 style="margin-top:0">Capture metadata keys</h2>
+  <p class="muted" style="font-size:12px">
+    What writers are putting in <code>payload</code>. A key you lean on
+    repeatedly is a candidate to become its own column — migrations are
+    declarations here, so promoting one later costs a rebuild, not a data loss.
+  </p>
+  <table><thead><tr><th>key</th><th>records</th></tr></thead><tbody>{rows}</tbody></table>
+</div>"#
+    )
 }
 
 fn build_query_string(f: &RecordsFilter) -> String {
@@ -348,8 +405,8 @@ fn build_query_string(f: &RecordsFilter) -> String {
     if let Some(p) = &f.project_id {
         parts.push(format!("project_id={}", p));
     }
-    if let Some(s) = &f.session_id {
-        parts.push(format!("session_id={}", s));
+    if let Some(s) = &f.container_id {
+        parts.push(format!("container_id={}", s));
     }
     if let Some(m) = &f.mode {
         parts.push(format!("mode={}", m));
@@ -449,7 +506,7 @@ pub fn record_detail(user_id: &str, r: &RawAdminRow, chain: &[RawAdminRow]) -> S
             ))
             .unwrap_or_default(),
         session = r
-            .session_id
+            .container_id
             .as_deref()
             .map(|s| format!(r#"<p class="muted">session: <code>{}</code></p>"#, esc(s)))
             .unwrap_or_default(),
@@ -1278,8 +1335,17 @@ pub fn short_id(id: Uuid) -> String {
     id.to_string()[..8].to_string()
 }
 
+/// A timestamp the browser can localise. The server only knows UTC, so it emits
+/// the machine-readable instant in `datetime` and a UTC-labelled fallback as the
+/// text — `LOCAL_TIME_JS` rewrites the text to the viewer's zone. Without the
+/// label an unconverted UTC reading is silently wrong by the viewer's offset,
+/// which is exactly how a 14:52 event came to read as 18:52.
 pub fn format_when(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%d %H:%M").to_string()
+    format!(
+        r#"<time datetime="{}" class="ts">{} UTC</time>"#,
+        t.to_rfc3339(),
+        t.format("%Y-%m-%d %H:%M")
+    )
 }
 
 pub fn esc(s: &str) -> String {
@@ -1295,4 +1361,353 @@ pub fn esc(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare wall-clock string is ambiguous: the viewer reads UTC as local and
+    /// is wrong by their offset. The rendered timestamp must carry the instant
+    /// machine-readably AND label the fallback text.
+    #[test]
+    fn format_when_is_machine_readable_and_labelled() {
+        let t = DateTime::parse_from_rfc3339("2026-07-25T18:52:26Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let out = format_when(t);
+
+        assert!(out.contains(r#"datetime="2026-07-25T18:52:26+00:00""#));
+        assert!(out.contains("2026-07-25 18:52 UTC"));
+        assert!(out.contains(r#"class="ts""#));
+    }
+
+    #[test]
+    fn page_ships_the_localiser() {
+        let html = page("records", "alice", "<p>x</p>");
+        assert!(html.contains("time.ts"));
+        assert!(html.contains("toLocaleString"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Playground — the dynamic-RAG loop, made visible.
+// ---------------------------------------------------------------------------
+
+/// Stand in for a host: send a turn, watch what was retrieved, see the exact
+/// prompt that would go to a model, and see what got written back.
+///
+/// Chat-first on purpose — you judge a memory system by whether the reply reads
+/// like it remembered, and only then by asking why. Settings are server-side
+/// and per-operator, so they survive a different browser, a different origin,
+/// or a rebuilt machine.
+pub fn playground_view(
+    user_id: &str,
+    can_distill: bool,
+    settings: &super::playground::Settings,
+) -> String {
+    let distill_note = if can_distill {
+        r#"<span class="pill" style="color:var(--good)">distillation on</span>"#
+    } else {
+        r#"<span class="pill" style="color:var(--warn)">heuristic provider — no semantic facts yet</span>"#
+    };
+    let configured = settings.base_url.is_some() && settings.model.is_some();
+    // The failure this replaces: a half-filled form silently degrading to
+    // retrieval-only, with the only clue a line of grey text under the input.
+    let warn_banner = if configured {
+        String::new()
+    } else {
+        r#"<div class="error" style="margin:12px 0">
+  <strong>No model configured.</strong> Turns will retrieve and write, but nothing will reply.
+  Set a base URL <em>and</em> a model name below — both are required.
+</div>"#
+            .to_string()
+    };
+    let val = |o: &Option<String>| esc(o.as_deref().unwrap_or(""));
+    let content = format!(
+        r##"<div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+  <h1 style="margin-bottom:4px">Playground</h1>
+  {distill_note}
+  <span class="spacer" style="flex:1"></span>
+  <a href="#" id="pg-settings-toggle" class="muted" style="font-size:13px">⚙ settings</a>
+</div>
+<p class="muted" style="margin-top:0;font-size:13px">
+  Retrieval and the write use the same seams ritsu does — what happens here is what a real host gets.
+</p>
+{warn_banner}
+
+<div class="card" id="pg-settings" style="display:{settings_display}">
+  <div class="row" style="gap:8px;flex-wrap:wrap">
+    <input id="pg-base" value="{base}" placeholder="http://127.0.0.1:1234/v1 — base URL" style="flex:2;min-width:240px" />
+    <input id="pg-model" value="{model}" placeholder="model name (required)" style="flex:1;min-width:180px" />
+    <input id="pg-limit" value="{limit}" placeholder="memories (12)" style="flex:0 0 120px" />
+  </div>
+  <input id="pg-key" type="password" placeholder="api key — optional, stays in this browser" style="width:100%;margin-top:8px;box-sizing:border-box" />
+  <label class="muted" style="font-size:12px;display:block;margin-top:10px">
+    System prompt — how retrieved memories get framed. The biggest lever on whether the model uses them.
+  </label>
+  <textarea id="pg-sys" rows="3" style="width:100%;box-sizing:border-box;margin-top:4px">{sys}</textarea>
+  <div class="row" style="align-items:center;gap:10px;margin-top:8px">
+    <button id="pg-save">Save settings</button>
+    <button id="pg-sys-reset" class="muted">reset prompt</button>
+    <span id="pg-save-status" class="muted" style="font-size:12px"></span>
+  </div>
+  <p class="muted" style="font-size:12px;margin-bottom:0">
+    Saved on the server for <code>{user_id}</code>. Any OpenAI-compatible endpoint —
+    LM Studio, Ollama, LiteLLM, OpenRouter. The API key is the one exception: it stays
+    in this browser rather than in the database.
+  </p>
+</div>
+
+<div class="row" style="align-items:stretch;gap:16px;margin-top:16px">
+  <div class="card" style="flex:1.15;min-width:340px;display:flex;flex-direction:column">
+    <div class="muted" style="font-size:12px;margin-bottom:8px">
+      <code id="pg-container"></code> · <a href="#" id="pg-new">new conversation</a>
+    </div>
+    <div id="pg-log" style="flex:1;min-height:46vh;max-height:60vh;overflow:auto;padding-right:4px"></div>
+    <div style="margin-top:10px">
+      <textarea id="pg-msg" rows="3" placeholder="Ask something it should remember. ⌘↵ to send."
+        style="width:100%;box-sizing:border-box"></textarea>
+      <div class="row" style="align-items:center;gap:10px;margin-top:6px">
+        <button id="pg-send">Send</button>
+        <span id="pg-status" class="muted" style="font-size:12px"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="flex:1;min-width:320px;overflow:auto;max-height:78vh">
+    <h2 style="margin-top:0">Diagnostics</h2>
+    <div id="pg-trace"><p class="muted">Send a turn to see what it retrieved and why.</p></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}}[c]));
+const approxTokens = s => Math.round(s.length / 4);
+const DEFAULT_SYS = 'You are a helpful assistant with persistent memory. Answer in a few sentences unless asked for detail — most of the wait a user experiences is output length.';
+
+$('pg-settings-toggle').addEventListener('click', e => {{
+  e.preventDefault();
+  const el = $('pg-settings');
+  el.style.display = el.style.display === 'none' ? '' : 'none';
+}});
+$('pg-sys-reset').addEventListener('click', e => {{ e.preventDefault(); $('pg-sys').value = DEFAULT_SYS; }});
+
+// The API key is the only browser-held value; everything else is server-side.
+$('pg-key').value = localStorage.getItem('fb_pg_key') || '';
+$('pg-key').addEventListener('change', () => localStorage.setItem('fb_pg_key', $('pg-key').value));
+
+$('pg-save').addEventListener('click', async e => {{
+  e.preventDefault();
+  const limit = parseInt($('pg-limit').value, 10);
+  const body = {{
+    base_url: $('pg-base').value, model: $('pg-model').value,
+    system_prompt: $('pg-sys').value,
+    context_limit: Number.isFinite(limit) ? limit : null,
+  }};
+  $('pg-save-status').textContent = 'saving…';
+  try {{
+    const res = await fetch('/admin/api/playground/settings', {{
+      method: 'POST', headers: {{ 'content-type': 'application/json' }}, body: JSON.stringify(body),
+    }});
+    if (!res.ok) throw new Error((await res.text()).slice(0, 200));
+    const saved = await res.json();
+    $('pg-save-status').textContent = (saved.base_url && saved.model)
+      ? 'saved' : 'saved — but base URL AND model are both needed to get a reply';
+    if (saved.base_url && saved.model) document.querySelector('.error')?.remove();
+  }} catch (err) {{
+    $('pg-save-status').textContent = 'failed: ' + err.message;
+  }}
+}});
+
+const newContainer = () => 'playground:' + Math.random().toString(36).slice(2, 10);
+let container = sessionStorage.getItem('fb_pg_container') || newContainer();
+sessionStorage.setItem('fb_pg_container', container);
+$('pg-container').textContent = container;
+$('pg-new').addEventListener('click', e => {{
+  e.preventDefault();
+  container = newContainer();
+  sessionStorage.setItem('fb_pg_container', container);
+  $('pg-container').textContent = container;
+  $('pg-log').innerHTML = '';
+  $('pg-trace').innerHTML = '<p class="muted">New conversation. Nothing retrieved yet.</p>';
+}});
+
+function bubble(role, text) {{
+  const mine = role === 'user';
+  $('pg-log').insertAdjacentHTML('beforeend',
+    `<div style="display:flex;justify-content:${{mine ? 'flex-end' : 'flex-start'}};margin-bottom:10px">
+       <div style="max-width:82%;padding:9px 12px;border-radius:12px;
+                   background:${{mine ? 'var(--accent,#2a4d69)' : 'var(--panel2,#1e1e24)'}};
+                   white-space:pre-wrap;word-break:break-word"></div>
+     </div>`);
+  const el = $('pg-log').lastElementChild.firstElementChild;
+  el.textContent = text;   // textContent, so streamed chunks can't inject HTML
+  $('pg-log').scrollTop = $('pg-log').scrollHeight;
+  return el;
+}}
+
+const stat = (l, v) => `<div class="stat" style="padding:8px"><div class="label" style="font-size:10px">${{l}}</div>
+  <div class="value" style="font-size:17px">${{v}}</div></div>`;
+const section = (t, b, open) => `<details ${{open ? 'open' : ''}} style="margin-top:12px">
+  <summary style="cursor:pointer;font-weight:600">${{t}}</summary><div style="margin-top:8px">${{b}}</div></details>`;
+
+function renderTrace(t, retrievalMs) {{
+  const ctx = t.prompt.length > 2 ? t.prompt[1].content : '';
+  const parts = ['<div class="stat-grid" id="pg-stats" style="grid-template-columns:repeat(auto-fit,minmax(84px,1fr))">'];
+  parts.push(stat('retrieved', t.retrieved.length));
+  parts.push(stat('context', '~' + approxTokens(ctx) + ' tok'));
+  parts.push(stat('retrieval', (retrievalMs / 1000).toFixed(2) + 's'));
+  parts.push('</div>');
+
+  if (t.degraded) parts.push(`<p class="pill" style="color:var(--warn)">degraded: ${{esc(t.warning || '')}}</p>`);
+  parts.push('<div id="pg-llm-note"></div>');
+  if (t.llm_error) llmNoteHtml = noReply(t.llm_error);
+
+  let mem = '';
+  if (!t.retrieved.length) {{
+    mem = '<p class="muted">Nothing matched. On a near-empty store that is correct, not a bug.</p>';
+  }} else {{
+    mem = '<ol style="padding-left:18px;margin:0">';
+    for (const r of t.retrieved) {{
+      mem += `<li style="margin-bottom:10px">
+        <div class="muted mono" style="font-size:11px">${{esc(r.type)}} · ${{esc(r.source)}}
+          · <time class="ts" datetime="${{esc(r.event_time)}}">${{esc(r.event_time)}}</time></div>
+        <div style="white-space:pre-wrap;font-size:13px">${{esc(r.content.slice(0, 320))}}${{r.content.length > 320 ? '…' : ''}}</div>
+      </li>`;
+    }}
+    mem += '</ol>';
+  }}
+  parts.push(section(`Retrieved memories (${{t.retrieved.length}})`, mem, true));
+
+  let pr = '';
+  for (const m of t.prompt) {{
+    pr += `<div style="margin-bottom:8px"><div class="muted mono" style="font-size:11px">${{esc(m.role)}}
+      · ~${{approxTokens(m.content)}} tok</div>
+      <pre style="white-space:pre-wrap;margin:2px 0;font-size:12px">${{esc(m.content)}}</pre></div>`;
+  }}
+  parts.push(section('Prompt sent — exactly what the model saw', pr, false));
+
+  parts.push(section('Written to raw', `<p class="mono" id="pg-written" style="font-size:12px"></p>
+    <p class="muted" style="font-size:12px">Run <a href="/admin/curate">Curate</a> to derive episodes from these turns.</p>`, false));
+
+  $('pg-trace').innerHTML = parts.join('');
+  if (llmNoteHtml) $('pg-llm-note').innerHTML = llmNoteHtml;
+  patchWritten(t.written);
+  for (const el of document.querySelectorAll('#pg-trace time.ts')) {{
+    const d = new Date(el.getAttribute('datetime'));
+    if (!isNaN(d)) el.textContent = d.toLocaleString();
+  }}
+}}
+
+let llmNoteHtml = '';
+const noReply = m => `<div class="error" style="margin:10px 0"><strong>No reply.</strong>
+  <div style="font-size:12px;margin-top:4px;white-space:pre-wrap">${{esc(m)}}</div></div>`;
+
+function patchWritten(ids) {{
+  const el = $('pg-written');
+  if (el) el.innerHTML = ids.map(id => `<a href="/admin/records/${{id.slice ? id : ''}}">${{String(id).slice(0,8)}}</a>`).join(' · ') || '—';
+}}
+
+/// After `done`: fold the model's numbers into the stat row.
+function patchStats(stats, totalMs) {{
+  const grid = $('pg-stats');
+  if (!grid) return;
+  let extra = stat('total', (totalMs / 1000).toFixed(1) + 's');
+  if (stats) {{
+    if (stats.prompt_tokens != null) extra += stat('prompt tok', stats.prompt_tokens);
+    if (stats.completion_tokens != null) extra += stat('output tok', stats.completion_tokens);
+    extra += stat('model', (stats.latency_ms / 1000).toFixed(1) + 's');
+  }}
+  grid.insertAdjacentHTML('beforeend', extra);
+}}
+
+let timer = null;
+async function send() {{
+  const msg = $('pg-msg').value.trim();
+  if (!msg) return;
+  $('pg-send').disabled = true;
+  bubble('user', msg);
+  $('pg-msg').value = '';
+  llmNoteHtml = '';
+
+  const t0 = performance.now();
+  let gotFirstDelta = false;
+  timer = setInterval(() => {{
+    if (!gotFirstDelta)
+      $('pg-status').textContent = 'waiting for model… ' + ((performance.now() - t0) / 1000).toFixed(0) + 's';
+  }}, 250);
+
+  let assistantEl = null, assistantText = '';
+
+  try {{
+    const res = await fetch('/admin/api/playground/turn', {{
+      method: 'POST', headers: {{ 'content-type': 'application/json' }},
+      body: JSON.stringify({{ message: msg, container_id: container, api_key: $('pg-key').value || null }}),
+    }});
+    if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+
+    // Consume the SSE stream: trace (instant) → delta* → done.
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {{
+      const {{ done, value }} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {{ stream: true }});
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {{
+        const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        let ev = 'message', data = '';
+        for (const line of frame.split('\n')) {{
+          if (line.startsWith('event:')) ev = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += line.slice(5).trim();
+        }}
+        if (!data) continue;
+        if (ev === 'trace') {{
+          renderTrace(JSON.parse(data), performance.now() - t0);
+        }} else if (ev === 'delta') {{
+          if (!assistantEl) {{
+            gotFirstDelta = true;
+            $('pg-status').textContent = '';
+            assistantEl = bubble('assistant', '');
+          }}
+          assistantText += JSON.parse(data).t;
+          assistantEl.textContent = assistantText;
+          $('pg-log').scrollTop = $('pg-log').scrollHeight;
+        }} else if (ev === 'done') {{
+          const d = JSON.parse(data);
+          patchStats(d.stats, performance.now() - t0);
+          patchWritten(d.written);
+          if (d.llm_error) $('pg-llm-note').innerHTML = noReply(d.llm_error);
+        }} else if (ev === 'error') {{
+          $('pg-status').textContent = 'failed: ' + data;
+        }}
+      }}
+    }}
+    clearInterval(timer);
+    if (!assistantText) $('pg-status').textContent = 'written — see Diagnostics';
+    else $('pg-status').textContent = '';
+  }} catch (e) {{
+    clearInterval(timer);
+    $('pg-status').textContent = 'failed: ' + e.message;
+  }} finally {{
+    $('pg-send').disabled = false;
+    $('pg-msg').focus();
+  }}
+}}
+$('pg-send').addEventListener('click', send);
+$('pg-msg').addEventListener('keydown', e => {{ if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) send(); }});
+</script>"##,
+        settings_display = if configured { "none" } else { "" },
+        base = val(&settings.base_url),
+        model = val(&settings.model),
+        sys = val(&settings.system_prompt),
+        limit = settings
+            .context_limit
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+    );
+    page("playground", user_id, &content)
 }

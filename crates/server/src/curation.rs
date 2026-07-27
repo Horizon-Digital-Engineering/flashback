@@ -5,13 +5,22 @@
 //! set is rebuildable from raw. That's what `rebuild` proves — wipe curation,
 //! re-derive, get the same set back.
 //!
+//! Raw `type` names a kind of evidence, never a tier — a writer says what it
+//! arrived, this module says what that arrival became. Tier vocabulary
+//! (`episodic`, `semantic`, `summary`) exists only in `curated_nodes.kind`.
+//!
 //! Two derivations, both scoped to a single (user, project, mode) tuple and
 //! never crossing it:
 //!
-//!   - `promote_working_to_episodic`: every active `working` raw record that
-//!     isn't already curated becomes a `curated_nodes` row `kind='episodic'`
-//!     plus a `curated_edges('derived_from')` back to the raw id. Idempotent —
-//!     the presence of that edge is the "already curated" marker.
+//!   - `promote_raw_to_episodic`: turns the promotable raw types into
+//!     `curated_nodes` rows `kind='episodic'`, each with
+//!     `curated_edges('derived_from')` back to every raw id it covers. A
+//!     `conversation` turn is not an episode on its own — the episode is the
+//!     whole conversation — so those group by `container_id` into one node per
+//!     session, carrying a transcript and a derived title in `meta`.
+//!     `document` rows stand alone, one node each.
+//!     Idempotent: a session that already has an episode is skipped, and a
+//!     standalone row is skipped once a `derived_from` edge points at it.
 //!
 //!   - `distill_semantic`: clusters active episodic curated nodes by entity
 //!     overlap, then asks the configured `AiProvider` to distill each cluster
@@ -119,31 +128,113 @@ impl Scope {
 }
 
 // ---------------------------------------------------------------------------
-// promote_working_to_episodic
+// promote_raw_to_episodic
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, sqlx::FromRow)]
-struct WorkingRaw {
+struct PromotableRaw {
     id: Uuid,
     content: String,
     event_time: DateTime<Utc>,
     importance: Option<f32>,
+    source: String,
+    payload: Option<serde_json::Value>,
 }
 
-/// Promote every active `working` raw record in scope that isn't already
-/// curated into an episodic curated node. Idempotent: a raw id that already
-/// has a `derived_from` edge pointing at it is skipped.
-pub async fn promote_working_to_episodic(
+/// Raw types curation derives episodes from. `state_object` is deliberately
+/// absent — the reference/catalog layer owns those rows and derives its own
+/// view of them.
+const PROMOTABLE_TYPES: [&str; 2] = ["conversation", "document"];
+
+/// Characters of transcript an episode node carries. The turns stay whole and
+/// separately searchable in raw; this is the representative text that gets
+/// embedded and handed to distillation, so it is bounded rather than complete.
+const EPISODE_CONTENT_BUDGET: usize = 4_000;
+
+/// Characters of a derived conversation title.
+const TITLE_BUDGET: usize = 80;
+
+/// Truncate on a character boundary, appending an ellipsis when it bit.
+fn truncate_chars(s: &str, max: usize) -> String {
+    let mut out: String = s.chars().take(max).collect();
+    if s.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// The speaker label for a turn. Writers name a source as `host:agent:role`
+/// (ritsu) or a bare origin (`chatgpt`); the trailing segment is the useful
+/// label in both shapes.
+fn speaker_of(source: &str) -> &str {
+    source.rsplit(':').next().unwrap_or(source)
+}
+
+/// Render a conversation's turns as a bounded, ordered transcript. Only ever
+/// reuses the turns' own text — nothing here fabricates.
+fn render_transcript(turns: &[PromotableRaw]) -> String {
+    let mut out = String::new();
+    for t in turns {
+        let line = format!("{}: {}\n", speaker_of(&t.source), t.content.trim());
+        if out.chars().count() + line.chars().count() > EPISODE_CONTENT_BUDGET {
+            out.push('…');
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+/// A conversation's title: the source's own title when the import carried one,
+/// otherwise the opening turn, truncated. Extractive by design — a title is a
+/// label for something the user said, not a claim about it.
+fn derive_title(turns: &[PromotableRaw]) -> String {
+    let imported = turns.iter().find_map(|t| {
+        t.payload
+            .as_ref()
+            .and_then(|p| p.get("conversation_title"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    });
+    if let Some(title) = imported {
+        return truncate_chars(title, TITLE_BUDGET);
+    }
+    let opening = turns
+        .iter()
+        .find(|t| !t.content.trim().is_empty())
+        .map(|t| t.content.trim())
+        .unwrap_or_default();
+    let first_line = opening.lines().next().unwrap_or(opening).trim();
+    truncate_chars(first_line, TITLE_BUDGET)
+}
+
+/// Derive episodic nodes from the promotable raw records in scope.
+///
+/// A `conversation` turn is not an episode on its own — an episode is the whole
+/// conversation, the block of time the turns share. So conversation rows group
+/// by `container_id` and yield **one** node per session, carrying the transcript,
+/// a derived title, and `derived_from` edges to every turn it covers. Rows with
+/// no container (and `document` rows) stand alone, one node each.
+///
+/// Idempotent at the session level: a session that already has an episode is
+/// skipped rather than duplicated. A session that has since grown picks up its
+/// new turns on the next `rebuild`, which wipes and re-derives from raw.
+pub async fn promote_raw_to_episodic(
     pool: &PgPool,
     nlp: &dyn NlpService,
     scope: &Scope,
 ) -> AppResult<CurationStats> {
-    // Active = not superseded (no newer row points at it) AND not expired.
-    // Not-yet-curated = no episodic curated node has a derived_from edge to it.
-    let sql = r#"
-        SELECT r.id, r.content, r.event_time, r.importance
+    let mut stats = CurationStats::default();
+
+    // --- conversations: one episode per not-yet-curated session -------------
+    // Active = not superseded by a newer row, and not expired.
+    let sessions: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT r.container_id
         FROM raw_records r
-        WHERE r.type = 'working'
+        WHERE r.type = 'conversation'
+          AND r.container_id IS NOT NULL
           AND r.user_id = $1
           AND r.project_id IS NOT DISTINCT FROM $2
           AND r.mode IS NOT DISTINCT FROM $3
@@ -151,7 +242,115 @@ pub async fn promote_working_to_episodic(
               SELECT supersedes FROM raw_records
               WHERE supersedes IS NOT NULL AND user_id = $1
           )
-          AND (r.ttl IS NULL OR r.ttl > NOW())
+          AND NOT EXISTS (
+              SELECT 1 FROM curated_nodes n
+              WHERE n.kind = 'episodic'
+                AND n.user_id = $1
+                AND n.project_id IS NOT DISTINCT FROM $2
+                AND n.mode IS NOT DISTINCT FROM $3
+                AND n.meta->>'container_id' = r.container_id
+          )
+        ORDER BY r.container_id
+        LIMIT $4
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(curation_batch_cap())
+    .fetch_all(pool)
+    .await?;
+
+    for container_id in sessions {
+        let turns = sqlx::query_as::<_, PromotableRaw>(
+            r#"
+            SELECT r.id, r.content, r.event_time, r.importance, r.source, r.payload
+            FROM raw_records r
+            WHERE r.type = 'conversation'
+              AND r.user_id = $1
+              AND r.project_id IS NOT DISTINCT FROM $2
+              AND r.mode IS NOT DISTINCT FROM $3
+              AND r.container_id = $4
+              AND r.id NOT IN (
+                  SELECT supersedes FROM raw_records
+                  WHERE supersedes IS NOT NULL AND user_id = $1
+              )
+            ORDER BY r.event_time ASC, r.ingest_time ASC
+            "#,
+        )
+        .bind(&scope.user_id)
+        .bind(&scope.project_id)
+        .bind(&scope.mode)
+        .bind(&container_id)
+        .fetch_all(pool)
+        .await?;
+        if turns.is_empty() {
+            continue;
+        }
+
+        let content = render_transcript(&turns);
+        let title = derive_title(&turns);
+        let started = turns[0].event_time;
+        let ended = turns[turns.len() - 1].event_time;
+        // An episode inherits the weight of its most-weighted turn; a
+        // conversation matters as much as the most important thing said in it.
+        let importance = turns
+            .iter()
+            .filter_map(|t| t.importance)
+            .fold(None, |acc, i| Some(acc.map_or(i, |a: f32| a.max(i))));
+
+        let node_id = Uuid::new_v4();
+        insert_node(
+            pool,
+            node_id,
+            "episodic",
+            &content,
+            scope,
+            importance,
+            Some(started),
+        )
+        .await?;
+        set_node_meta(
+            pool,
+            node_id,
+            serde_json::json!({
+                "container_id": container_id,
+                "title": title,
+                "turns": turns.len(),
+                "started_at": started,
+                "ended_at": ended,
+            }),
+        )
+        .await?;
+        embed_node(pool, nlp, scope, node_id, &content).await;
+
+        // Lineage and entity index run per turn, so the glass-box view still
+        // resolves to the individual raw rows an episode was built from.
+        for t in &turns {
+            add_edge(pool, node_id, t.id, "derived_from").await?;
+            let entities = nlp.extract_entities(&t.content);
+            index_entities(pool, &scope.user_id, t.id, &entities).await?;
+            for entity in &entities {
+                add_entity_edge(pool, node_id, t.id, entity).await?;
+            }
+        }
+        stats.promoted += 1;
+    }
+
+    // --- standalone rows: documents, container-less turns -------------------
+    let solo = sqlx::query_as::<_, PromotableRaw>(
+        r#"
+        SELECT r.id, r.content, r.event_time, r.importance, r.source, r.payload
+        FROM raw_records r
+        WHERE r.type = ANY($5)
+          AND (r.type <> 'conversation' OR r.container_id IS NULL)
+          AND r.user_id = $1
+          AND r.project_id IS NOT DISTINCT FROM $2
+          AND r.mode IS NOT DISTINCT FROM $3
+          AND r.id NOT IN (
+              SELECT supersedes FROM raw_records
+              WHERE supersedes IS NOT NULL AND user_id = $1
+          )
           AND NOT EXISTS (
               SELECT 1 FROM curated_edges e
               JOIN curated_nodes n ON n.id = e.from_id
@@ -159,17 +358,17 @@ pub async fn promote_working_to_episodic(
           )
         ORDER BY r.event_time ASC
         LIMIT $4
-    "#;
-    let rows = sqlx::query_as::<_, WorkingRaw>(sql)
-        .bind(&scope.user_id)
-        .bind(&scope.project_id)
-        .bind(&scope.mode)
-        .bind(curation_batch_cap())
-        .fetch_all(pool)
-        .await?;
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(curation_batch_cap())
+    .bind(PROMOTABLE_TYPES.as_slice())
+    .fetch_all(pool)
+    .await?;
 
-    let mut stats = CurationStats::default();
-    for r in rows {
+    for r in solo {
         let node_id = Uuid::new_v4();
         insert_node(
             pool,
@@ -194,7 +393,20 @@ pub async fn promote_working_to_episodic(
         }
         stats.promoted += 1;
     }
+
     Ok(stats)
+}
+
+/// Attach derived identity (session, title, span) to a curated node. Curated
+/// rows are the pipeline's own, so a plain UPDATE is fine here — the append-only
+/// contract binds `raw_records`, not this table.
+async fn set_node_meta(pool: &PgPool, node_id: Uuid, meta: serde_json::Value) -> AppResult<()> {
+    sqlx::query("UPDATE curated_nodes SET meta = $2 WHERE id = $1")
+        .bind(node_id)
+        .bind(meta)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Insert (user_id, entity, record_id) rows into the HippoRAG pointer table.
@@ -454,7 +666,7 @@ pub async fn rebuild(
     let mut total = CurationStats::default();
     for (project_id, mode) in buckets {
         let scope = Scope::new(user_id).with_project(project_id).with_mode(mode);
-        let p = promote_working_to_episodic(pool, nlp, &scope).await?;
+        let p = promote_raw_to_episodic(pool, nlp, &scope).await?;
         let d = distill_semantic(pool, nlp, &scope).await?;
         // Build the RAPTOR summary tree over the level-0 nodes just derived for
         // this scope. Scope-bounded and rebuilt from scratch each pass, so the
@@ -841,9 +1053,10 @@ mod tests {
 
     // -- DB helpers --------------------------------------------------------
 
-    /// Insert a raw working record directly (bypassing the door — we don't need
-    /// the door here, and raw is append-only so a plain INSERT is fine).
-    async fn insert_working_raw(
+    /// Insert a standalone raw record directly (bypassing the door — we don't
+    /// need the door here, and raw is append-only so a plain INSERT is fine).
+    /// `document` is the one-record-one-episode shape.
+    async fn insert_document_raw(
         pool: &PgPool,
         user_id: &str,
         project_id: Option<&str>,
@@ -854,7 +1067,7 @@ mod tests {
         sqlx::query(
             r#"INSERT INTO raw_records
                (id, type, content, event_time, source, user_id, project_id, mode)
-               VALUES ($1, 'working', $2, NOW(), 'test', $3, $4, $5)"#,
+               VALUES ($1, 'document', $2, NOW(), 'test', $3, $4, $5)"#,
         )
         .bind(id)
         .bind(content)
@@ -865,6 +1078,45 @@ mod tests {
         .await
         .unwrap();
         id
+    }
+
+    /// One conversation turn. `offset_secs` orders turns inside a session so a
+    /// test can assert the transcript came out in the order it was said.
+    async fn insert_turn(
+        pool: &PgPool,
+        user_id: &str,
+        container_id: &str,
+        source: &str,
+        content: &str,
+        offset_secs: i64,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO raw_records
+               (id, type, content, event_time, source, user_id, container_id)
+               VALUES ($1, 'conversation', $2, NOW() + ($3 || ' seconds')::interval, $4, $5, $6)"#,
+        )
+        .bind(id)
+        .bind(content)
+        .bind(offset_secs.to_string())
+        .bind(source)
+        .bind(user_id)
+        .bind(container_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    async fn node_meta(pool: &PgPool, user_id: &str) -> serde_json::Value {
+        sqlx::query_scalar::<_, Option<serde_json::Value>>(
+            "SELECT meta FROM curated_nodes WHERE user_id = $1 AND kind = 'episodic' LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .unwrap_or(serde_json::Value::Null)
     }
 
     async fn count_nodes(pool: &PgPool, user_id: &str, kind: &str) -> i64 {
@@ -879,11 +1131,11 @@ mod tests {
     // -- promote -----------------------------------------------------------
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn promote_working_creates_one_episodic_with_edge(pool: PgPool) {
-        let raw_id = insert_working_raw(&pool, "alice", None, None, "took 5mg lisinopril").await;
+    async fn promote_document_creates_one_episodic_with_edge(pool: PgPool) {
+        let raw_id = insert_document_raw(&pool, "alice", None, None, "took 5mg lisinopril").await;
         let scope = Scope::new("alice");
 
-        let stats = promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        let stats = promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
         assert_eq!(stats.promoted, 1);
@@ -910,20 +1162,174 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn promote_is_idempotent(pool: PgPool) {
-        insert_working_raw(&pool, "alice", None, None, "took 5mg lisinopril").await;
+        insert_document_raw(&pool, "alice", None, None, "took 5mg lisinopril").await;
         let scope = Scope::new("alice");
 
-        let first = promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        let first = promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
         assert_eq!(first.promoted, 1);
 
         // Re-run: the derived_from edge already exists → nothing new.
-        let second = promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        let second = promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
         assert_eq!(second.promoted, 0);
         assert_eq!(count_nodes(&pool, "alice", "episodic").await, 1);
+    }
+
+    /// The unit of an episode is the conversation, not the turn: four turns in
+    /// one session collapse to a single node, not four.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_conversation_becomes_one_episode_not_one_per_turn(pool: PgPool) {
+        let a = insert_turn(
+            &pool,
+            "alice",
+            "conv-1",
+            "host:helper:user",
+            "what's due friday",
+            0,
+        )
+        .await;
+        let b = insert_turn(
+            &pool,
+            "alice",
+            "conv-1",
+            "host:helper:assistant",
+            "the quarterly report",
+            1,
+        )
+        .await;
+        let c = insert_turn(
+            &pool,
+            "alice",
+            "conv-1",
+            "host:helper:user",
+            "and after that",
+            2,
+        )
+        .await;
+        let d = insert_turn(
+            &pool,
+            "alice",
+            "conv-1",
+            "host:helper:assistant",
+            "the tax filing",
+            3,
+        )
+        .await;
+
+        let scope = Scope::new("alice");
+        let stats = promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.promoted, 1);
+        assert_eq!(count_nodes(&pool, "alice", "episodic").await, 1);
+
+        // Lineage still resolves to every individual turn.
+        let edges: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_edges WHERE kind = 'derived_from' AND to_id = ANY($1)",
+        )
+        .bind(vec![a, b, c, d].as_slice())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(edges, 4);
+
+        let meta = node_meta(&pool, "alice").await;
+        assert_eq!(meta["container_id"], "conv-1");
+        assert_eq!(meta["turns"], 4);
+        assert_eq!(meta["title"], "what's due friday");
+
+        // The transcript is ordered and speaker-labelled from the turns' own text.
+        let content: String = sqlx::query_scalar(
+            "SELECT content FROM curated_nodes WHERE user_id = 'alice' AND kind = 'episodic'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(content.starts_with("user: what's due friday"));
+        assert!(content.contains("assistant: the quarterly report"));
+        assert!(content.find("and after that").unwrap() < content.find("the tax filing").unwrap());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn separate_sessions_stay_separate_episodes(pool: PgPool) {
+        insert_turn(&pool, "alice", "conv-1", "chatgpt", "about the kernel", 0).await;
+        insert_turn(&pool, "alice", "conv-2", "chatgpt", "about the taxes", 0).await;
+
+        let scope = Scope::new("alice");
+        let stats = promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.promoted, 2);
+        assert_eq!(count_nodes(&pool, "alice", "episodic").await, 2);
+    }
+
+    /// Re-running promotion must not mint a second episode for a session that
+    /// already has one — the session, not the turn, is the idempotency key.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn conversation_promotion_is_idempotent_per_session(pool: PgPool) {
+        insert_turn(&pool, "alice", "conv-1", "host:helper:user", "first", 0).await;
+        insert_turn(
+            &pool,
+            "alice",
+            "conv-1",
+            "host:helper:assistant",
+            "second",
+            1,
+        )
+        .await;
+        let scope = Scope::new("alice");
+
+        promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
+            .await
+            .unwrap();
+        let again = promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
+            .await
+            .unwrap();
+
+        assert_eq!(again.promoted, 0);
+        assert_eq!(count_nodes(&pool, "alice", "episodic").await, 1);
+    }
+
+    /// An import that carried the conversation's own title uses it rather than
+    /// falling back to the opening line.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn imported_title_wins_over_the_opening_turn(pool: PgPool) {
+        sqlx::query(
+            r#"INSERT INTO raw_records
+               (id, type, content, event_time, source, user_id, container_id, payload)
+               VALUES ($1,'conversation','hey can you help',NOW(),'chatgpt','alice','conv-9',$2)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(serde_json::json!({ "conversation_title": "FPE export planning" }))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        promote_raw_to_episodic(&pool, &DistillingNlp, &Scope::new("alice"))
+            .await
+            .unwrap();
+        assert_eq!(
+            node_meta(&pool, "alice").await["title"],
+            "FPE export planning"
+        );
+    }
+
+    #[test]
+    fn transcript_and_title_are_extractive_and_bounded() {
+        let long = "x".repeat(TITLE_BUDGET + 40);
+        assert_eq!(
+            truncate_chars(&long, TITLE_BUDGET).chars().count(),
+            TITLE_BUDGET + 1 // + the ellipsis
+        );
+        // Multi-byte input must not panic or split a character.
+        assert_eq!(truncate_chars("héllo wörld", 4), "héll…");
+        assert_eq!(speaker_of("host:agent-alpha:user"), "user");
+        assert_eq!(speaker_of("chatgpt"), "chatgpt");
     }
 
     #[test]
@@ -957,7 +1363,7 @@ mod tests {
     async fn distill_entity_overlap_makes_one_semantic_with_all_sources(pool: PgPool) {
         // Two working records that extract the same entity set ({deploy target,
         // pgvector service}) → jaccard 1.0 → one cluster.
-        let r1 = insert_working_raw(
+        let r1 = insert_document_raw(
             &pool,
             "alice",
             None,
@@ -965,7 +1371,7 @@ mod tests {
             "the deploy target for the pgvector service is staging",
         )
         .await;
-        let r2 = insert_working_raw(
+        let r2 = insert_document_raw(
             &pool,
             "alice",
             None,
@@ -975,7 +1381,7 @@ mod tests {
         .await;
         let scope = Scope::new("alice");
 
-        promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
         let stats = distill_semantic(&pool, &DistillingNlp, &scope)
@@ -1007,11 +1413,11 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn distill_skips_gracefully_without_capability(pool: PgPool) {
-        insert_working_raw(&pool, "alice", None, None, "the deploy target is staging").await;
-        insert_working_raw(&pool, "alice", None, None, "switched the deploy target now").await;
+        insert_document_raw(&pool, "alice", None, None, "the deploy target is staging").await;
+        insert_document_raw(&pool, "alice", None, None, "switched the deploy target now").await;
         let scope = Scope::new("alice");
 
-        promote_working_to_episodic(&pool, &HeuristicNlp, &scope)
+        promote_raw_to_episodic(&pool, &HeuristicNlp, &scope)
             .await
             .unwrap();
         let stats = distill_semantic(&pool, &HeuristicNlp, &scope)
@@ -1027,7 +1433,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn rebuild_reproduces_the_same_derived_set(pool: PgPool) {
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1035,7 +1441,7 @@ mod tests {
             "the deploy target for the pgvector service is staging",
         )
         .await;
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1063,9 +1469,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn curation_never_mutates_raw(pool: PgPool) {
-        let raw_id = insert_working_raw(&pool, "alice", None, None, "took 5mg lisinopril").await;
+        let raw_id = insert_document_raw(&pool, "alice", None, None, "took 5mg lisinopril").await;
         let scope = Scope::new("alice");
-        promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
         distill_semantic(&pool, &DistillingNlp, &scope)
@@ -1090,12 +1496,12 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn curation_is_scope_isolated_by_user(pool: PgPool) {
-        insert_working_raw(&pool, "alice", None, None, "alice deploy target staging").await;
-        insert_working_raw(&pool, "bob", None, None, "bob deploy target staging").await;
+        insert_document_raw(&pool, "alice", None, None, "alice deploy target staging").await;
+        insert_document_raw(&pool, "bob", None, None, "bob deploy target staging").await;
 
         // Curate only alice.
         let scope = Scope::new("alice");
-        promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
 
@@ -1113,7 +1519,7 @@ mod tests {
         // Two records with an IDENTICAL entity set (jaccard 1.0) that would
         // cluster into one semantic fact — except they live in different modes.
         // Curation is scoped per (user, project, mode), so they must NOT merge.
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1121,7 +1527,7 @@ mod tests {
             "the deploy target for the pgvector service is staging",
         )
         .await;
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1168,7 +1574,7 @@ mod tests {
         // Control for the boundary test: the SAME two records in the SAME mode
         // DO cluster into one semantic fact — proving the boundary above is the
         // mode split, not something else blocking the merge.
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1176,7 +1582,7 @@ mod tests {
             "the deploy target for the pgvector service is staging",
         )
         .await;
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1200,7 +1606,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn promote_populates_entity_index_and_entity_edges(pool: PgPool) {
-        let raw_id = insert_working_raw(
+        let raw_id = insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1209,7 +1615,7 @@ mod tests {
         )
         .await;
         let scope = Scope::new("alice");
-        promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
 
@@ -1251,7 +1657,7 @@ mod tests {
     async fn distill_clusters_using_the_entity_index(pool: PgPool) {
         // Two records with identical entity sets → jaccard 1.0 → one cluster.
         // Promotion fills the index; distill must read it (no on-the-fly needed).
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1259,7 +1665,7 @@ mod tests {
             "the deploy target for the pgvector service is staging",
         )
         .await;
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1268,7 +1674,7 @@ mod tests {
         )
         .await;
         let scope = Scope::new("alice");
-        promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
         assert!(count_entity_index(&pool, "alice").await > 0);
@@ -1331,7 +1737,7 @@ mod tests {
         // Promote via a path that leaves entity_index empty (insert episodic
         // nodes directly, bypassing promote's indexing), then distill — the
         // fallback on-the-fly extraction must still cluster the two records.
-        let r1 = insert_working_raw(
+        let r1 = insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1339,7 +1745,7 @@ mod tests {
             "the deploy target for the pgvector service is staging",
         )
         .await;
-        let r2 = insert_working_raw(
+        let r2 = insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1381,7 +1787,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn rebuild_repopulates_entity_index_deterministically(pool: PgPool) {
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1389,7 +1795,7 @@ mod tests {
             "the deploy target for the pgvector service is staging",
         )
         .await;
-        insert_working_raw(
+        insert_document_raw(
             &pool,
             "alice",
             None,
@@ -1410,9 +1816,9 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn derivations_lists_curated_nodes_for_a_raw_id(pool: PgPool) {
-        let raw_id = insert_working_raw(&pool, "alice", None, None, "took 5mg lisinopril").await;
+        let raw_id = insert_document_raw(&pool, "alice", None, None, "took 5mg lisinopril").await;
         let scope = Scope::new("alice");
-        promote_working_to_episodic(&pool, &DistillingNlp, &scope)
+        promote_raw_to_episodic(&pool, &DistillingNlp, &scope)
             .await
             .unwrap();
 

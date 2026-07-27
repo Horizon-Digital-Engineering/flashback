@@ -310,6 +310,26 @@ type MemoryType = 'episodic' | 'semantic' | 'working' | 'document' | 'procedural
 type DecayClass = 'none' | 'slow' | 'medium' | 'fast';
 ```
 
+> **How this maps onto the built schema.** The single-table `MemoryType` above is
+> the design-level view. The implementation splits it across two layers, and the
+> vocabularies are *not* interchangeable:
+>
+> | Layer | Column | Values | Who sets it |
+> |---|---|---|---|
+> | raw | `raw_records.type` | `conversation`, `document`, `observation`, `state_object` | the writer |
+> | curated | `curated_nodes.kind` | `episodic`, `semantic`, `summary` | the curation pipeline |
+>
+> A raw type names **the kind of evidence**; a curated kind names **the tier it
+> was derived into**. A writer may only say what it observed — declaring
+> `episodic` on ingest is claiming an outcome that only curation can confer, and
+> the API rejects it. The raw type is also curation's dispatch key: two records
+> share a type exactly when the same derivation rule applies.
+>
+> One consequence worth stating plainly, because the tier names invite the wrong
+> intuition: **a conversation turn is not an episode.** The episode is the whole
+> conversation, so `conversation` rows group by `session_id` into one episodic
+> node per session.
+
 ### Entity Node (graph schema)
 
 ```typescript

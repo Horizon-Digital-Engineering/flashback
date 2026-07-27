@@ -548,18 +548,19 @@ pub(crate) async fn sync_store_inner(
         .into_iter()
         .map(|f| ImportRecord {
             // A fact carrying a payload is a structured slice (state_object);
-            // a bare fact is a distilled semantic record.
+            // a bare fact is text the store published, so it lands as a
+            // document — evidence arriving from outside, not a tier we derived.
             r#type: if f.payload.is_some() {
                 "state_object".to_string()
             } else {
-                "semantic".to_string()
+                "document".to_string()
             },
             content: f.fact,
             event_time: f.event_time,
             source: store.name.clone(),
             source_ref: Some(f.id.to_string()),
             project_id: None,
-            session_id: None,
+            container_id: None,
             mode: None,
             importance: None,
             payload: f.payload,
@@ -628,18 +629,16 @@ mod tests {
             &StubNlp,
             user_id,
             crate::routes::records::IngestRecordRequest {
-                r#type: "episodic".into(),
+                r#type: "document".into(),
                 content: content.into(),
                 event_time: None,
                 source: "test".into(),
                 source_ref: None,
                 project_id: None,
-                session_id: None,
+                container_id: None,
                 mode: None,
                 importance: None,
                 supersedes: None,
-                ttl_hours: None,
-                acl: None,
                 payload: None,
             },
         )
