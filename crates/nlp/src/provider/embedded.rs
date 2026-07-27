@@ -19,6 +19,7 @@
 
 use async_trait::async_trait;
 
+#[cfg(feature = "embedded-llm")]
 use super::prompt::{build_system_prompt, build_user_prompt};
 use super::{AiProvider, Capabilities, ExtractContext, Extraction, ProviderError};
 

@@ -34,7 +34,6 @@ pub struct Nlp {
     cache_dir: Option<std::path::PathBuf>,
     provider: Arc<dyn AiProvider>,
     fallback: FallbackPolicy,
-    provider_kind: ProviderKind,
     provider_name: &'static str,
 }
 
@@ -132,13 +131,8 @@ impl Nlp {
             cache_dir,
             provider,
             fallback: provider_cfg.fallback,
-            provider_kind: provider_cfg.kind,
             provider_name: name,
         })
-    }
-
-    pub fn embedder(&self) -> &Embedder {
-        &self.embedder
     }
 
     /// Embed `text` with the embedder a mode pins, returning `(dim, vector)`.
@@ -205,16 +199,8 @@ impl Nlp {
         Ok(entry.clone())
     }
 
-    pub fn provider_kind(&self) -> ProviderKind {
-        self.provider_kind
-    }
-
     pub fn provider_name(&self) -> &'static str {
         self.provider_name
-    }
-
-    pub fn provider(&self) -> &Arc<dyn AiProvider> {
-        &self.provider
     }
 
     /// True if the configured provider supports distill_facts (i.e. is an
