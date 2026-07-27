@@ -63,7 +63,7 @@ pub struct StateSetArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub importance: Option<f32>,
 }
@@ -103,7 +103,7 @@ pub struct RecordArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -119,7 +119,7 @@ pub struct RecallArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub container_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -271,7 +271,7 @@ impl Flashback {
         let body = json!({
             "data":       args.data,
             "project_id": args.project_id,
-            "session_id": args.session_id,
+            "container_id": args.container_id,
             "importance": args.importance,
         });
         let res = self.post(&path, &bearer, body).await?;
