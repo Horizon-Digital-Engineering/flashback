@@ -13,7 +13,8 @@ use reqwest::Client;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities,
+        ServerInfo,
     },
     schemars,
     service::RequestContext,
@@ -452,7 +453,7 @@ fn result_ok(value: Value) -> Result<CallToolResult, McpError> {
     // Serialize as text content for clients that only consume `content`.
     // Most up-to-date MCP clients ALSO read `structured_content` when present.
     let text = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
-    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.structured_content = Some(value);
     Ok(result)
 }
