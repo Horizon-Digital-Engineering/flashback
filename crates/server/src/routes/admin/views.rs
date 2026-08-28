@@ -946,7 +946,7 @@ pub fn curate_view(
 
     let content = format!(
         r#"<h1>Curate</h1>
-<p class="muted">Rebuild the curated layer from raw: promote important/accessed <code>working</code> records to <code>episodic</code>, then cluster episodic records by topic + entity overlap and distill them into <code>semantic</code> facts. Raw is never touched — curation only writes the <code>curated_*</code> tables.</p>
+<p class="muted">Run an incremental curation pass: promote new records to <code>episodic</code>, refresh grown conversations, cluster and distill the undistilled into <code>semantic</code> facts, and re-derive summaries when anything changed. Raw is never touched, and an unchanged store costs no model work. The destructive wipe-and-re-derive rebuild lives behind the API, not this button.</p>
 {distill_note}
 <div class="card" style="display:flex;gap:12px;align-items:center">
   <form method="post" action="/admin/api/curate" class="inline">
@@ -1860,7 +1860,7 @@ function renderTrace(t, retrievalMs) {{
     mem = '<ol style="padding-left:18px;margin:0">';
     for (const r of t.retrieved) {{
       mem += `<li style="margin-bottom:10px">
-        <div class="muted mono" style="font-size:11px">${{esc(r.type)}} · ${{esc(r.source)}}
+        <div class="muted mono" style="font-size:11px">${{r.sandbox ? 'sandbox' : 'real'}} · ${{esc(r.type)}} · ${{esc(r.source)}}
           · <time class="ts" datetime="${{esc(r.event_time)}}">${{esc(r.event_time)}}</time></div>
         <div style="white-space:pre-wrap;font-size:13px">${{esc(r.content.slice(0, 320))}}${{r.content.length > 320 ? '…' : ''}}</div>
       </li>`;

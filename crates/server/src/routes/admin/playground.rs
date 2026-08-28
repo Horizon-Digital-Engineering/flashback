@@ -112,6 +112,9 @@ pub struct RetrievedItem {
     pub content: String,
     pub event_time: String,
     pub container_id: Option<String>,
+    /// True when the record lives in the sandbox scope — the diagnostics tag
+    /// each memory so a mixed retrieval says which store it came from.
+    pub sandbox: bool,
 }
 
 impl From<&RawRecordRow> for RetrievedItem {
@@ -123,6 +126,7 @@ impl From<&RawRecordRow> for RetrievedItem {
             content: r.content.clone(),
             event_time: r.event_time.to_rfc3339(),
             container_id: r.container_id.clone(),
+            sandbox: r.project_id.as_deref() == Some(crate::routes::records::SANDBOX_PROJECT),
         }
     }
 }
@@ -552,6 +556,7 @@ mod tests {
             content: "  the quarterly report is due friday  ".into(),
             event_time: "2026-07-26T12:00:00+00:00".into(),
             container_id: Some("conv-9".into()),
+            sandbox: false,
         }];
         let block = render_context_block(&items);
         assert!(block.contains("[1] (conversation, host:helper:user, 2026-07-26T12:00:00+00:00)"));
