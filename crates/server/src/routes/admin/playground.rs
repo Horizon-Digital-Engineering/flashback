@@ -163,6 +163,8 @@ pub struct TraceEvent {
     /// system provider rather than set in the sandbox.
     pub model: Option<String>,
     pub model_inherited: bool,
+    /// The synthesis-first feed the assembly served: facts and summaries.
+    pub synthesis: Vec<crate::routes::records::SynthesisItem>,
     /// Set when no model will run (not configured); the stream ends after this.
     pub llm_error: Option<String>,
 }
@@ -398,6 +400,7 @@ async fn run_turn(
         }
     };
     let retrieved: Vec<RetrievedItem> = assembled.records.iter().map(RetrievedItem::from).collect();
+    let synthesis = assembled.synthesis.clone();
 
     // 2) The prompt a host would send.
     let mut prompt = vec![PromptMessage {
@@ -410,6 +413,19 @@ async fn run_turn(
             .unwrap_or(DEFAULT_SYSTEM_PROMPT)
             .to_string(),
     }];
+    if !synthesis.is_empty() {
+        let mut block = String::from(
+            "Distilled knowledge from persistent memory (newest evidence first; \
+             each entry is a synthesized fact or summary):\n\n",
+        );
+        for item in &synthesis {
+            block.push_str(&format!("- [{}] {}\n", item.kind, item.content.trim()));
+        }
+        prompt.push(PromptMessage {
+            role: "system".into(),
+            content: block,
+        });
+    }
     if !retrieved.is_empty() {
         prompt.push(PromptMessage {
             role: "system".into(),
@@ -488,6 +504,7 @@ async fn run_turn(
         warning: assembled.warning,
         model: llm_cfg.as_ref().map(|c| c.model.clone()),
         model_inherited: inherited,
+        synthesis,
         llm_error: llm_cfg.is_none().then(|| {
             "No model configured — set a base URL and model in the playground \
              settings, or configure the system provider on the Settings page \

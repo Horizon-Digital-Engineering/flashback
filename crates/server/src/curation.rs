@@ -54,7 +54,29 @@ use crate::error::AppResult;
 use crate::nlp::NlpService;
 
 /// Jaccard threshold for merging two episodic nodes into one semantic cluster.
+/// Only the FALLBACK signal now — used when a node has no stored embedding.
 const CLUSTER_JACCARD: f32 = 0.4;
+
+/// Cosine-to-centroid threshold for embedding clustering. The primary signal:
+/// meaning, not shared entity strings, is what makes two episodes one topic.
+pub(crate) const CLUSTER_COSINE: f32 = 0.60;
+
+/// Ceiling on episodes per cluster. Bounds the distill prompt (episode content
+/// is transcript-budgeted, so prompt size is at most cap x budget) and stops a
+/// hub topic from dragging half the corpus into one call.
+pub(crate) const CLUSTER_MAX: usize = 12;
+
+/// Already-distilled episodes carried into clustering as CONTEXT, newest
+/// first. A new episode on an old topic clusters with the evidence that
+/// produced the existing fact, so the refreshed fact is distilled with full
+/// context instead of in a vacuum — and can then supersede its predecessor.
+const DISTILL_CONTEXT: i64 = 200;
+
+/// Cosine floor for one semantic fact superseding another. Deliberately
+/// conservative: only a near-same-topic newer fact closes an older one's
+/// validity window (the filters everywhere already exclude superseded nodes).
+/// Too low retires unrelated facts; too high never fires.
+const SUPERSEDE_COSINE: f64 = 0.85;
 
 /// Upper bound on how many raw/episodic rows a single curation pass pulls into
 /// memory (and, for distillation, feeds the O(n²) entity clusterer). Promotion
@@ -77,6 +99,10 @@ pub struct CurationStats {
     pub refreshed: i64,
     pub distilled: i64,
     pub clusters_seen: i64,
+    /// Older facts whose validity window a newer fact closed this pass.
+    pub superseded: i64,
+    /// Clusters whose distill call failed twice this pass — retried next pass.
+    pub clusters_failed: i64,
     pub skipped_distill: bool,
     /// Summary nodes built across all RAPTOR levels.
     pub summarized: i64,
@@ -596,6 +622,12 @@ struct EpisodeNode {
     source_raw_ids: Vec<Uuid>,
     content: String,
     entities: Vec<String>,
+    /// The node's stored embedding in the scope's geometry, L2-normalized.
+    /// Missing (embed failed at write time) falls back to entity overlap.
+    embedding: Option<Vec<f32>>,
+    /// True when this episode is context (already distilled): it can anchor a
+    /// cluster but never triggers one, is never re-marked, never bumped.
+    already_distilled: bool,
     /// When the episode started / ended. Equal for a single-record episode.
     started: Option<DateTime<Utc>>,
     ended: Option<DateTime<Utc>>,
@@ -675,12 +707,57 @@ pub async fn distill_semantic(
     .bind(curation_batch_cap())
     .fetch_all(pool)
     .await?;
+    if node_rows.is_empty() {
+        return Ok(stats);
+    }
+
+    // Already-distilled episodes ride along as CONTEXT (newest first, capped):
+    // a new episode on an old topic clusters with the evidence behind the
+    // existing fact, so its fact is distilled with history instead of in a
+    // vacuum — and the supersede pass below can then retire the predecessor.
+    let context_rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<DateTime<Utc>>,
+            Option<serde_json::Value>,
+        ),
+    >(
+        r#"
+        SELECT n.id, n.content, n.event_time, n.meta
+        FROM curated_nodes n
+        WHERE n.kind = 'episodic'
+          AND n.user_id = $1
+          AND n.project_id IS NOT DISTINCT FROM $2
+          AND n.mode IS NOT DISTINCT FROM $3
+          AND (n.meta->>'distilled_at') IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM curated_edges s
+              WHERE s.to_id = n.id AND s.kind = 'supersedes'
+          )
+        ORDER BY n.event_time DESC NULLS LAST, n.id ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(DISTILL_CONTEXT)
+    .fetch_all(pool)
+    .await?;
+
+    let node_rows: Vec<_> = node_rows
+        .into_iter()
+        .map(|r| (r, false))
+        .chain(context_rows.into_iter().map(|r| (r, true)))
+        .collect();
     if node_rows.len() < 2 {
         return Ok(stats);
     }
 
     // Lineage for the batch in one query: every raw id each node derives from.
-    let node_ids: Vec<Uuid> = node_rows.iter().map(|(id, ..)| *id).collect();
+    let node_ids: Vec<Uuid> = node_rows.iter().map(|((id, ..), _)| *id).collect();
     let edge_rows = sqlx::query_as::<_, (Uuid, Uuid)>(
         "SELECT from_id, to_id FROM curated_edges \
          WHERE kind = 'derived_from' AND from_id = ANY($1) \
@@ -701,8 +778,37 @@ pub async fn distill_semantic(
     // promoted before the index existed.
     let entities_by_raw = entities_for_scope(pool, scope).await?;
 
+    // The stored embeddings in this scope's geometry — the primary clustering
+    // signal. A node whose embed failed at write time simply has no row and
+    // clusters on the entity fallback.
+    let embedder_key = scope.embedder_key(pool).await;
+    let dim = flashback_nlp::model_for_key(&embedder_key)
+        .map(|(_, d)| d)
+        .unwrap_or(384);
+    let col = crate::routes::records::embedding_col_for_dim(dim);
+    let emb_sql = format!(
+        "SELECT node_id, {col} FROM curated_embeddings \
+         WHERE node_id = ANY($1) AND model = $2 AND {col} IS NOT NULL"
+    );
+    let emb_rows: Vec<(Uuid, pgvector::Vector)> = sqlx::query_as(sqlx::AssertSqlSafe(emb_sql))
+        .bind(&node_ids)
+        .bind(&embedder_key)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "curation: embedding fetch failed ({e}) — this pass clusters \
+                 on the entity fallback only"
+            );
+            Vec::new()
+        });
+    let mut emb_by_node: HashMap<Uuid, Vec<f32>> = emb_rows
+        .into_iter()
+        .map(|(id, v)| (id, v.to_vec()))
+        .collect();
+
     let mut episodes: Vec<EpisodeNode> = Vec::with_capacity(node_rows.len());
-    for (node_id, content, event_time, meta) in node_rows {
+    for ((node_id, content, event_time, meta), already_distilled) in node_rows {
         let source_raw_ids = raws_by_node.remove(&node_id).unwrap_or_default();
         if source_raw_ids.is_empty() {
             // An episode nothing points back at can't be cited; skip it.
@@ -729,6 +835,8 @@ pub async fn distill_semantic(
         let started = span("started_at").or(event_time);
         let ended = span("ended_at").or(started);
         episodes.push(EpisodeNode {
+            embedding: emb_by_node.remove(&node_id),
+            already_distilled,
             node_id,
             source_raw_ids,
             content,
@@ -742,7 +850,12 @@ pub async fn distill_semantic(
     }
 
     let clusters = cluster_by_entities(&episodes);
-    stats.clusters_seen = clusters.len() as i64;
+    // Only clusters that can actually distill count — context-only groups
+    // are not work.
+    stats.clusters_seen = clusters
+        .iter()
+        .filter(|c| c.iter().any(|&i| !episodes[i].already_distilled))
+        .count() as i64;
 
     // Singletons stay eligible (a future related episode can still pull them
     // into a cluster), but their attempt count is bumped so the batch ordering
@@ -753,7 +866,9 @@ pub async fn distill_semantic(
     let singleton_ids: Vec<Uuid> = clusters
         .iter()
         .filter(|c| c.len() < 2)
-        .flat_map(|c| c.iter().map(|&i| episodes[i].node_id))
+        .flat_map(|c| c.iter().map(|&i| &episodes[i]))
+        .filter(|e| !e.already_distilled)
+        .map(|e| e.node_id)
         .collect();
     if !singleton_ids.is_empty() {
         sqlx::query(
@@ -767,7 +882,10 @@ pub async fn distill_semantic(
         .await?;
     }
 
-    for cluster in clusters.iter().filter(|c| c.len() >= 2) {
+    for cluster in clusters
+        .iter()
+        .filter(|c| c.len() >= 2 && c.iter().any(|&i| !episodes[i].already_distilled))
+    {
         // One EpisodeRef per EPISODE — the transcript, the unioned entities,
         // and when it happened, so the distiller can weigh recency.
         let refs: Vec<EpisodeRef> = cluster
@@ -783,12 +901,19 @@ pub async fn distill_semantic(
 
         let facts = match nlp.distill_facts(&refs).await {
             Ok(f) => f,
-            Err(e) => {
-                // NOT marked as distilled — a failed cluster is retried on the
-                // next pass instead of silently never producing facts.
-                tracing::warn!("curation: distillation failed on cluster: {e}");
-                continue;
-            }
+            Err(first) => match nlp.distill_facts(&refs).await {
+                Ok(f) => f,
+                Err(e) => {
+                    // NOT marked as distilled — a failed cluster is retried
+                    // next pass, and the failure is a counted stat, not a
+                    // silently dropped topic.
+                    stats.clusters_failed += 1;
+                    tracing::warn!(
+                        "curation: distillation failed on cluster twice ({first}; then {e})"
+                    );
+                    continue;
+                }
+            },
         };
 
         // The provider answered, so this cluster is consumed — including a
@@ -797,7 +922,11 @@ pub async fn distill_semantic(
         // episode forever; a session that later grows has its meta rewritten,
         // which clears it. Singletons never reach here and stay eligible, so a
         // future related episode can still pull them into a cluster.
-        let cluster_node_ids: Vec<Uuid> = cluster.iter().map(|&i| episodes[i].node_id).collect();
+        let cluster_node_ids: Vec<Uuid> = cluster
+            .iter()
+            .filter(|&&i| !episodes[i].already_distilled)
+            .map(|&i| episodes[i].node_id)
+            .collect();
         sqlx::query(
             "UPDATE curated_nodes \
              SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('distilled_at', NOW()) \
@@ -858,7 +987,16 @@ pub async fn distill_semantic(
             for ep in &evidence {
                 add_edge(pool, node_id, ep.node_id, "distilled_from").await?;
             }
-            embed_node(pool, nlp, scope, node_id, &fact.content).await;
+            let fact_emb = embed_node(pool, nlp, scope, node_id, &fact.content).await;
+            // Temporal invalidation: the newer fact closes the validity window
+            // of any near-same-topic older fact. A closed window, never a
+            // delete — every filter already excludes superseded nodes, and a
+            // rebuild reproduces the same closures from raw.
+            if let (Some(t), Some((fdim, femb))) = (fact_time, fact_emb.as_ref()) {
+                stats.superseded +=
+                    supersede_older_facts(pool, scope, &embedder_key, node_id, t, *fdim, femb)
+                        .await?;
+            }
             stats.distilled += 1;
         }
     }
@@ -972,6 +1110,8 @@ async fn curate_inner(
         total.refreshed += p.refreshed;
         total.distilled += d.distilled;
         total.clusters_seen += d.clusters_seen;
+        total.clusters_failed += d.clusters_failed;
+        total.superseded += d.superseded;
         total.skipped_distill = total.skipped_distill || d.skipped_distill;
         total.summarized += s.summaries;
         total.max_level = total.max_level.max(s.max_level);
@@ -1136,6 +1276,59 @@ async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64
     Ok((sessions, solos))
 }
 
+/// Write `supersedes` edges from a newly distilled fact to every ACTIVE
+/// semantic fact in scope whose embedding sits within `SUPERSEDE_COSINE` and
+/// whose evidence is STRICTLY older — same-evidence siblings from one pass
+/// never retire each other. An UNDATED old fact counts as older (retirable):
+/// a fact that cannot prove its evidence is newer yields to one that can.
+/// Deliberately forward-only: closure happens when the newer fact distills.
+/// Backfilled history distilled after a newer fact does NOT retroactively
+/// retire it, and same-time facts coexist — the reconciliation pass owns the
+/// bidirectional case; this hook handles the live-forward one. Returns how
+/// many windows closed.
+async fn supersede_older_facts(
+    pool: &PgPool,
+    scope: &Scope,
+    embedder_key: &str,
+    new_id: Uuid,
+    new_time: DateTime<Utc>,
+    dim: usize,
+    emb: &[f32],
+) -> AppResult<i64> {
+    let col = crate::routes::records::embedding_col_for_dim(dim);
+    let sql = format!(
+        "INSERT INTO curated_edges (from_id, to_id, kind) \
+         SELECT $1, n.id, 'supersedes' \
+         FROM curated_nodes n \
+         JOIN curated_embeddings ce \
+           ON ce.node_id = n.id AND ce.model = $8 AND ce.{col} IS NOT NULL \
+         WHERE n.kind = 'semantic' \
+           AND n.user_id = $2 \
+           AND n.project_id IS NOT DISTINCT FROM $3 \
+           AND n.mode IS NOT DISTINCT FROM $4 \
+           AND n.id <> $1 \
+           AND (n.event_time IS NULL OR n.event_time < $5) \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM curated_edges s \
+               WHERE s.to_id = n.id AND s.kind = 'supersedes' \
+           ) \
+           AND 1 - (ce.{col} <=> $6) >= $7 \
+         ON CONFLICT (from_id, to_id, kind) DO NOTHING"
+    );
+    let res = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(new_id)
+        .bind(&scope.user_id)
+        .bind(&scope.project_id)
+        .bind(&scope.mode)
+        .bind(new_time)
+        .bind(Vector::from(emb.to_vec()))
+        .bind(SUPERSEDE_COSINE)
+        .bind(embedder_key)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() as i64)
+}
+
 // ---------------------------------------------------------------------------
 // rebuild
 // ---------------------------------------------------------------------------
@@ -1220,8 +1413,11 @@ async fn rebuild_inner(
         // tree is reproducible.
         let s = crate::summaries::build_summaries(pool, nlp, &scope).await?;
         total.promoted += p.promoted;
+        total.refreshed += p.refreshed;
         total.distilled += d.distilled;
         total.clusters_seen += d.clusters_seen;
+        total.clusters_failed += d.clusters_failed;
+        total.superseded += d.superseded;
         total.skipped_distill = total.skipped_distill || d.skipped_distill;
         total.summarized += s.summaries;
         total.max_level = total.max_level.max(s.max_level);
@@ -1405,60 +1601,133 @@ pub(crate) mod edges {
         scope: &Scope,
         node_id: Uuid,
         content: &str,
-    ) {
+    ) -> Option<(usize, Vec<f32>)> {
         let embedder_key = scope.embedder_key(pool).await;
-        if let Ok((dim, embedding)) = nlp.embed_for_mode(&embedder_key, content).await {
-            let col = crate::routes::records::embedding_col_for_dim(dim);
-            let sql = format!(
-                "INSERT INTO curated_embeddings (node_id, model, {col}) VALUES ($1, $2, $3) \
-                 ON CONFLICT (node_id, model) DO NOTHING"
-            );
-            // col is a trusted constant from embedding_col_for_dim; values bound.
-            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(node_id)
-                .bind(&embedder_key)
-                .bind(Vector::from(embedding))
-                .execute(pool)
-                .await;
+        match nlp.embed_for_mode(&embedder_key, content).await {
+            Ok((dim, embedding)) => {
+                let col = crate::routes::records::embedding_col_for_dim(dim);
+                let sql = format!(
+                    "INSERT INTO curated_embeddings (node_id, model, {col}) VALUES ($1, $2, $3) \
+                     ON CONFLICT (node_id, model) DO NOTHING"
+                );
+                // col is a trusted constant from embedding_col_for_dim; values bound.
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(node_id)
+                    .bind(&embedder_key)
+                    .bind(Vector::from(embedding.clone()))
+                    .execute(pool)
+                    .await;
+                Some((dim, embedding))
+            }
+            Err(_) => None,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Entity-overlap clustering. Greedy single-link on entity Jaccard over
-// raw-derived entities. Returns clusters as index groups into `episodes`.
+// Clustering: embedding-centroid first, entity overlap as the fallback.
+//
+// The retired greedy single-link entity-Jaccard had two failure modes this
+// exists to kill: transitive CHAINING (a~b, b~c merged a and c even when they
+// shared nothing) and the lexical miss (same topic, different words, zero
+// shared entities — the exact case embeddings are stored for). Assignment is
+// against a cluster's CENTROID, so drift is bounded and chains cannot form;
+// the size cap bounds the distill prompt and stops hub topics swallowing the
+// batch. Deterministic for a given input order.
 // ---------------------------------------------------------------------------
 
-fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
-    let entity_sets: Vec<&[String]> = episodes.iter().map(|e| e.entities.as_slice()).collect();
-    cluster_indices_by_jaccard(&entity_sets, CLUSTER_JACCARD)
+pub(crate) fn l2_normalize(v: &[f32]) -> Option<Vec<f32>> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    (norm > 0.0).then(|| v.iter().map(|x| x / norm).collect())
 }
 
-/// Greedy single-link clustering over index `i` with entity sets `sets[i]`,
-/// merging any pair whose Jaccard ≥ `threshold`. Returns index groups. Shared
-/// with the summaries module so higher RAPTOR levels cluster the same way.
-pub(crate) fn cluster_indices_by_jaccard(sets: &[&[String]], threshold: f32) -> Vec<Vec<usize>> {
-    let mut assigned = vec![false; sets.len()];
-    let mut clusters: Vec<Vec<usize>> = Vec::new();
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
 
-    for i in 0..sets.len() {
-        if assigned[i] {
-            continue;
-        }
-        let mut group = vec![i];
-        assigned[i] = true;
-        for (j, assigned_j) in assigned.iter_mut().enumerate().skip(i + 1) {
-            if *assigned_j {
+struct Cluster {
+    members: Vec<usize>,
+    /// Running mean of the EMBEDDED members' normalized embeddings; None
+    /// until one joins. Renormalized at comparison time.
+    centroid: Option<Vec<f32>>,
+    /// How many members contributed to the centroid — the mean's denominator.
+    embedded: usize,
+    /// The seed member's index — the entity-fallback comparison surface.
+    seed: usize,
+}
+
+/// Cluster items by cosine-to-centroid over normalized `embeddings`, falling
+/// back to entity Jaccard against the cluster seed when either side has no
+/// embedding. Returns index groups, each at most `max_size` long.
+pub(crate) fn cluster_for_distill(
+    embeddings: &[Option<Vec<f32>>],
+    entity_sets: &[&[String]],
+    cosine_threshold: f32,
+    jaccard_threshold: f32,
+    max_size: usize,
+) -> Vec<Vec<usize>> {
+    let mut clusters: Vec<Cluster> = Vec::new();
+    for i in 0..entity_sets.len() {
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, c) in clusters.iter().enumerate() {
+            if c.members.len() >= max_size {
                 continue;
             }
-            if jaccard(sets[i], sets[j]) >= threshold {
-                group.push(j);
-                *assigned_j = true;
+            let score = match (&embeddings[i], &c.centroid) {
+                (Some(e), Some(cen)) => l2_normalize(cen)
+                    .map(|n| dot(e, &n))
+                    .filter(|cos| *cos >= cosine_threshold),
+                _ => Some(jaccard(entity_sets[i], entity_sets[c.seed]))
+                    .filter(|j| *j >= jaccard_threshold),
+            };
+            if let Some(sc) = score {
+                if best.is_none_or(|(_, b)| sc > b) {
+                    best = Some((ci, sc));
+                }
             }
         }
-        clusters.push(group);
+        match best {
+            Some((ci, _)) => {
+                let c = &mut clusters[ci];
+                if let Some(e) = &embeddings[i] {
+                    c.centroid = Some(match c.centroid.take() {
+                        Some(mut cen) => {
+                            let k = c.embedded as f32;
+                            for (m, x) in cen.iter_mut().zip(e) {
+                                *m = (*m * k + x) / (k + 1.0);
+                            }
+                            cen
+                        }
+                        None => e.clone(),
+                    });
+                    c.embedded += 1;
+                }
+                c.members.push(i);
+            }
+            None => clusters.push(Cluster {
+                embedded: usize::from(embeddings[i].is_some()),
+                members: vec![i],
+                centroid: embeddings[i].clone(),
+                seed: i,
+            }),
+        }
     }
-    clusters
+    clusters.into_iter().map(|c| c.members).collect()
+}
+
+fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
+    let embeddings: Vec<Option<Vec<f32>>> = episodes
+        .iter()
+        .map(|e| e.embedding.as_deref().and_then(l2_normalize))
+        .collect();
+    let entity_sets: Vec<&[String]> = episodes.iter().map(|e| e.entities.as_slice()).collect();
+    cluster_for_distill(
+        &embeddings,
+        &entity_sets,
+        CLUSTER_COSINE,
+        CLUSTER_JACCARD,
+        CLUSTER_MAX,
+    )
 }
 
 pub(crate) fn jaccard(a: &[String], b: &[String]) -> f32 {
@@ -1471,6 +1740,26 @@ pub(crate) fn jaccard(a: &[String], b: &[String]) -> f32 {
     } else {
         inter / union
     }
+}
+
+/// Test embedder: a hashed bag-of-words vector, so cosine reflects lexical
+/// overlap the way a real embedder's reflects semantic overlap. Same-topic
+/// test strings cluster; disjoint-topic strings don't — which is the geometry
+/// the clustering tests exist to exercise.
+#[cfg(test)]
+pub(crate) fn bow_embed(text: &str) -> Vec<f32> {
+    let mut v = vec![0.0_f32; 384];
+    for w in text.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
+        if w.len() < 3 {
+            continue;
+        }
+        let mut h = 5381_u32;
+        for b in w.bytes() {
+            h = h.wrapping_mul(33) ^ b as u32;
+        }
+        v[(h % 384) as usize] += 1.0;
+    }
+    v
 }
 
 #[cfg(test)]
@@ -1500,9 +1789,61 @@ mod tests {
             source_raw_ids: vec![Uuid::new_v4()],
             content: String::new(),
             entities: entities.iter().map(|s| s.to_string()).collect(),
+            embedding: None,
+            already_distilled: false,
             started: None,
             ended: None,
         }
+    }
+
+    fn nvec(v: &[f32]) -> Option<Vec<f32>> {
+        l2_normalize(v)
+    }
+
+    #[test]
+    fn centroid_clustering_kills_the_single_link_chain() {
+        // a~b and b~c, but a and c share nothing. Single-link merged all
+        // three; against the a+b centroid, c falls short and stays out.
+        let e: Vec<Option<Vec<f32>>> =
+            vec![nvec(&[1.0, 0.0]), nvec(&[0.8, 0.6]), nvec(&[0.0, 1.0])];
+        let ents: Vec<&[String]> = vec![&[], &[], &[]];
+        let clusters = cluster_for_distill(&e, &ents, 0.6, 0.4, 12);
+        assert!(clusters.iter().any(|c| c == &vec![0, 1]));
+        assert!(clusters.iter().any(|c| c == &vec![2]), "{clusters:?}");
+    }
+
+    #[test]
+    fn embeddings_cluster_what_entities_miss() {
+        // Same topic, zero shared entity strings — the lexical miss the old
+        // clusterer could never bridge. Embeddings carry it.
+        let e: Vec<Option<Vec<f32>>> = vec![nvec(&[0.9, 0.1]), nvec(&[0.85, 0.15])];
+        let a = ["knee".to_string()];
+        let b = ["joint pain".to_string()];
+        let ents: Vec<&[String]> = vec![&a, &b];
+        let clusters = cluster_for_distill(&e, &ents, 0.6, 0.4, 12);
+        assert_eq!(clusters, vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn cluster_size_cap_bounds_the_distill_prompt() {
+        let e: Vec<Option<Vec<f32>>> = (0..5).map(|_| nvec(&[1.0, 0.0])).collect();
+        let empty: [String; 0] = [];
+        let ents: Vec<&[String]> = (0..5).map(|_| empty.as_slice()).collect();
+        let clusters = cluster_for_distill(&e, &ents, 0.6, 0.4, 2);
+        assert!(clusters.iter().all(|c| c.len() <= 2), "{clusters:?}");
+        assert_eq!(clusters.iter().map(Vec::len).sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn missing_embeddings_fall_back_to_entity_overlap() {
+        let e: Vec<Option<Vec<f32>>> = vec![None, None, None];
+        let a = ["x".to_string(), "y".to_string()];
+        let b = ["x".to_string(), "y".to_string(), "z".to_string()];
+        let c = ["p".to_string()];
+        let ents: Vec<&[String]> = vec![&a, &b, &c];
+        let clusters = cluster_for_distill(&e, &ents, 0.6, 0.4, 12);
+        assert!(clusters.iter().any(|cl| cl == &vec![0, 1]));
+        assert!(clusters.iter().any(|cl| cl == &vec![2]));
     }
 
     #[test]
@@ -1538,11 +1879,11 @@ mod tests {
         fn embedder_dimension(&self) -> usize {
             384
         }
-        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
-            Ok(vec![0.1_f32; 384])
+        async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(bow_embed(text))
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+            Ok(texts.iter().map(|t| bow_embed(t)).collect())
         }
         fn extract_entities(&self, text: &str) -> Vec<String> {
             flashback_nlp::extract_entities(text)
@@ -1585,11 +1926,11 @@ mod tests {
         fn embedder_dimension(&self) -> usize {
             384
         }
-        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
-            Ok(vec![0.1_f32; 384])
+        async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(bow_embed(text))
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+            Ok(texts.iter().map(|t| bow_embed(t)).collect())
         }
         fn extract_entities(&self, text: &str) -> Vec<String> {
             flashback_nlp::extract_entities(text)
@@ -1629,11 +1970,11 @@ mod tests {
         fn embedder_dimension(&self) -> usize {
             384
         }
-        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
-            Ok(vec![0.1_f32; 384])
+        async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(bow_embed(text))
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+            Ok(texts.iter().map(|t| bow_embed(t)).collect())
         }
         fn extract_entities(&self, text: &str) -> Vec<String> {
             flashback_nlp::extract_entities(text)
@@ -1672,6 +2013,29 @@ mod tests {
         .bind(user_id)
         .bind(project_id)
         .bind(mode)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A standalone document dated `days_ago` in the past — for temporal tests.
+    async fn insert_document_raw_at(
+        pool: &PgPool,
+        user_id: &str,
+        content: &str,
+        days_ago: i64,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO raw_records
+               (id, type, content, event_time, source, user_id)
+               VALUES ($1, 'document', $2, NOW() - ($3 || ' days')::interval, 'test', $4)"#,
+        )
+        .bind(id)
+        .bind(content)
+        .bind(days_ago.to_string())
+        .bind(user_id)
         .execute(pool)
         .await
         .unwrap();
@@ -2348,6 +2712,160 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts, vec![2, 2], "each pass rotates the counter");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn new_evidence_joins_old_context_and_supersedes_the_stale_fact(pool: PgPool) {
+        let nlp = CapturingNlp::default();
+        // Two same-topic documents from ten days ago produce the first fact.
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "the deploy target for the pgvector service is staging",
+            10,
+        )
+        .await;
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "note: the deploy target for the pgvector service is staging",
+            10,
+        )
+        .await;
+        let first = curate(&pool, &nlp, "alice").await.unwrap();
+        assert_eq!(first.distilled, 1);
+        assert_eq!(first.superseded, 0);
+
+        // A single NEWER document on the same topic: it must cluster with the
+        // already-distilled context (a lone new episode used to wait forever),
+        // and its fact must close the old fact's validity window.
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "update: the deploy target for the pgvector service is production",
+            0,
+        )
+        .await;
+        let second = curate(&pool, &nlp, "alice").await.unwrap();
+        assert_eq!(
+            second.distilled, 1,
+            "one new episode + context must distill"
+        );
+        assert_eq!(second.superseded, 1, "the stale fact's window must close");
+
+        // The second distill call saw all three episodes, not the newcomer alone.
+        let seen = nlp.seen.lock().unwrap().len();
+        assert_eq!(seen, 2 + 3, "context episodes ride into the second cluster");
+
+        // Two facts exist; exactly one is still active, and it is the newer.
+        let (total, active): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), \
+                    COUNT(*) FILTER (WHERE NOT EXISTS ( \
+                        SELECT 1 FROM curated_edges s \
+                        WHERE s.to_id = curated_nodes.id AND s.kind = 'supersedes')) \
+             FROM curated_nodes WHERE kind = 'semantic' AND user_id = 'alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((total, active), (2, 1));
+
+        // Nothing left to do: a third pass is a no-op.
+        let third = curate(&pool, &nlp, "alice").await.unwrap();
+        assert_eq!(third.distilled, 0);
+        assert_eq!(third.superseded, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unrelated_newer_facts_do_not_retire_older_ones(pool: PgPool) {
+        // A stub whose fact text derives from the cluster, so facts about
+        // different topics are genuinely dissimilar — which is what makes the
+        // supersede cosine threshold testable in the refusing direction.
+        struct TopicFactNlp;
+        #[async_trait]
+        impl NlpService for TopicFactNlp {
+            fn provider_name(&self) -> &'static str {
+                "test-topic"
+            }
+            fn provider_can_distill(&self) -> bool {
+                true
+            }
+            fn embedder_model_name(&self) -> &str {
+                "test-embedder"
+            }
+            fn embedder_dimension(&self) -> usize {
+                384
+            }
+            async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+                Ok(bow_embed(text))
+            }
+            async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+                Ok(texts.iter().map(|t| bow_embed(t)).collect())
+            }
+            fn extract_entities(&self, text: &str) -> Vec<String> {
+                flashback_nlp::extract_entities(text)
+            }
+            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
+                Ok(Extraction::empty())
+            }
+            async fn distill_facts(
+                &self,
+                e: &[EpisodeRef],
+            ) -> Result<Vec<DistilledFact>, ProviderError> {
+                Ok(vec![DistilledFact {
+                    content: format!("summary: {}", e[0].content),
+                    topic: None,
+                    source_episode_ids: e.iter().map(|x| x.id).collect(),
+                    confidence: 0.9,
+                }])
+            }
+        }
+
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "the deploy target for the pgvector service is staging",
+            10,
+        )
+        .await;
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "note: the deploy target for the pgvector service is staging",
+            10,
+        )
+        .await;
+        let first = curate(&pool, &TopicFactNlp, "alice").await.unwrap();
+        assert_eq!(first.distilled, 1);
+
+        // A newer, UNRELATED topic must not close the deploy fact's window.
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "repotted the garden basil into fresh soil",
+            0,
+        )
+        .await;
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "note: repotted the garden basil with fresh soil",
+            0,
+        )
+        .await;
+        let second = curate(&pool, &TopicFactNlp, "alice").await.unwrap();
+        assert_eq!(second.distilled, 1);
+        assert_eq!(second.superseded, 0, "dissimilar facts must coexist");
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes n WHERE n.kind = 'semantic' \
+             AND n.user_id = 'alice' AND NOT EXISTS ( \
+                 SELECT 1 FROM curated_edges s \
+                 WHERE s.to_id = n.id AND s.kind = 'supersedes')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active, 2);
     }
 
     // -- rebuild -----------------------------------------------------------

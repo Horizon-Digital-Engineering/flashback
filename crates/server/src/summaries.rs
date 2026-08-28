@@ -15,7 +15,7 @@
 //! level 0, and produces the same shape.
 //!
 //! Clustering reuses the entity-Jaccard signal the level-0 distillation pass
-//! already uses (`curation::cluster_indices_by_jaccard`). Rationale:
+//! already uses (`curation::cluster_for_distill`). Rationale:
 //! it needs no extra embedding round-trips, behaves identically under the
 //! heuristic (no-LLM) provider, and keeps one clustering story across the whole
 //! curated layer. Entities for a summary node are the union of its children's
@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use flashback_nlp::EpisodeRef;
 
-use crate::curation::{cluster_indices_by_jaccard, edges, Scope};
+use crate::curation::{cluster_for_distill, edges, Scope};
 use crate::error::AppResult;
 use crate::nlp::NlpService;
 
@@ -84,6 +84,8 @@ struct LevelNode {
     content: String,
     importance: Option<f32>,
     entities: Vec<String>,
+    /// L2-normalized stored embedding in the scope's geometry, when present.
+    embedding: Option<Vec<f32>>,
 }
 
 /// Build the RAPTOR summary tree for a scope on top of its existing level-0
@@ -120,7 +122,14 @@ pub async fn build_summaries_with(
         }
 
         let entity_sets: Vec<&[String]> = nodes.iter().map(|n| n.entities.as_slice()).collect();
-        let clusters = cluster_indices_by_jaccard(&entity_sets, cfg.cluster_jaccard);
+        let embeddings: Vec<Option<Vec<f32>>> = nodes.iter().map(|n| n.embedding.clone()).collect();
+        let clusters = cluster_for_distill(
+            &embeddings,
+            &entity_sets,
+            crate::curation::CLUSTER_COSINE,
+            cfg.cluster_jaccard,
+            crate::curation::CLUSTER_MAX,
+        );
 
         // If clustering can't group anything (every node isolated), summarizing
         // one-node "clusters" would just copy content up forever. Stop.
@@ -194,11 +203,35 @@ async fn load_level(
     .fetch_all(pool)
     .await?;
 
+    // Stored embeddings for these nodes, in the scope's geometry — the
+    // primary clustering signal; entities remain the fallback.
+    let ids: Vec<Uuid> = rows.iter().map(|(id, ..)| *id).collect();
+    let embedder_key = scope.embedder_key(pool).await;
+    let dim = flashback_nlp::model_for_key(&embedder_key)
+        .map(|(_, d)| d)
+        .unwrap_or(384);
+    let col = crate::routes::records::embedding_col_for_dim(dim);
+    let emb_sql = format!(
+        "SELECT node_id, {col} FROM curated_embeddings \
+         WHERE node_id = ANY($1) AND model = $2 AND {col} IS NOT NULL"
+    );
+    let emb_rows: Vec<(Uuid, pgvector::Vector)> = sqlx::query_as(sqlx::AssertSqlSafe(emb_sql))
+        .bind(&ids)
+        .bind(&embedder_key)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    let mut emb: std::collections::HashMap<Uuid, Vec<f32>> = emb_rows
+        .into_iter()
+        .filter_map(|(id, v)| crate::curation::l2_normalize(&v.to_vec()).map(|n| (id, n)))
+        .collect();
+
     Ok(rows
         .into_iter()
         .map(|(id, content, importance)| {
             let entities = nlp.extract_entities(&content);
             LevelNode {
+                embedding: emb.remove(&id),
                 id,
                 content,
                 importance,
@@ -315,6 +348,7 @@ mod tests {
 
     fn node(content: &str, importance: Option<f32>) -> LevelNode {
         LevelNode {
+            embedding: None,
             id: Uuid::new_v4(),
             content: content.to_string(),
             importance,
@@ -375,11 +409,14 @@ mod tests {
         fn embedder_dimension(&self) -> usize {
             384
         }
-        async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
-            Ok(vec![0.1_f32; 384])
+        async fn embed_one(&self, t: &str) -> Result<Vec<f32>, AppError> {
+            Ok(crate::curation::bow_embed(t))
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+            Ok(texts
+                .iter()
+                .map(|t| crate::curation::bow_embed(t))
+                .collect())
         }
         fn extract_entities(&self, text: &str) -> Vec<String> {
             flashback_nlp::extract_entities(text)
@@ -422,11 +459,14 @@ mod tests {
         fn embedder_dimension(&self) -> usize {
             384
         }
-        async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
-            Ok(vec![0.1_f32; 384])
+        async fn embed_one(&self, t: &str) -> Result<Vec<f32>, AppError> {
+            Ok(crate::curation::bow_embed(t))
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+            Ok(texts
+                .iter()
+                .map(|t| crate::curation::bow_embed(t))
+                .collect())
         }
         fn extract_entities(&self, text: &str) -> Vec<String> {
             flashback_nlp::extract_entities(text)

@@ -7,6 +7,7 @@ mod db;
 mod decay;
 mod doctor;
 mod error;
+mod eval;
 mod modes;
 mod nlp;
 mod proposals;
@@ -82,13 +83,14 @@ async fn main() -> Result<()> {
         Some("migrate") => run_migrate().await,
         Some("doctor") => doctor::run().await,
         Some("token") => run_token(rest).await,
+        Some("eval") => eval::run(rest).await,
         Some("serve") | None => run_serve().await,
         Some("version") | Some("--version") | Some("-V") => {
             println!("{}", build_info::summary());
             Ok(())
         }
         Some(other) => Err(anyhow!(
-            "Unknown subcommand: {other}. Try: serve | migrate | doctor | version | token mint|list|revoke"
+            "Unknown subcommand: {other}. Try: serve | migrate | doctor | version | eval | token mint|list|revoke"
         )),
     }
 }
