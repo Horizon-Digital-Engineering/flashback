@@ -54,7 +54,17 @@ use crate::error::AppResult;
 use crate::nlp::NlpService;
 
 /// Jaccard threshold for merging two episodic nodes into one semantic cluster.
+/// Only the FALLBACK signal now — used when a node has no stored embedding.
 const CLUSTER_JACCARD: f32 = 0.4;
+
+/// Cosine-to-centroid threshold for embedding clustering. The primary signal:
+/// meaning, not shared entity strings, is what makes two episodes one topic.
+pub(crate) const CLUSTER_COSINE: f32 = 0.60;
+
+/// Ceiling on episodes per cluster. Bounds the distill prompt (episode content
+/// is transcript-budgeted, so prompt size is at most cap x budget) and stops a
+/// hub topic from dragging half the corpus into one call.
+pub(crate) const CLUSTER_MAX: usize = 12;
 
 /// Upper bound on how many raw/episodic rows a single curation pass pulls into
 /// memory (and, for distillation, feeds the O(n²) entity clusterer). Promotion
@@ -77,6 +87,8 @@ pub struct CurationStats {
     pub refreshed: i64,
     pub distilled: i64,
     pub clusters_seen: i64,
+    /// Clusters whose distill call failed twice this pass — retried next pass.
+    pub clusters_failed: i64,
     pub skipped_distill: bool,
     /// Summary nodes built across all RAPTOR levels.
     pub summarized: i64,
@@ -596,6 +608,9 @@ struct EpisodeNode {
     source_raw_ids: Vec<Uuid>,
     content: String,
     entities: Vec<String>,
+    /// The node's stored embedding in the scope's geometry, L2-normalized.
+    /// Missing (embed failed at write time) falls back to entity overlap.
+    embedding: Option<Vec<f32>>,
     /// When the episode started / ended. Equal for a single-record episode.
     started: Option<DateTime<Utc>>,
     ended: Option<DateTime<Utc>>,
@@ -701,6 +716,29 @@ pub async fn distill_semantic(
     // promoted before the index existed.
     let entities_by_raw = entities_for_scope(pool, scope).await?;
 
+    // The stored embeddings in this scope's geometry — the primary clustering
+    // signal. A node whose embed failed at write time simply has no row and
+    // clusters on the entity fallback.
+    let embedder_key = scope.embedder_key(pool).await;
+    let dim = flashback_nlp::model_for_key(&embedder_key)
+        .map(|(_, d)| d)
+        .unwrap_or(384);
+    let col = crate::routes::records::embedding_col_for_dim(dim);
+    let emb_sql = format!(
+        "SELECT node_id, {col} FROM curated_embeddings \
+         WHERE node_id = ANY($1) AND model = $2 AND {col} IS NOT NULL"
+    );
+    let emb_rows: Vec<(Uuid, pgvector::Vector)> = sqlx::query_as(sqlx::AssertSqlSafe(emb_sql))
+        .bind(&node_ids)
+        .bind(&embedder_key)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    let mut emb_by_node: HashMap<Uuid, Vec<f32>> = emb_rows
+        .into_iter()
+        .map(|(id, v)| (id, v.to_vec()))
+        .collect();
+
     let mut episodes: Vec<EpisodeNode> = Vec::with_capacity(node_rows.len());
     for (node_id, content, event_time, meta) in node_rows {
         let source_raw_ids = raws_by_node.remove(&node_id).unwrap_or_default();
@@ -729,6 +767,7 @@ pub async fn distill_semantic(
         let started = span("started_at").or(event_time);
         let ended = span("ended_at").or(started);
         episodes.push(EpisodeNode {
+            embedding: emb_by_node.remove(&node_id),
             node_id,
             source_raw_ids,
             content,
@@ -783,12 +822,19 @@ pub async fn distill_semantic(
 
         let facts = match nlp.distill_facts(&refs).await {
             Ok(f) => f,
-            Err(e) => {
-                // NOT marked as distilled — a failed cluster is retried on the
-                // next pass instead of silently never producing facts.
-                tracing::warn!("curation: distillation failed on cluster: {e}");
-                continue;
-            }
+            Err(first) => match nlp.distill_facts(&refs).await {
+                Ok(f) => f,
+                Err(e) => {
+                    // NOT marked as distilled — a failed cluster is retried
+                    // next pass, and the failure is a counted stat, not a
+                    // silently dropped topic.
+                    stats.clusters_failed += 1;
+                    tracing::warn!(
+                        "curation: distillation failed on cluster twice ({first}; then {e})"
+                    );
+                    continue;
+                }
+            },
         };
 
         // The provider answered, so this cluster is consumed — including a
@@ -972,6 +1018,7 @@ async fn curate_inner(
         total.refreshed += p.refreshed;
         total.distilled += d.distilled;
         total.clusters_seen += d.clusters_seen;
+        total.clusters_failed += d.clusters_failed;
         total.skipped_distill = total.skipped_distill || d.skipped_distill;
         total.summarized += s.summaries;
         total.max_level = total.max_level.max(s.max_level);
@@ -1425,40 +1472,105 @@ pub(crate) mod edges {
 }
 
 // ---------------------------------------------------------------------------
-// Entity-overlap clustering. Greedy single-link on entity Jaccard over
-// raw-derived entities. Returns clusters as index groups into `episodes`.
+// Clustering: embedding-centroid first, entity overlap as the fallback.
+//
+// The retired greedy single-link entity-Jaccard had two failure modes this
+// exists to kill: transitive CHAINING (a~b, b~c merged a and c even when they
+// shared nothing) and the lexical miss (same topic, different words, zero
+// shared entities — the exact case embeddings are stored for). Assignment is
+// against a cluster's CENTROID, so drift is bounded and chains cannot form;
+// the size cap bounds the distill prompt and stops hub topics swallowing the
+// batch. Deterministic for a given input order.
 // ---------------------------------------------------------------------------
 
-fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
-    let entity_sets: Vec<&[String]> = episodes.iter().map(|e| e.entities.as_slice()).collect();
-    cluster_indices_by_jaccard(&entity_sets, CLUSTER_JACCARD)
+pub(crate) fn l2_normalize(v: &[f32]) -> Option<Vec<f32>> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    (norm > 0.0).then(|| v.iter().map(|x| x / norm).collect())
 }
 
-/// Greedy single-link clustering over index `i` with entity sets `sets[i]`,
-/// merging any pair whose Jaccard ≥ `threshold`. Returns index groups. Shared
-/// with the summaries module so higher RAPTOR levels cluster the same way.
-pub(crate) fn cluster_indices_by_jaccard(sets: &[&[String]], threshold: f32) -> Vec<Vec<usize>> {
-    let mut assigned = vec![false; sets.len()];
-    let mut clusters: Vec<Vec<usize>> = Vec::new();
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
 
-    for i in 0..sets.len() {
-        if assigned[i] {
-            continue;
-        }
-        let mut group = vec![i];
-        assigned[i] = true;
-        for (j, assigned_j) in assigned.iter_mut().enumerate().skip(i + 1) {
-            if *assigned_j {
+struct Cluster {
+    members: Vec<usize>,
+    /// Running mean of members' normalized embeddings; None until a member
+    /// with an embedding joins. Renormalized at comparison time.
+    centroid: Option<Vec<f32>>,
+    /// The seed member's index — the entity-fallback comparison surface.
+    seed: usize,
+}
+
+/// Cluster items by cosine-to-centroid over normalized `embeddings`, falling
+/// back to entity Jaccard against the cluster seed when either side has no
+/// embedding. Returns index groups, each at most `max_size` long.
+pub(crate) fn cluster_for_distill(
+    embeddings: &[Option<Vec<f32>>],
+    entity_sets: &[&[String]],
+    cosine_threshold: f32,
+    jaccard_threshold: f32,
+    max_size: usize,
+) -> Vec<Vec<usize>> {
+    let mut clusters: Vec<Cluster> = Vec::new();
+    for i in 0..entity_sets.len() {
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, c) in clusters.iter().enumerate() {
+            if c.members.len() >= max_size {
                 continue;
             }
-            if jaccard(sets[i], sets[j]) >= threshold {
-                group.push(j);
-                *assigned_j = true;
+            let score = match (&embeddings[i], &c.centroid) {
+                (Some(e), Some(cen)) => l2_normalize(cen)
+                    .map(|n| dot(e, &n))
+                    .filter(|cos| *cos >= cosine_threshold),
+                _ => Some(jaccard(entity_sets[i], entity_sets[c.seed]))
+                    .filter(|j| *j >= jaccard_threshold),
+            };
+            if let Some(sc) = score {
+                if best.is_none_or(|(_, b)| sc > b) {
+                    best = Some((ci, sc));
+                }
             }
         }
-        clusters.push(group);
+        match best {
+            Some((ci, _)) => {
+                let c = &mut clusters[ci];
+                if let Some(e) = &embeddings[i] {
+                    c.centroid = Some(match c.centroid.take() {
+                        Some(mut cen) => {
+                            let k = c.members.len() as f32;
+                            for (m, x) in cen.iter_mut().zip(e) {
+                                *m = (*m * k + x) / (k + 1.0);
+                            }
+                            cen
+                        }
+                        None => e.clone(),
+                    });
+                }
+                c.members.push(i);
+            }
+            None => clusters.push(Cluster {
+                members: vec![i],
+                centroid: embeddings[i].clone(),
+                seed: i,
+            }),
+        }
     }
-    clusters
+    clusters.into_iter().map(|c| c.members).collect()
+}
+
+fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
+    let embeddings: Vec<Option<Vec<f32>>> = episodes
+        .iter()
+        .map(|e| e.embedding.as_deref().and_then(l2_normalize))
+        .collect();
+    let entity_sets: Vec<&[String]> = episodes.iter().map(|e| e.entities.as_slice()).collect();
+    cluster_for_distill(
+        &embeddings,
+        &entity_sets,
+        CLUSTER_COSINE,
+        CLUSTER_JACCARD,
+        CLUSTER_MAX,
+    )
 }
 
 pub(crate) fn jaccard(a: &[String], b: &[String]) -> f32 {
@@ -1471,6 +1583,26 @@ pub(crate) fn jaccard(a: &[String], b: &[String]) -> f32 {
     } else {
         inter / union
     }
+}
+
+/// Test embedder: a hashed bag-of-words vector, so cosine reflects lexical
+/// overlap the way a real embedder's reflects semantic overlap. Same-topic
+/// test strings cluster; disjoint-topic strings don't — which is the geometry
+/// the clustering tests exist to exercise.
+#[cfg(test)]
+pub(crate) fn bow_embed(text: &str) -> Vec<f32> {
+    let mut v = vec![0.0_f32; 384];
+    for w in text.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
+        if w.len() < 3 {
+            continue;
+        }
+        let mut h = 5381_u32;
+        for b in w.bytes() {
+            h = h.wrapping_mul(33) ^ b as u32;
+        }
+        v[(h % 384) as usize] += 1.0;
+    }
+    v
 }
 
 #[cfg(test)]
@@ -1500,9 +1632,60 @@ mod tests {
             source_raw_ids: vec![Uuid::new_v4()],
             content: String::new(),
             entities: entities.iter().map(|s| s.to_string()).collect(),
+            embedding: None,
             started: None,
             ended: None,
         }
+    }
+
+    fn nvec(v: &[f32]) -> Option<Vec<f32>> {
+        l2_normalize(v)
+    }
+
+    #[test]
+    fn centroid_clustering_kills_the_single_link_chain() {
+        // a~b and b~c, but a and c share nothing. Single-link merged all
+        // three; against the a+b centroid, c falls short and stays out.
+        let e: Vec<Option<Vec<f32>>> =
+            vec![nvec(&[1.0, 0.0]), nvec(&[0.8, 0.6]), nvec(&[0.0, 1.0])];
+        let ents: Vec<&[String]> = vec![&[], &[], &[]];
+        let clusters = cluster_for_distill(&e, &ents, 0.6, 0.4, 12);
+        assert!(clusters.iter().any(|c| c == &vec![0, 1]));
+        assert!(clusters.iter().any(|c| c == &vec![2]), "{clusters:?}");
+    }
+
+    #[test]
+    fn embeddings_cluster_what_entities_miss() {
+        // Same topic, zero shared entity strings — the lexical miss the old
+        // clusterer could never bridge. Embeddings carry it.
+        let e: Vec<Option<Vec<f32>>> = vec![nvec(&[0.9, 0.1]), nvec(&[0.85, 0.15])];
+        let a = ["knee".to_string()];
+        let b = ["joint pain".to_string()];
+        let ents: Vec<&[String]> = vec![&a, &b];
+        let clusters = cluster_for_distill(&e, &ents, 0.6, 0.4, 12);
+        assert_eq!(clusters, vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn cluster_size_cap_bounds_the_distill_prompt() {
+        let e: Vec<Option<Vec<f32>>> = (0..5).map(|_| nvec(&[1.0, 0.0])).collect();
+        let empty: [String; 0] = [];
+        let ents: Vec<&[String]> = (0..5).map(|_| empty.as_slice()).collect();
+        let clusters = cluster_for_distill(&e, &ents, 0.6, 0.4, 2);
+        assert!(clusters.iter().all(|c| c.len() <= 2), "{clusters:?}");
+        assert_eq!(clusters.iter().map(Vec::len).sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn missing_embeddings_fall_back_to_entity_overlap() {
+        let e: Vec<Option<Vec<f32>>> = vec![None, None, None];
+        let a = ["x".to_string(), "y".to_string()];
+        let b = ["x".to_string(), "y".to_string(), "z".to_string()];
+        let c = ["p".to_string()];
+        let ents: Vec<&[String]> = vec![&a, &b, &c];
+        let clusters = cluster_for_distill(&e, &ents, 0.6, 0.4, 12);
+        assert!(clusters.iter().any(|cl| cl == &vec![0, 1]));
+        assert!(clusters.iter().any(|cl| cl == &vec![2]));
     }
 
     #[test]
@@ -1538,11 +1721,11 @@ mod tests {
         fn embedder_dimension(&self) -> usize {
             384
         }
-        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
-            Ok(vec![0.1_f32; 384])
+        async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(bow_embed(text))
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+            Ok(texts.iter().map(|t| bow_embed(t)).collect())
         }
         fn extract_entities(&self, text: &str) -> Vec<String> {
             flashback_nlp::extract_entities(text)
@@ -1585,11 +1768,11 @@ mod tests {
         fn embedder_dimension(&self) -> usize {
             384
         }
-        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
-            Ok(vec![0.1_f32; 384])
+        async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(bow_embed(text))
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+            Ok(texts.iter().map(|t| bow_embed(t)).collect())
         }
         fn extract_entities(&self, text: &str) -> Vec<String> {
             flashback_nlp::extract_entities(text)
@@ -1629,11 +1812,11 @@ mod tests {
         fn embedder_dimension(&self) -> usize {
             384
         }
-        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
-            Ok(vec![0.1_f32; 384])
+        async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(bow_embed(text))
         }
         async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+            Ok(texts.iter().map(|t| bow_embed(t)).collect())
         }
         fn extract_entities(&self, text: &str) -> Vec<String> {
             flashback_nlp::extract_entities(text)
