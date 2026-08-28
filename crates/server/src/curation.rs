@@ -66,6 +66,18 @@ pub(crate) const CLUSTER_COSINE: f32 = 0.60;
 /// hub topic from dragging half the corpus into one call.
 pub(crate) const CLUSTER_MAX: usize = 12;
 
+/// Already-distilled episodes carried into clustering as CONTEXT, newest
+/// first. A new episode on an old topic clusters with the evidence that
+/// produced the existing fact, so the refreshed fact is distilled with full
+/// context instead of in a vacuum — and can then supersede its predecessor.
+const DISTILL_CONTEXT: i64 = 200;
+
+/// Cosine floor for one semantic fact superseding another. Deliberately
+/// conservative: only a near-same-topic newer fact closes an older one's
+/// validity window (the filters everywhere already exclude superseded nodes).
+/// Too low retires unrelated facts; too high never fires.
+const SUPERSEDE_COSINE: f64 = 0.85;
+
 /// Upper bound on how many raw/episodic rows a single curation pass pulls into
 /// memory (and, for distillation, feeds the O(n²) entity clusterer). Promotion
 /// is idempotent and the clusterer is quadratic, so a large backlog is drained
@@ -87,6 +99,8 @@ pub struct CurationStats {
     pub refreshed: i64,
     pub distilled: i64,
     pub clusters_seen: i64,
+    /// Older facts whose validity window a newer fact closed this pass.
+    pub superseded: i64,
     /// Clusters whose distill call failed twice this pass — retried next pass.
     pub clusters_failed: i64,
     pub skipped_distill: bool,
@@ -611,6 +625,9 @@ struct EpisodeNode {
     /// The node's stored embedding in the scope's geometry, L2-normalized.
     /// Missing (embed failed at write time) falls back to entity overlap.
     embedding: Option<Vec<f32>>,
+    /// True when this episode is context (already distilled): it can anchor a
+    /// cluster but never triggers one, is never re-marked, never bumped.
+    already_distilled: bool,
     /// When the episode started / ended. Equal for a single-record episode.
     started: Option<DateTime<Utc>>,
     ended: Option<DateTime<Utc>>,
@@ -690,12 +707,57 @@ pub async fn distill_semantic(
     .bind(curation_batch_cap())
     .fetch_all(pool)
     .await?;
+    if node_rows.is_empty() {
+        return Ok(stats);
+    }
+
+    // Already-distilled episodes ride along as CONTEXT (newest first, capped):
+    // a new episode on an old topic clusters with the evidence behind the
+    // existing fact, so its fact is distilled with history instead of in a
+    // vacuum — and the supersede pass below can then retire the predecessor.
+    let context_rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<DateTime<Utc>>,
+            Option<serde_json::Value>,
+        ),
+    >(
+        r#"
+        SELECT n.id, n.content, n.event_time, n.meta
+        FROM curated_nodes n
+        WHERE n.kind = 'episodic'
+          AND n.user_id = $1
+          AND n.project_id IS NOT DISTINCT FROM $2
+          AND n.mode IS NOT DISTINCT FROM $3
+          AND (n.meta->>'distilled_at') IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM curated_edges s
+              WHERE s.to_id = n.id AND s.kind = 'supersedes'
+          )
+        ORDER BY n.event_time DESC NULLS LAST, n.id ASC
+        LIMIT $4
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(DISTILL_CONTEXT)
+    .fetch_all(pool)
+    .await?;
+
+    let node_rows: Vec<_> = node_rows
+        .into_iter()
+        .map(|r| (r, false))
+        .chain(context_rows.into_iter().map(|r| (r, true)))
+        .collect();
     if node_rows.len() < 2 {
         return Ok(stats);
     }
 
     // Lineage for the batch in one query: every raw id each node derives from.
-    let node_ids: Vec<Uuid> = node_rows.iter().map(|(id, ..)| *id).collect();
+    let node_ids: Vec<Uuid> = node_rows.iter().map(|((id, ..), _)| *id).collect();
     let edge_rows = sqlx::query_as::<_, (Uuid, Uuid)>(
         "SELECT from_id, to_id FROM curated_edges \
          WHERE kind = 'derived_from' AND from_id = ANY($1) \
@@ -740,7 +802,7 @@ pub async fn distill_semantic(
         .collect();
 
     let mut episodes: Vec<EpisodeNode> = Vec::with_capacity(node_rows.len());
-    for (node_id, content, event_time, meta) in node_rows {
+    for ((node_id, content, event_time, meta), already_distilled) in node_rows {
         let source_raw_ids = raws_by_node.remove(&node_id).unwrap_or_default();
         if source_raw_ids.is_empty() {
             // An episode nothing points back at can't be cited; skip it.
@@ -768,6 +830,7 @@ pub async fn distill_semantic(
         let ended = span("ended_at").or(started);
         episodes.push(EpisodeNode {
             embedding: emb_by_node.remove(&node_id),
+            already_distilled,
             node_id,
             source_raw_ids,
             content,
@@ -792,7 +855,9 @@ pub async fn distill_semantic(
     let singleton_ids: Vec<Uuid> = clusters
         .iter()
         .filter(|c| c.len() < 2)
-        .flat_map(|c| c.iter().map(|&i| episodes[i].node_id))
+        .flat_map(|c| c.iter().map(|&i| &episodes[i]))
+        .filter(|e| !e.already_distilled)
+        .map(|e| e.node_id)
         .collect();
     if !singleton_ids.is_empty() {
         sqlx::query(
@@ -806,7 +871,10 @@ pub async fn distill_semantic(
         .await?;
     }
 
-    for cluster in clusters.iter().filter(|c| c.len() >= 2) {
+    for cluster in clusters
+        .iter()
+        .filter(|c| c.len() >= 2 && c.iter().any(|&i| !episodes[i].already_distilled))
+    {
         // One EpisodeRef per EPISODE — the transcript, the unioned entities,
         // and when it happened, so the distiller can weigh recency.
         let refs: Vec<EpisodeRef> = cluster
@@ -843,7 +911,11 @@ pub async fn distill_semantic(
         // episode forever; a session that later grows has its meta rewritten,
         // which clears it. Singletons never reach here and stay eligible, so a
         // future related episode can still pull them into a cluster.
-        let cluster_node_ids: Vec<Uuid> = cluster.iter().map(|&i| episodes[i].node_id).collect();
+        let cluster_node_ids: Vec<Uuid> = cluster
+            .iter()
+            .filter(|&&i| !episodes[i].already_distilled)
+            .map(|&i| episodes[i].node_id)
+            .collect();
         sqlx::query(
             "UPDATE curated_nodes \
              SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('distilled_at', NOW()) \
@@ -904,7 +976,16 @@ pub async fn distill_semantic(
             for ep in &evidence {
                 add_edge(pool, node_id, ep.node_id, "distilled_from").await?;
             }
-            embed_node(pool, nlp, scope, node_id, &fact.content).await;
+            let fact_emb = embed_node(pool, nlp, scope, node_id, &fact.content).await;
+            // Temporal invalidation: the newer fact closes the validity window
+            // of any near-same-topic older fact. A closed window, never a
+            // delete — every filter already excludes superseded nodes, and a
+            // rebuild reproduces the same closures from raw.
+            if let (Some(t), Some((fdim, femb))) = (fact_time, fact_emb.as_ref()) {
+                stats.superseded +=
+                    supersede_older_facts(pool, scope, &embedder_key, node_id, t, *fdim, femb)
+                        .await?;
+            }
             stats.distilled += 1;
         }
     }
@@ -1019,6 +1100,7 @@ async fn curate_inner(
         total.distilled += d.distilled;
         total.clusters_seen += d.clusters_seen;
         total.clusters_failed += d.clusters_failed;
+        total.superseded += d.superseded;
         total.skipped_distill = total.skipped_distill || d.skipped_distill;
         total.summarized += s.summaries;
         total.max_level = total.max_level.max(s.max_level);
@@ -1181,6 +1263,53 @@ async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64
     .fetch_one(pool)
     .await?;
     Ok((sessions, solos))
+}
+
+/// Write `supersedes` edges from a newly distilled fact to every ACTIVE
+/// semantic fact in scope whose embedding sits within `SUPERSEDE_COSINE` and
+/// whose evidence is STRICTLY older — same-evidence siblings from one pass
+/// never retire each other. Returns how many windows closed.
+async fn supersede_older_facts(
+    pool: &PgPool,
+    scope: &Scope,
+    embedder_key: &str,
+    new_id: Uuid,
+    new_time: DateTime<Utc>,
+    dim: usize,
+    emb: &[f32],
+) -> AppResult<i64> {
+    let col = crate::routes::records::embedding_col_for_dim(dim);
+    let sql = format!(
+        "INSERT INTO curated_edges (from_id, to_id, kind) \
+         SELECT $1, n.id, 'supersedes' \
+         FROM curated_nodes n \
+         JOIN curated_embeddings ce \
+           ON ce.node_id = n.id AND ce.model = $8 AND ce.{col} IS NOT NULL \
+         WHERE n.kind = 'semantic' \
+           AND n.user_id = $2 \
+           AND n.project_id IS NOT DISTINCT FROM $3 \
+           AND n.mode IS NOT DISTINCT FROM $4 \
+           AND n.id <> $1 \
+           AND COALESCE(n.event_time, n.created_at) < $5 \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM curated_edges s \
+               WHERE s.to_id = n.id AND s.kind = 'supersedes' \
+           ) \
+           AND 1 - (ce.{col} <=> $6) >= $7 \
+         ON CONFLICT (from_id, to_id, kind) DO NOTHING"
+    );
+    let res = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(new_id)
+        .bind(&scope.user_id)
+        .bind(&scope.project_id)
+        .bind(&scope.mode)
+        .bind(new_time)
+        .bind(Vector::from(emb.to_vec()))
+        .bind(SUPERSEDE_COSINE)
+        .bind(embedder_key)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,21 +1581,25 @@ pub(crate) mod edges {
         scope: &Scope,
         node_id: Uuid,
         content: &str,
-    ) {
+    ) -> Option<(usize, Vec<f32>)> {
         let embedder_key = scope.embedder_key(pool).await;
-        if let Ok((dim, embedding)) = nlp.embed_for_mode(&embedder_key, content).await {
-            let col = crate::routes::records::embedding_col_for_dim(dim);
-            let sql = format!(
-                "INSERT INTO curated_embeddings (node_id, model, {col}) VALUES ($1, $2, $3) \
-                 ON CONFLICT (node_id, model) DO NOTHING"
-            );
-            // col is a trusted constant from embedding_col_for_dim; values bound.
-            let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
-                .bind(node_id)
-                .bind(&embedder_key)
-                .bind(Vector::from(embedding))
-                .execute(pool)
-                .await;
+        match nlp.embed_for_mode(&embedder_key, content).await {
+            Ok((dim, embedding)) => {
+                let col = crate::routes::records::embedding_col_for_dim(dim);
+                let sql = format!(
+                    "INSERT INTO curated_embeddings (node_id, model, {col}) VALUES ($1, $2, $3) \
+                     ON CONFLICT (node_id, model) DO NOTHING"
+                );
+                // col is a trusted constant from embedding_col_for_dim; values bound.
+                let _ = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(node_id)
+                    .bind(&embedder_key)
+                    .bind(Vector::from(embedding.clone()))
+                    .execute(pool)
+                    .await;
+                Some((dim, embedding))
+            }
+            Err(_) => None,
         }
     }
 }
@@ -1633,6 +1766,7 @@ mod tests {
             content: String::new(),
             entities: entities.iter().map(|s| s.to_string()).collect(),
             embedding: None,
+            already_distilled: false,
             started: None,
             ended: None,
         }
@@ -1855,6 +1989,29 @@ mod tests {
         .bind(user_id)
         .bind(project_id)
         .bind(mode)
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A standalone document dated `days_ago` in the past — for temporal tests.
+    async fn insert_document_raw_at(
+        pool: &PgPool,
+        user_id: &str,
+        content: &str,
+        days_ago: i64,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO raw_records
+               (id, type, content, event_time, source, user_id)
+               VALUES ($1, 'document', $2, NOW() - ($3 || ' days')::interval, 'test', $4)"#,
+        )
+        .bind(id)
+        .bind(content)
+        .bind(days_ago.to_string())
+        .bind(user_id)
         .execute(pool)
         .await
         .unwrap();
@@ -2531,6 +2688,68 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts, vec![2, 2], "each pass rotates the counter");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn new_evidence_joins_old_context_and_supersedes_the_stale_fact(pool: PgPool) {
+        let nlp = CapturingNlp::default();
+        // Two same-topic documents from ten days ago produce the first fact.
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "the deploy target for the pgvector service is staging",
+            10,
+        )
+        .await;
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "note: the deploy target for the pgvector service is staging",
+            10,
+        )
+        .await;
+        let first = curate(&pool, &nlp, "alice").await.unwrap();
+        assert_eq!(first.distilled, 1);
+        assert_eq!(first.superseded, 0);
+
+        // A single NEWER document on the same topic: it must cluster with the
+        // already-distilled context (a lone new episode used to wait forever),
+        // and its fact must close the old fact's validity window.
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "update: the deploy target for the pgvector service is production",
+            0,
+        )
+        .await;
+        let second = curate(&pool, &nlp, "alice").await.unwrap();
+        assert_eq!(
+            second.distilled, 1,
+            "one new episode + context must distill"
+        );
+        assert_eq!(second.superseded, 1, "the stale fact's window must close");
+
+        // The second distill call saw all three episodes, not the newcomer alone.
+        let seen = nlp.seen.lock().unwrap().len();
+        assert_eq!(seen, 2 + 3, "context episodes ride into the second cluster");
+
+        // Two facts exist; exactly one is still active, and it is the newer.
+        let (total, active): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), \
+                    COUNT(*) FILTER (WHERE NOT EXISTS ( \
+                        SELECT 1 FROM curated_edges s \
+                        WHERE s.to_id = curated_nodes.id AND s.kind = 'supersedes')) \
+             FROM curated_nodes WHERE kind = 'semantic' AND user_id = 'alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((total, active), (2, 1));
+
+        // Nothing left to do: a third pass is a no-op.
+        let third = curate(&pool, &nlp, "alice").await.unwrap();
+        assert_eq!(third.distilled, 0);
+        assert_eq!(third.superseded, 0);
     }
 
     // -- rebuild -----------------------------------------------------------
