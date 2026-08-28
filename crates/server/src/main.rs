@@ -12,6 +12,7 @@ mod nlp;
 mod proposals;
 mod references;
 mod routes;
+mod settings;
 mod summaries;
 
 use std::sync::Arc;
@@ -124,11 +125,21 @@ async fn run_serve() -> Result<()> {
         db::migrate(&pool).await?;
     }
 
+    // The environment seeds the provider config; the settings row — written
+    // from the admin settings page — wins over it once one exists.
+    let provider_cfg = settings::resolve_from_db(&pool, &cfg.provider).await;
+
     tracing::info!("Loading embedding model (this can take a few seconds on first run)...");
     let nlp_cfg = nlp::Config {
         cache_dir: cfg.fastembed_cache_dir.clone(),
     };
-    let nlp = Arc::new(nlp::Nlp::new(nlp_cfg, &cfg.provider).await?);
+    let nlp = Arc::new(nlp::Nlp::new(nlp_cfg, &provider_cfg).await?);
+
+    // Verify the configured models exist at the endpoint — in the background,
+    // because a model server that boots slower than this service must not
+    // wedge the memory store. Misses log at error level and show in /health
+    // as the provider failing, not as silence.
+    tokio::spawn(async move { settings::verify_models_at_startup(&provider_cfg).await });
 
     let cfg_arc = Arc::new(cfg);
 

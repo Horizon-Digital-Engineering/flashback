@@ -270,8 +270,11 @@ PROVIDER_REMOTE_PROVIDER=openai
 PROVIDER_REMOTE_MODEL=qwen2.5:3b
 PROVIDER_REMOTE_API_BASE=http://host.docker.internal:11434/v1   # macOS/Windows
 # PROVIDER_REMOTE_API_BASE=http://172.17.0.1:11434/v1            # Linux
-PROVIDER_REMOTE_API_KEY=ollama   # any non-empty string
+# No API key needed: with an explicit PROVIDER_REMOTE_API_BASE the endpoint is
+# self-chosen, and self-hosted model servers don't check one.
 ```
+
+All of these environment values are the **bootstrap seed**. Once the server is up, the admin UI's **Settings** page (`/admin/settings`) configures the provider at runtime — pick the model from what the endpoint actually serves, test one real extraction, save, and the pipeline swaps over live with no restart. Saved settings are stored in the database and win over the environment from then on. The API key is the one exception: it stays in the environment and is never stored.
 
 Hardware roadmap: DGX Spark, M-series 128 GB, Strix Halo will all run 70B+ comfortably. Two ways to use them:
 
@@ -286,6 +289,7 @@ For every deployment there's a built-in admin UI at `/admin`. Login with any min
 - **Memories** — filterable table with delete actions
 - **Memory detail** — full content, structured extraction, lineage (supersede chain) walked both directions
 - **State** — current value of every state object you maintain
+- **Settings** — the live extraction/distillation provider: model picked from what the endpoint actually serves, one-click test extraction, applies without a restart
 - **Tokens** — list + revoke per-client tokens
 - **Mind map** — force-directed network graph of your memories, edges for supersede / entity-overlap / same-session. Server-rendered HTML + inline vanilla JS, no framework, no CDN, no external assets.
 

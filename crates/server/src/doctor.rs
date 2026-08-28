@@ -154,14 +154,32 @@ pub async fn run() -> Result<()> {
     }
 
     // --- AI provider ------------------------------------------------------
-    match cfg.provider.kind {
+    // The server resolves database-stored settings over the environment at
+    // startup; the doctor must judge the same effective config, or it reports
+    // on a provider the server is not actually running.
+    let provider_cfg = match &pool {
+        Some(pool) => {
+            let resolved = crate::settings::resolve_from_db(pool, &cfg.provider).await;
+            match crate::settings::load(pool).await {
+                Ok(db) if !db.is_empty() => r.line(
+                    Level::Info,
+                    "provider",
+                    "settings come from the database (admin settings page), overriding the environment",
+                ),
+                _ => {}
+            }
+            resolved
+        }
+        None => cfg.provider.clone(),
+    };
+    match provider_cfg.kind {
         ProviderKind::Heuristic => r.line(
             Level::Ok,
             "provider",
             "heuristic — in-process, nothing to reach",
         ),
         ProviderKind::Remote => {
-            let remote = &cfg.provider.remote;
+            let remote = &provider_cfg.remote;
             if remote.api_key.is_empty() {
                 if remote.api_base.is_some() {
                     r.line(
@@ -197,6 +215,46 @@ pub async fn run() -> Result<()> {
                     "provider",
                     &format!("remote endpoint {base} unreachable: {e}"),
                 ),
+            }
+            // With an explicit base the endpoint can be asked what it serves,
+            // so a configured-but-absent model is caught here instead of as a
+            // per-call failure after deploy. Hosted defaults are skipped: their
+            // model list needs the key this probe deliberately does not send.
+            if remote.api_base.is_some() {
+                let key = (!remote.api_key.is_empty()).then_some(remote.api_key.as_str());
+                match crate::settings::list_models(remote.api_base.as_deref().unwrap(), key).await {
+                    Ok(models) => {
+                        for (role, model) in [
+                            ("extract", &remote.extract_model),
+                            ("distill", &remote.distill_model),
+                        ] {
+                            if models.iter().any(|m| m == model) {
+                                r.line(
+                                    Level::Ok,
+                                    "model",
+                                    &format!("{role} model '{model}' is served by the endpoint"),
+                                );
+                            } else {
+                                r.line(
+                                    Level::Fail,
+                                    "model",
+                                    &format!(
+                                        "{role} model '{model}' is NOT served by the endpoint — \
+                                         available: {}",
+                                        models.join(", ")
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => r.line(
+                        Level::Info,
+                        "model",
+                        &format!(
+                            "could not list the endpoint's models ({e}) — model names unverified"
+                        ),
+                    ),
+                }
             }
         }
         ProviderKind::Embedded => {

@@ -21,6 +21,112 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::config::{FallbackPolicy, ProviderConfig as SrvProviderConfig, ProviderKind};
 use crate::error::AppError;
 
+/// The live provider plus what it resolved to. Swapped as one unit so the
+/// name, models and trait object can never disagree mid-read.
+struct ProviderSlot {
+    provider: Arc<dyn AiProvider>,
+    name: &'static str,
+    /// `(extract_model, distill_model)` for remote providers; `None` when the
+    /// provider has no model (heuristic) or manages its own (embedded).
+    models: Option<(String, String)>,
+}
+
+/// Build a provider from config. Shared by startup and the settings page's
+/// live apply, so both produce identical providers from identical config.
+async fn build_provider(provider_cfg: &SrvProviderConfig) -> ProviderSlot {
+    match provider_cfg.kind {
+        ProviderKind::Remote => {
+            let backend = match provider_cfg.remote.backend.as_str() {
+                "anthropic" => RemoteBackend::Anthropic,
+                "openai" => RemoteBackend::OpenAI,
+                _ => RemoteBackend::OpenRouter,
+            };
+            let rc = RemoteLlmConfig {
+                backend,
+                api_key: provider_cfg.remote.api_key.clone(),
+                api_base: provider_cfg.remote.api_base.clone(),
+                prompt_cache: provider_cfg.remote.prompt_cache,
+                extract_model: provider_cfg.remote.extract_model.clone(),
+                extract_max_tokens: provider_cfg.remote.extract_max_tokens,
+                extract_timeout_ms: provider_cfg.remote.extract_timeout_ms,
+                distill_model: provider_cfg.remote.distill_model.clone(),
+                distill_max_tokens: provider_cfg.remote.distill_max_tokens,
+                distill_timeout_ms: provider_cfg.remote.distill_timeout_ms,
+            };
+            match RemoteLlmProvider::new(rc) {
+                Ok(p) => {
+                    let name: &'static str = match backend {
+                        RemoteBackend::OpenRouter => "remote-openrouter",
+                        RemoteBackend::Anthropic => "remote-anthropic",
+                        RemoteBackend::OpenAI => "remote-openai",
+                    };
+                    tracing::info!(
+                        backend = name,
+                        extract_model = %provider_cfg.remote.extract_model,
+                        distill_model = %provider_cfg.remote.distill_model,
+                        "Remote AI provider configured"
+                    );
+                    ProviderSlot {
+                        provider: Arc::new(p),
+                        name,
+                        models: Some((
+                            provider_cfg.remote.extract_model.clone(),
+                            provider_cfg.remote.distill_model.clone(),
+                        )),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Remote AI provider misconfigured ({e}); falling back to heuristic. \
+                         Set PROVIDER=heuristic explicitly to silence this warning."
+                    );
+                    heuristic_slot()
+                }
+            }
+        }
+        ProviderKind::Embedded => {
+            let ec = EmbeddedLlmConfig {
+                model: provider_cfg.embedded.model.clone(),
+                context_size: provider_cfg.embedded.context_size,
+                max_tokens: provider_cfg.embedded.max_tokens,
+                ..Default::default()
+            };
+            match EmbeddedLlmProvider::new(ec).await {
+                Ok(p) => {
+                    tracing::info!(
+                        model = %provider_cfg.embedded.model,
+                        "Embedded LLM provider configured"
+                    );
+                    ProviderSlot {
+                        provider: Arc::new(p),
+                        name: "embedded-llm",
+                        models: None,
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Embedded LLM init failed ({e}); falling back to heuristic. \
+                         Build with --features embedded-llm to enable in-process LLM."
+                    );
+                    heuristic_slot()
+                }
+            }
+        }
+        ProviderKind::Heuristic => {
+            tracing::info!("Heuristic AI provider configured (no LLM calls)");
+            heuristic_slot()
+        }
+    }
+}
+
+fn heuristic_slot() -> ProviderSlot {
+    ProviderSlot {
+        provider: Arc::new(HeuristicProvider),
+        name: "heuristic",
+        models: None,
+    }
+}
+
 #[derive(Clone)]
 pub struct Nlp {
     /// The default embedder (all-MiniLM-L6-v2, 384-dim) — the `general` mode's
@@ -32,9 +138,11 @@ pub struct Nlp {
     extra_embedders: Arc<AsyncMutex<HashMap<String, Embedder>>>,
     /// The fastembed cache dir, threaded to lazily-built extra embedders.
     cache_dir: Option<std::path::PathBuf>,
-    provider: Arc<dyn AiProvider>,
+    /// Swappable so the settings page can apply a new provider without a
+    /// restart. Reads clone the inner `Arc` and drop the lock immediately; an
+    /// in-flight call keeps the provider it started with alive via its clone.
+    provider: Arc<std::sync::RwLock<ProviderSlot>>,
     fallback: FallbackPolicy,
-    provider_name: &'static str,
 }
 
 impl Nlp {
@@ -52,87 +160,36 @@ impl Nlp {
             "Embedding model loaded"
         );
 
-        let (provider, name): (Arc<dyn AiProvider>, &'static str) = match provider_cfg.kind {
-            ProviderKind::Remote => {
-                let backend = match provider_cfg.remote.backend.as_str() {
-                    "anthropic" => RemoteBackend::Anthropic,
-                    "openai" => RemoteBackend::OpenAI,
-                    _ => RemoteBackend::OpenRouter,
-                };
-                let rc = RemoteLlmConfig {
-                    backend,
-                    api_key: provider_cfg.remote.api_key.clone(),
-                    api_base: provider_cfg.remote.api_base.clone(),
-                    prompt_cache: provider_cfg.remote.prompt_cache,
-                    extract_model: provider_cfg.remote.extract_model.clone(),
-                    extract_max_tokens: provider_cfg.remote.extract_max_tokens,
-                    extract_timeout_ms: provider_cfg.remote.extract_timeout_ms,
-                    distill_model: provider_cfg.remote.distill_model.clone(),
-                    distill_max_tokens: provider_cfg.remote.distill_max_tokens,
-                    distill_timeout_ms: provider_cfg.remote.distill_timeout_ms,
-                };
-                match RemoteLlmProvider::new(rc) {
-                    Ok(p) => {
-                        let name: &'static str = match backend {
-                            RemoteBackend::OpenRouter => "remote-openrouter",
-                            RemoteBackend::Anthropic => "remote-anthropic",
-                            RemoteBackend::OpenAI => "remote-openai",
-                        };
-                        tracing::info!(
-                            backend = name,
-                            extract_model = %provider_cfg.remote.extract_model,
-                            distill_model = %provider_cfg.remote.distill_model,
-                            "Remote AI provider configured"
-                        );
-                        (Arc::new(p), name)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Remote AI provider misconfigured ({e}); falling back to heuristic. \
-                             Set PROVIDER=heuristic explicitly to silence this warning."
-                        );
-                        (Arc::new(HeuristicProvider), "heuristic")
-                    }
-                }
-            }
-            ProviderKind::Embedded => {
-                let ec = EmbeddedLlmConfig {
-                    model: provider_cfg.embedded.model.clone(),
-                    context_size: provider_cfg.embedded.context_size,
-                    max_tokens: provider_cfg.embedded.max_tokens,
-                    ..Default::default()
-                };
-                match EmbeddedLlmProvider::new(ec).await {
-                    Ok(p) => {
-                        tracing::info!(
-                            model = %provider_cfg.embedded.model,
-                            "Embedded LLM provider configured"
-                        );
-                        (Arc::new(p), "embedded-llm")
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Embedded LLM init failed ({e}); falling back to heuristic. \
-                             Build with --features embedded-llm to enable in-process LLM."
-                        );
-                        (Arc::new(HeuristicProvider), "heuristic")
-                    }
-                }
-            }
-            ProviderKind::Heuristic => {
-                tracing::info!("Heuristic AI provider configured (no LLM calls)");
-                (Arc::new(HeuristicProvider), "heuristic")
-            }
-        };
+        let slot = build_provider(provider_cfg).await;
 
         Ok(Self {
             embedder,
             extra_embedders: Arc::new(AsyncMutex::new(HashMap::new())),
             cache_dir,
-            provider,
+            provider: Arc::new(std::sync::RwLock::new(slot)),
             fallback: provider_cfg.fallback,
-            provider_name: name,
         })
+    }
+
+    fn current_provider(&self) -> Arc<dyn AiProvider> {
+        self.provider
+            .read()
+            .expect("provider lock")
+            .provider
+            .clone()
+    }
+
+    /// Rebuild the provider from `provider_cfg` and swap it in. Callers that
+    /// already hold a provider clone finish on the old one; new calls get the
+    /// new one. Returns the name the config resolved to, which is `heuristic`
+    /// when construction fell back — the caller surfaces that rather than
+    /// pretending the apply succeeded.
+    pub async fn reconfigure_provider(&self, provider_cfg: &SrvProviderConfig) -> &'static str {
+        let slot = build_provider(provider_cfg).await;
+        let name = slot.name;
+        *self.provider.write().expect("provider lock") = slot;
+        tracing::info!(provider = name, "provider swapped at runtime");
+        name
     }
 
     /// Embed `text` with the embedder a mode pins, returning `(dim, vector)`.
@@ -200,14 +257,20 @@ impl Nlp {
     }
 
     pub fn provider_name(&self) -> &'static str {
-        self.provider_name
+        self.provider.read().expect("provider lock").name
+    }
+
+    /// `(extract_model, distill_model)` the live provider resolved to, when it
+    /// has models at all. What `/health` and the settings page report.
+    pub fn provider_models(&self) -> Option<(String, String)> {
+        self.provider.read().expect("provider lock").models.clone()
     }
 
     /// True if the configured provider supports distill_facts (i.e. is an
     /// LLM provider, not the heuristic). The curation pipeline checks this
     /// before running the semantic-distill derivation.
     pub fn provider_can_distill(&self) -> bool {
-        self.provider.capabilities().fact_distillation
+        self.current_provider().capabilities().fact_distillation
     }
 
     pub async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
@@ -227,7 +290,7 @@ impl Nlp {
     /// the heuristic provider if remote fails and `PROVIDER_FALLBACK=heuristic`.
     pub async fn extract_full(&self, text: &str) -> Result<Extraction, AppError> {
         let ctx = ExtractContext::default();
-        match self.provider.extract(text, &ctx).await {
+        match self.current_provider().extract(text, &ctx).await {
             Ok(e) => Ok(e),
             Err(ProviderError::NotConfigured(_))
             | Err(ProviderError::Upstream(_))
@@ -267,6 +330,18 @@ pub struct Config {
 #[async_trait]
 pub trait NlpService: Send + Sync {
     fn provider_name(&self) -> &'static str;
+    /// `(extract_model, distill_model)` for providers that have models.
+    /// Default `None` keeps model-less stubs and the heuristic honest.
+    fn provider_models(&self) -> Option<(String, String)> {
+        None
+    }
+    /// Rebuild the provider from config and swap it in live. Returns the
+    /// provider name the config resolved to. The default is a no-op that
+    /// reports the current name, which is correct for test stubs — only the
+    /// production `Nlp` actually swaps.
+    async fn reconfigure_provider(&self, _cfg: &SrvProviderConfig) -> &'static str {
+        self.provider_name()
+    }
     fn provider_can_distill(&self) -> bool;
     fn embedder_model_name(&self) -> &str;
     fn embedder_dimension(&self) -> usize;
@@ -303,6 +378,12 @@ impl NlpService for Nlp {
     fn provider_name(&self) -> &'static str {
         Nlp::provider_name(self)
     }
+    fn provider_models(&self) -> Option<(String, String)> {
+        Nlp::provider_models(self)
+    }
+    async fn reconfigure_provider(&self, cfg: &SrvProviderConfig) -> &'static str {
+        Nlp::reconfigure_provider(self, cfg).await
+    }
     fn provider_can_distill(&self) -> bool {
         Nlp::provider_can_distill(self)
     }
@@ -338,7 +419,7 @@ impl NlpService for Nlp {
         &self,
         episodes: &[flashback_nlp::EpisodeRef],
     ) -> Result<Vec<flashback_nlp::DistilledFact>, ProviderError> {
-        self.provider.distill_facts(episodes).await
+        self.current_provider().distill_facts(episodes).await
     }
 }
 

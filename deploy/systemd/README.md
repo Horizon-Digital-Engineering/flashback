@@ -107,19 +107,27 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull qwen2.5:3b
 ```
 
-Then in `/opt/flashback/.env`:
+When the model server is up **before** the installer runs, nothing else is
+needed: the installer asks it what it serves and writes the remote provider
+config itself (preferring a tools-capable model, since extraction output is
+parsed as JSON). Set `FLASHBACK_OLLAMA_MODEL=<name>` to pin one explicitly.
+
+Already installed? Use the admin **Settings** page (`/admin/settings`): load
+the model list from the endpoint, test one extraction, save — it applies live,
+no restart, and the saved settings win over `.env` from then on. The manual
+equivalent in `/opt/flashback/.env` (restart to apply):
 
 ```bash
 PROVIDER=remote
 PROVIDER_REMOTE_PROVIDER=openai
 PROVIDER_REMOTE_MODEL=qwen2.5:3b
 PROVIDER_REMOTE_API_BASE=http://127.0.0.1:11434/v1
-PROVIDER_REMOTE_API_KEY=ollama
+# No API key: self-hosted endpoints don't check one.
 ```
 
-`sudo systemctl restart flashback` to apply. A hosted provider (Anthropic /
-OpenRouter) or another box on the LAN is the same flip with a different URL —
-see the decision matrix in [deploy/README.md](../README.md#embedded-llm-runbook).
+A hosted provider (Anthropic / OpenRouter) or another box on the LAN is the
+same flip with a different URL — see the decision matrix in
+[deploy/README.md](../README.md#embedded-llm-runbook).
 
 ## Update
 

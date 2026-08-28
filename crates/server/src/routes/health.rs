@@ -8,6 +8,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<Value> {
         .fetch_one(&state.pool)
         .await
         .is_ok();
+    let models = state.nlp.provider_models();
 
     Json(json!({
         "status": if db_ok { "ok" } else { "degraded" },
@@ -23,6 +24,11 @@ pub async fn health_check(State(state): State<AppState>) -> Json<Value> {
             },
             "extractor": {
                 "provider": state.nlp.provider_name(),
+                // The models the live provider resolved to — null for
+                // model-less providers. A box silently downgraded to the
+                // heuristic provider is visible right here.
+                "extract_model": models.as_ref().map(|(e, _)| e.clone()),
+                "distill_model": models.as_ref().map(|(_, d)| d.clone()),
             }
         }
     }))
