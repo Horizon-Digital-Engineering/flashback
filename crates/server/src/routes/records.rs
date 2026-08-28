@@ -666,9 +666,9 @@ fn assemble_char_budget() -> usize {
 /// Enforce the record limit and the character budget on a final record set,
 /// in rank order. The first record always survives, so one long document can
 /// still be served alone. Returns a warning sentence when the budget clipped.
-fn clamp_assembled(records: &mut Vec<RawRecordRow>, limit: i64) -> Option<String> {
+fn clamp_assembled(records: &mut Vec<RawRecordRow>, limit: i64, reserved: usize) -> Option<String> {
     records.truncate(limit as usize);
-    let budget = assemble_char_budget();
+    let budget = assemble_char_budget().saturating_sub(reserved);
     let before = records.len();
     let mut used = 0usize;
     let mut keep = before;
@@ -763,7 +763,7 @@ pub(crate) async fn assemble_inner(
             .bind(&req.exclude_container_id)
             .fetch_all(pool)
             .await?;
-        let clip = clamp_assembled(&mut records, limit);
+        let clip = clamp_assembled(&mut records, limit, 0);
         return Ok(AssembleResponse {
             synthesis: Vec::new(),
             records,
@@ -776,7 +776,7 @@ pub(crate) async fn assemble_inner(
     // over raw, across every mode. Visible `degraded` flag + a warning.
     if cross_mode {
         let mut records = cross_mode_degraded(pool, nlp, user_id, &req, &query, limit).await?;
-        let clip = clamp_assembled(&mut records, limit);
+        let clip = clamp_assembled(&mut records, limit, 0);
         return Ok(AssembleResponse {
             synthesis: Vec::new(),
             records,
@@ -872,8 +872,19 @@ pub(crate) async fn assemble_inner(
     for (node_id, _level, kind, content, event_time) in curated_scored
         .iter()
         .filter(|(_, _, kind, ..)| kind == "semantic" || kind == "summary")
-        .take(SYNTHESIS_MAX)
     {
+        if synthesis.len() >= SYNTHESIS_MAX {
+            break;
+        }
+        // The container exclusion must hold HERE too: facts and summaries
+        // carry no container of their own, but their lineage can reach the
+        // live conversation — serving that distillate back into the same
+        // conversation is the echo the exclusion exists to prevent.
+        if let Some(excl) = req.exclude_container_id.as_deref() {
+            if node_touches_container(pool, *node_id, excl).await? {
+                continue;
+            }
+        }
         synthesis.push(SynthesisItem {
             id: *node_id,
             kind: kind.clone(),
@@ -964,7 +975,9 @@ pub(crate) async fn assemble_inner(
         records.extend(backstop);
     }
 
-    let clip = clamp_assembled(&mut records, limit);
+    // Served synthesis text spends the same budget the records do.
+    let synth_chars: usize = synthesis.iter().map(|s| s.content.chars().count()).sum();
+    let clip = clamp_assembled(&mut records, limit, synth_chars);
     Ok(AssembleResponse {
         synthesis,
         records,
@@ -1128,6 +1141,34 @@ async fn reference_hits(
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+/// True when any raw record in this curated node's evidence lineage lives in
+/// `container`. Summaries span containers and carry none of their own, so
+/// the check walks the summary tree down to raw.
+async fn node_touches_container(pool: &PgPool, node_id: Uuid, container: &str) -> AppResult<bool> {
+    let hit: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            WITH RECURSIVE tree AS (
+                SELECT $1::uuid AS id
+                UNION
+                SELECT e.to_id FROM curated_edges e
+                JOIN tree t ON e.from_id = t.id AND e.kind = 'summarizes'
+            )
+            SELECT 1
+            FROM tree t
+            JOIN curated_edges df ON df.from_id = t.id AND df.kind = 'derived_from'
+            JOIN raw_records r ON r.id = df.to_id
+            WHERE r.container_id = $2
+        )
+        "#,
+    )
+    .bind(node_id)
+    .bind(container)
+    .fetch_one(pool)
+    .await?;
+    Ok(hit)
 }
 
 /// Raw ids reachable from a curated node: walk `summarizes` down to the
@@ -1767,6 +1808,103 @@ mod tests {
         assert!(
             out.synthesis.iter().all(|s| !s.source_raw_ids.is_empty()),
             "every synthesis item carries drill-down evidence"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn synthesis_honors_the_container_exclusion(pool: PgPool) {
+        use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+        struct Distilling;
+        #[async_trait]
+        impl NlpService for Distilling {
+            fn provider_name(&self) -> &'static str {
+                "test-distill"
+            }
+            fn provider_can_distill(&self) -> bool {
+                true
+            }
+            fn embedder_model_name(&self) -> &str {
+                "sentence-transformers/all-MiniLM-L6-v2"
+            }
+            fn embedder_dimension(&self) -> usize {
+                384
+            }
+            async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
+                Ok(vec![0.1_f32; 384])
+            }
+            async fn embed_batch(&self, t: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+                Ok(t.iter().map(|_| vec![0.1_f32; 384]).collect())
+            }
+            fn extract_entities(&self, t: &str) -> Vec<String> {
+                flashback_nlp::extract_entities(t)
+            }
+            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
+                Ok(Extraction::empty())
+            }
+            async fn distill_facts(
+                &self,
+                e: &[EpisodeRef],
+            ) -> Result<Vec<DistilledFact>, ProviderError> {
+                Ok(vec![DistilledFact {
+                    content: "the deploy target is staging".into(),
+                    topic: None,
+                    source_episode_ids: e.iter().map(|x| x.id).collect(),
+                    confidence: 0.9,
+                }])
+            }
+        }
+        // Two same-topic documents, all evidence inside container "live".
+        for i in 0..2 {
+            ingest_record(
+                &pool,
+                &Distilling,
+                "leslie",
+                IngestRecordRequest {
+                    project_id: None,
+                    container_id: Some("live".into()),
+                    ..req(&format!(
+                        "note {i}: the deploy target for the pgvector service is staging"
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        }
+        crate::curation::rebuild(&pool, &Distilling, "leslie")
+            .await
+            .unwrap();
+
+        let base = AssembleRequest {
+            include_sandbox: false,
+            project_id: None,
+            container_id: None,
+            mode: None,
+            modes: None,
+            exclude_container_id: None,
+            query: Some("deploy target".into()),
+            limit: Some(10),
+        };
+        // Without exclusion the fact is served…
+        let out = assemble_inner(&pool, &Distilling, "leslie", base.clone())
+            .await
+            .unwrap();
+        assert!(!out.synthesis.is_empty());
+        // …but from inside that conversation, its own distillate must not echo.
+        let out = assemble_inner(
+            &pool,
+            &Distilling,
+            "leslie",
+            AssembleRequest {
+                exclude_container_id: Some("live".into()),
+                ..base
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.synthesis.is_empty(),
+            "distillate of the excluded conversation leaked: {:?}",
+            out.synthesis
         );
     }
 

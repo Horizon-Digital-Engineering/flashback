@@ -795,7 +795,13 @@ pub async fn distill_semantic(
         .bind(&embedder_key)
         .fetch_all(pool)
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                "curation: embedding fetch failed ({e}) — this pass clusters \
+                 on the entity fallback only"
+            );
+            Vec::new()
+        });
     let mut emb_by_node: HashMap<Uuid, Vec<f32>> = emb_rows
         .into_iter()
         .map(|(id, v)| (id, v.to_vec()))
@@ -844,7 +850,12 @@ pub async fn distill_semantic(
     }
 
     let clusters = cluster_by_entities(&episodes);
-    stats.clusters_seen = clusters.len() as i64;
+    // Only clusters that can actually distill count — context-only groups
+    // are not work.
+    stats.clusters_seen = clusters
+        .iter()
+        .filter(|c| c.iter().any(|&i| !episodes[i].already_distilled))
+        .count() as i64;
 
     // Singletons stay eligible (a future related episode can still pull them
     // into a cluster), but their attempt count is bumped so the batch ordering
@@ -1268,7 +1279,13 @@ async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64
 /// Write `supersedes` edges from a newly distilled fact to every ACTIVE
 /// semantic fact in scope whose embedding sits within `SUPERSEDE_COSINE` and
 /// whose evidence is STRICTLY older — same-evidence siblings from one pass
-/// never retire each other. Returns how many windows closed.
+/// never retire each other. An UNDATED old fact counts as older (retirable):
+/// a fact that cannot prove its evidence is newer yields to one that can.
+/// Deliberately forward-only: closure happens when the newer fact distills.
+/// Backfilled history distilled after a newer fact does NOT retroactively
+/// retire it, and same-time facts coexist — the reconciliation pass owns the
+/// bidirectional case; this hook handles the live-forward one. Returns how
+/// many windows closed.
 async fn supersede_older_facts(
     pool: &PgPool,
     scope: &Scope,
@@ -1290,7 +1307,7 @@ async fn supersede_older_facts(
            AND n.project_id IS NOT DISTINCT FROM $3 \
            AND n.mode IS NOT DISTINCT FROM $4 \
            AND n.id <> $1 \
-           AND COALESCE(n.event_time, n.created_at) < $5 \
+           AND (n.event_time IS NULL OR n.event_time < $5) \
            AND NOT EXISTS ( \
                SELECT 1 FROM curated_edges s \
                WHERE s.to_id = n.id AND s.kind = 'supersedes' \
@@ -1396,8 +1413,11 @@ async fn rebuild_inner(
         // tree is reproducible.
         let s = crate::summaries::build_summaries(pool, nlp, &scope).await?;
         total.promoted += p.promoted;
+        total.refreshed += p.refreshed;
         total.distilled += d.distilled;
         total.clusters_seen += d.clusters_seen;
+        total.clusters_failed += d.clusters_failed;
+        total.superseded += d.superseded;
         total.skipped_distill = total.skipped_distill || d.skipped_distill;
         total.summarized += s.summaries;
         total.max_level = total.max_level.max(s.max_level);
@@ -1627,9 +1647,11 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 struct Cluster {
     members: Vec<usize>,
-    /// Running mean of members' normalized embeddings; None until a member
-    /// with an embedding joins. Renormalized at comparison time.
+    /// Running mean of the EMBEDDED members' normalized embeddings; None
+    /// until one joins. Renormalized at comparison time.
     centroid: Option<Vec<f32>>,
+    /// How many members contributed to the centroid — the mean's denominator.
+    embedded: usize,
     /// The seed member's index — the entity-fallback comparison surface.
     seed: usize,
 }
@@ -1670,7 +1692,7 @@ pub(crate) fn cluster_for_distill(
                 if let Some(e) = &embeddings[i] {
                     c.centroid = Some(match c.centroid.take() {
                         Some(mut cen) => {
-                            let k = c.members.len() as f32;
+                            let k = c.embedded as f32;
                             for (m, x) in cen.iter_mut().zip(e) {
                                 *m = (*m * k + x) / (k + 1.0);
                             }
@@ -1678,10 +1700,12 @@ pub(crate) fn cluster_for_distill(
                         }
                         None => e.clone(),
                     });
+                    c.embedded += 1;
                 }
                 c.members.push(i);
             }
             None => clusters.push(Cluster {
+                embedded: usize::from(embeddings[i].is_some()),
                 members: vec![i],
                 centroid: embeddings[i].clone(),
                 seed: i,
@@ -2750,6 +2774,98 @@ mod tests {
         let third = curate(&pool, &nlp, "alice").await.unwrap();
         assert_eq!(third.distilled, 0);
         assert_eq!(third.superseded, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn unrelated_newer_facts_do_not_retire_older_ones(pool: PgPool) {
+        // A stub whose fact text derives from the cluster, so facts about
+        // different topics are genuinely dissimilar — which is what makes the
+        // supersede cosine threshold testable in the refusing direction.
+        struct TopicFactNlp;
+        #[async_trait]
+        impl NlpService for TopicFactNlp {
+            fn provider_name(&self) -> &'static str {
+                "test-topic"
+            }
+            fn provider_can_distill(&self) -> bool {
+                true
+            }
+            fn embedder_model_name(&self) -> &str {
+                "test-embedder"
+            }
+            fn embedder_dimension(&self) -> usize {
+                384
+            }
+            async fn embed_one(&self, text: &str) -> Result<Vec<f32>, AppError> {
+                Ok(bow_embed(text))
+            }
+            async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+                Ok(texts.iter().map(|t| bow_embed(t)).collect())
+            }
+            fn extract_entities(&self, text: &str) -> Vec<String> {
+                flashback_nlp::extract_entities(text)
+            }
+            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
+                Ok(Extraction::empty())
+            }
+            async fn distill_facts(
+                &self,
+                e: &[EpisodeRef],
+            ) -> Result<Vec<DistilledFact>, ProviderError> {
+                Ok(vec![DistilledFact {
+                    content: format!("summary: {}", e[0].content),
+                    topic: None,
+                    source_episode_ids: e.iter().map(|x| x.id).collect(),
+                    confidence: 0.9,
+                }])
+            }
+        }
+
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "the deploy target for the pgvector service is staging",
+            10,
+        )
+        .await;
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "note: the deploy target for the pgvector service is staging",
+            10,
+        )
+        .await;
+        let first = curate(&pool, &TopicFactNlp, "alice").await.unwrap();
+        assert_eq!(first.distilled, 1);
+
+        // A newer, UNRELATED topic must not close the deploy fact's window.
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "repotted the garden basil into fresh soil",
+            0,
+        )
+        .await;
+        insert_document_raw_at(
+            &pool,
+            "alice",
+            "note: repotted the garden basil with fresh soil",
+            0,
+        )
+        .await;
+        let second = curate(&pool, &TopicFactNlp, "alice").await.unwrap();
+        assert_eq!(second.distilled, 1);
+        assert_eq!(second.superseded, 0, "dissimilar facts must coexist");
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes n WHERE n.kind = 'semantic' \
+             AND n.user_id = 'alice' AND NOT EXISTS ( \
+                 SELECT 1 FROM curated_edges s \
+                 WHERE s.to_id = n.id AND s.kind = 'supersedes')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active, 2);
     }
 
     // -- rebuild -----------------------------------------------------------

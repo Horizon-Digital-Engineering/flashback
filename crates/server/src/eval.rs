@@ -243,11 +243,27 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
         .find_map(|a| a.strip_prefix("--user="))
         .unwrap_or("eval-harness")
         .to_string();
+    // Seeded records are PERMANENT (raw is append-only) and the eval user
+    // joins every scheduled curation pass. An eval-prefixed id keeps that
+    // contained and obviously synthetic; targeting a real tenant is possible
+    // but only on purpose.
+    if !user.starts_with("eval") && !args.iter().any(|a| a == "--force-user") {
+        anyhow::bail!(
+            "eval seeds permanent records under user '{user}' in the configured \
+             database; use a user id starting with 'eval', or pass --force-user \
+             to target that id deliberately"
+        );
+    }
 
     let text = std::fs::read_to_string(file)?;
     let entries = parse_slice(&text).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
 
     let cfg = crate::config::Config::from_env()?;
+    eprintln!(
+        "eval: writing to {} as user '{user}' — seeded records persist and join \
+         scheduled curation",
+        cfg.database_url_safe()
+    );
     let pool = crate::db::create_pool(&cfg.database_url).await?;
     crate::db::migrate(&pool).await?;
     let provider_cfg = crate::settings::resolve_from_db(&pool, &cfg.provider).await;
