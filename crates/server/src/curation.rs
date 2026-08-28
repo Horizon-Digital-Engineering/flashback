@@ -23,14 +23,17 @@
 //!     standalone row is skipped once a `derived_from` edge points at it.
 //!
 //!   - `distill_semantic`: clusters active episodic curated nodes by entity
-//!     overlap, then asks the configured `AiProvider` to distill each cluster
-//!     into semantic facts. Entities come from `entity_index` (the HippoRAG
-//!     pointer table, populated during promotion) so a pass reads them instead
-//!     of re-extracting every time; on-the-fly `extract_entities` is the
-//!     fallback when the index has no row for a raw id yet. Each fact becomes a
-//!     `kind='semantic'` node with `derived_from` edges to *every* source raw
-//!     id. Requires a provider that can distill; the heuristic provider
-//!     degrades gracefully (logs + no-op).
+//!     overlap — each episode carrying its whole transcript, the union of its
+//!     raw rows' entities, and the time span it covers — then asks the
+//!     configured `AiProvider` to distill each cluster into semantic facts.
+//!     Entities come from `entity_index` (the HippoRAG pointer table,
+//!     populated during promotion); on-the-fly `extract_entities` over the
+//!     node content is the fallback when the index has no rows yet. Each fact
+//!     becomes a `kind='semantic'` node dated by its newest evidence, with
+//!     `derived_from` edges to the raw rows of the episodes the distiller
+//!     cited (whole-cluster fallback when it cites nothing valid). Requires a
+//!     provider that can distill; the heuristic provider degrades gracefully
+//!     (logs + no-op).
 //!
 //! Every new curated node is embedded into `curated_embeddings`. Promotion also
 //! populates `entity_index` and emits `curated_edges(kind='entity')` tying the
@@ -470,18 +473,42 @@ async fn entities_for_scope(pool: &PgPool, scope: &Scope) -> AppResult<HashMap<U
 // distill_semantic
 // ---------------------------------------------------------------------------
 
-/// An active episodic curated node plus the raw source content it derives from,
-/// with the entities it clusters on (read from `entity_index`, on-the-fly as
-/// fallback).
+/// An active episodic curated node, carried whole into distillation: its own
+/// content (the bounded transcript promotion rendered — never a single raw
+/// turn), the union of entities across every raw row it derives from, and the
+/// time span it covers.
 struct EpisodeNode {
-    /// Every raw id this episodic node was derived from (usually one).
+    node_id: Uuid,
+    /// Every raw id this episodic node was derived from.
     source_raw_ids: Vec<Uuid>,
     content: String,
     entities: Vec<String>,
+    /// When the episode started / ended. Equal for a single-record episode.
+    started: Option<DateTime<Utc>>,
+    ended: Option<DateTime<Utc>>,
+}
+
+impl EpisodeNode {
+    /// The `when` the distill prompt sees: an instant, or a `start..end` span.
+    fn when(&self) -> Option<String> {
+        match (self.started, self.ended) {
+            (Some(s), Some(e)) if s != e => Some(format!(
+                "{}..{}",
+                s.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                e.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            )),
+            (Some(s), _) => Some(s.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            _ => None,
+        }
+    }
 }
 
 /// Cluster active episodic curated nodes by entity overlap and distill each
-/// cluster into semantic facts. No-op (logged) when the provider can't distill.
+/// cluster into semantic facts. Episodes go to the distiller whole — the
+/// transcript promotion rendered, the union of entities across their raw rows,
+/// and when they happened — so a fact is derived from conversations, not from
+/// one arbitrary turn per conversation. No-op (logged) when the provider can't
+/// distill.
 pub async fn distill_semantic(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -498,15 +525,23 @@ pub async fn distill_semantic(
         return Ok(stats);
     }
 
-    // Active episodic nodes not already superseded by a semantic node, each with
-    // the raw ids they derive from. The raw content is what we extract entities
-    // from (raw is the source of truth; the episodic node content mirrors it).
-    let node_rows = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+    // Active episodic nodes, read WHOLE: the node's own content is the bounded
+    // transcript promotion rendered, and `meta` carries the session span. The
+    // deterministic ordering (time, then id) makes a pass reproducible — the
+    // previous shape joined through raw rows and inherited whatever content the
+    // join happened to surface first.
+    let node_rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<DateTime<Utc>>,
+            Option<serde_json::Value>,
+        ),
+    >(
         r#"
-        SELECT n.id, e.to_id AS raw_id, r.content
+        SELECT n.id, n.content, n.event_time, n.meta
         FROM curated_nodes n
-        JOIN curated_edges e ON e.from_id = n.id AND e.kind = 'derived_from'
-        JOIN raw_records r ON r.id = e.to_id
         WHERE n.kind = 'episodic'
           AND n.user_id = $1
           AND n.project_id IS NOT DISTINCT FROM $2
@@ -515,7 +550,7 @@ pub async fn distill_semantic(
               SELECT 1 FROM curated_edges s
               WHERE s.to_id = n.id AND s.kind = 'supersedes'
           )
-        ORDER BY n.created_at ASC
+        ORDER BY n.event_time ASC NULLS LAST, n.id ASC
         LIMIT $4
         "#,
     )
@@ -525,31 +560,68 @@ pub async fn distill_semantic(
     .bind(curation_batch_cap())
     .fetch_all(pool)
     .await?;
+    if node_rows.len() < 2 {
+        return Ok(stats);
+    }
+
+    // Lineage for the batch in one query: every raw id each node derives from.
+    let node_ids: Vec<Uuid> = node_rows.iter().map(|(id, ..)| *id).collect();
+    let edge_rows = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT from_id, to_id FROM curated_edges \
+         WHERE kind = 'derived_from' AND from_id = ANY($1) \
+         ORDER BY from_id, to_id",
+    )
+    .bind(&node_ids)
+    .fetch_all(pool)
+    .await?;
+    let mut raws_by_node: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (node_id, raw_id) in edge_rows {
+        raws_by_node.entry(node_id).or_default().push(raw_id);
+    }
 
     // The entities each raw id was indexed under, read from `entity_index`
-    // (the HippoRAG pointer table). Clustering reads this instead of
-    // re-extracting on every pass; when the index has no row for a raw id yet
-    // (e.g. a record promoted before the index existed), fall back to
-    // on-the-fly extraction so the pass still clusters correctly.
-    let mut entities_by_raw = entities_for_scope(pool, scope).await?;
+    // (the HippoRAG pointer table). An episode clusters on the UNION of its
+    // raw rows' entities — the whole conversation's signal, not one turn's.
+    // On-the-fly extraction over the node content is the fallback for records
+    // promoted before the index existed.
+    let entities_by_raw = entities_for_scope(pool, scope).await?;
 
-    // Fold (node, raw) rows into one EpisodeNode per node (a node can derive
-    // from several raw ids — e.g. a semantic node, but here only episodic).
-    let mut by_node: HashMap<Uuid, EpisodeNode> = HashMap::new();
-    for (node_id, raw_id, content) in node_rows {
-        let entities = entities_by_raw
-            .remove(&raw_id)
-            .filter(|e| !e.is_empty())
-            .unwrap_or_else(|| nlp.extract_entities(&content));
-        let entry = by_node.entry(node_id).or_insert_with(|| EpisodeNode {
-            source_raw_ids: Vec::new(),
-            content: content.clone(),
+    let mut episodes: Vec<EpisodeNode> = Vec::with_capacity(node_rows.len());
+    for (node_id, content, event_time, meta) in node_rows {
+        let source_raw_ids = raws_by_node.remove(&node_id).unwrap_or_default();
+        if source_raw_ids.is_empty() {
+            // An episode nothing points back at can't be cited; skip it.
+            continue;
+        }
+        let mut entities: Vec<String> = source_raw_ids
+            .iter()
+            .filter_map(|raw_id| entities_by_raw.get(raw_id))
+            .flatten()
+            .cloned()
+            .collect();
+        entities.sort();
+        entities.dedup();
+        if entities.is_empty() {
+            entities = nlp.extract_entities(&content);
+        }
+        let span = |key: &str| {
+            meta.as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc))
+        };
+        let started = span("started_at").or(event_time);
+        let ended = span("ended_at").or(started);
+        episodes.push(EpisodeNode {
+            node_id,
+            source_raw_ids,
+            content,
             entities,
+            started,
+            ended,
         });
-        entry.source_raw_ids.push(raw_id);
     }
-    let episodes: Vec<EpisodeNode> = by_node.into_values().collect();
-
     if episodes.len() < 2 {
         return Ok(stats);
     }
@@ -558,25 +630,18 @@ pub async fn distill_semantic(
     stats.clusters_seen = clusters.len() as i64;
 
     for cluster in clusters.iter().filter(|c| c.len() >= 2) {
+        // One EpisodeRef per EPISODE — the transcript, the unioned entities,
+        // and when it happened, so the distiller can weigh recency.
         let refs: Vec<EpisodeRef> = cluster
             .iter()
-            .filter_map(|&i| {
-                // The distiller identifies sources by the raw id (that's what
-                // the semantic node points back at). One EpisodeRef per raw id.
-                // An episode with no source raw id can't be cited, so skip it
-                // rather than index an empty vec.
-                let id = *episodes[i].source_raw_ids.first()?;
-                Some(EpisodeRef {
-                    id,
-                    content: episodes[i].content.clone(),
-                    topic: None,
-                    entities: episodes[i].entities.clone(),
-                })
+            .map(|&i| EpisodeRef {
+                id: episodes[i].node_id,
+                content: episodes[i].content.clone(),
+                topic: None,
+                entities: episodes[i].entities.clone(),
+                when: episodes[i].when(),
             })
             .collect();
-        if refs.is_empty() {
-            continue;
-        }
 
         let facts = match nlp.distill_facts(&refs).await {
             Ok(f) => f,
@@ -589,16 +654,47 @@ pub async fn distill_semantic(
             continue;
         }
 
-        // Every raw id feeding this cluster is a source for the derived fact.
-        let cluster_raw_ids: Vec<Uuid> = cluster
+        let in_cluster: HashMap<Uuid, &EpisodeNode> = cluster
             .iter()
-            .flat_map(|&i| episodes[i].source_raw_ids.iter().copied())
+            .map(|&i| (episodes[i].node_id, &episodes[i]))
             .collect();
 
         for fact in facts {
+            // Evidence-granularity lineage: the distiller cites the episodes a
+            // fact came from, and the fact's edges point at THOSE episodes' raw
+            // rows. A fact citing nothing valid falls back to the whole cluster
+            // rather than dropping lineage.
+            let cited: Vec<&EpisodeNode> = fact
+                .source_episode_ids
+                .iter()
+                .filter_map(|id| in_cluster.get(id).copied())
+                .collect();
+            let evidence: Vec<&EpisodeNode> = if cited.is_empty() {
+                in_cluster.values().copied().collect()
+            } else {
+                cited
+            };
+            let raw_ids: Vec<Uuid> = evidence
+                .iter()
+                .flat_map(|e| e.source_raw_ids.iter().copied())
+                .collect();
+            // A fact is dated by the newest evidence that supports it — never
+            // by the moment curation happened to run, which made every old
+            // fact look freshly minted to recency ranking.
+            let fact_time = evidence.iter().filter_map(|e| e.ended.or(e.started)).max();
+
             let node_id = Uuid::new_v4();
-            insert_node(pool, node_id, "semantic", &fact.content, scope, None, None).await?;
-            for raw_id in &cluster_raw_ids {
+            insert_node(
+                pool,
+                node_id,
+                "semantic",
+                &fact.content,
+                scope,
+                None,
+                fact_time,
+            )
+            .await?;
+            for raw_id in &raw_ids {
                 add_edge(pool, node_id, *raw_id, "derived_from").await?;
             }
             embed_node(pool, nlp, scope, node_id, &fact.content).await;
@@ -949,9 +1045,12 @@ mod tests {
 
     fn ep(entities: &[&str]) -> EpisodeNode {
         EpisodeNode {
+            node_id: Uuid::new_v4(),
             source_raw_ids: vec![Uuid::new_v4()],
             content: String::new(),
             entities: entities.iter().map(|s| s.to_string()).collect(),
+            started: None,
+            ended: None,
         }
     }
 
@@ -1004,6 +1103,54 @@ mod tests {
             &self,
             episodes: &[EpisodeRef],
         ) -> Result<Vec<DistilledFact>, ProviderError> {
+            Ok(vec![DistilledFact {
+                content: "distilled fact".to_string(),
+                topic: None,
+                source_episode_ids: episodes.iter().map(|e| e.id).collect(),
+                confidence: 0.9,
+            }])
+        }
+    }
+
+    /// Distilling stub that records the exact `EpisodeRef`s handed to it, so a
+    /// test can assert what distillation actually saw — the regression here was
+    /// an episode arriving as one arbitrary raw turn instead of its transcript.
+    #[derive(Clone, Default)]
+    struct CapturingNlp {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<EpisodeRef>>>,
+    }
+
+    #[async_trait]
+    impl NlpService for CapturingNlp {
+        fn provider_name(&self) -> &'static str {
+            "test-capture"
+        }
+        fn provider_can_distill(&self) -> bool {
+            true
+        }
+        fn embedder_model_name(&self) -> &str {
+            "test-embedder"
+        }
+        fn embedder_dimension(&self) -> usize {
+            384
+        }
+        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(vec![0.1_f32; 384])
+        }
+        async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+        }
+        fn extract_entities(&self, text: &str) -> Vec<String> {
+            flashback_nlp::extract_entities(text)
+        }
+        async fn extract_full(&self, _text: &str) -> Result<Extraction, AppError> {
+            Ok(Extraction::empty())
+        }
+        async fn distill_facts(
+            &self,
+            episodes: &[EpisodeRef],
+        ) -> Result<Vec<DistilledFact>, ProviderError> {
+            self.seen.lock().unwrap().extend(episodes.iter().cloned());
             Ok(vec![DistilledFact {
                 content: "distilled fact".to_string(),
                 topic: None,
@@ -1407,6 +1554,96 @@ mod tests {
         .unwrap();
         targets.sort();
         let mut want = vec![r1, r2];
+        want.sort();
+        assert_eq!(targets, want);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn distill_sees_whole_transcripts_spans_and_dates_the_fact(pool: PgPool) {
+        // Two sessions on the same topic, two turns each. The distiller must
+        // receive one ref per EPISODE carrying the transcript and the session
+        // span — not one arbitrary turn per session, which is what a
+        // join-ordering accident used to hand it.
+        let s1a = insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:user",
+            "the deploy target for the pgvector service is staging",
+            0,
+        )
+        .await;
+        let s1b = insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:assistant",
+            "confirmed, the deploy target for the pgvector service stays staging",
+            60,
+        )
+        .await;
+        let s2a = insert_turn(
+            &pool,
+            "alice",
+            "s2",
+            "host:agent:user",
+            "the deploy target for the pgvector service moved to production",
+            0,
+        )
+        .await;
+        let s2b = insert_turn(
+            &pool,
+            "alice",
+            "s2",
+            "host:agent:assistant",
+            "updating the deploy target for the pgvector service to production",
+            60,
+        )
+        .await;
+        let scope = Scope::new("alice");
+
+        let nlp = CapturingNlp::default();
+        promote_raw_to_episodic(&pool, &nlp, &scope).await.unwrap();
+        let stats = distill_semantic(&pool, &nlp, &scope).await.unwrap();
+        assert_eq!(stats.distilled, 1);
+
+        let refs = nlp.seen.lock().unwrap().clone();
+        assert_eq!(refs.len(), 2, "one ref per episode, not per raw turn");
+        for r in &refs {
+            assert!(
+                r.content.contains("user:"),
+                "transcript, not one turn: {}",
+                r.content
+            );
+            assert!(
+                r.content.contains("assistant:"),
+                "both speakers: {}",
+                r.content
+            );
+            let when = r.when.as_deref().expect("episode carries when");
+            assert!(when.contains(".."), "a session spans time, got {when}");
+        }
+
+        // The fact is dated by its newest evidence, never by the curation run,
+        // and its lineage reaches every cited episode's raw rows.
+        let (event_time, semantic_id): (Option<DateTime<Utc>>, Uuid) =
+            sqlx::query_as("SELECT event_time, id FROM curated_nodes WHERE kind = 'semantic'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            event_time.is_some(),
+            "semantic fact must carry evidence time"
+        );
+        let mut targets: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT to_id FROM curated_edges WHERE from_id = $1 AND kind = 'derived_from'",
+        )
+        .bind(semantic_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        targets.sort();
+        let mut want = vec![s1a, s1b, s2a, s2b];
         want.sort();
         assert_eq!(targets, want);
     }
