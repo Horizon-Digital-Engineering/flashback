@@ -44,7 +44,9 @@ use crate::auth::AuthUser;
 use sqlx::PgPool;
 
 /// Source tags for playground writes. They are ordinary `conversation` records
-/// — the point is that curation can't tell them apart from a host's.
+/// running the ordinary pipeline — but scoped to the sandbox project, so test
+/// chatter promotes, clusters and distills in its own bucket and never
+/// infects the real store. Same code path, separate data space.
 const SOURCE_USER: &str = "playground:user";
 const SOURCE_ASSISTANT: &str = "playground:assistant";
 
@@ -348,7 +350,10 @@ async fn run_turn(
         &*state.nlp,
         &user_id,
         AssembleRequest {
+            // Unscoped read + sandbox opt-in: the playground probes the REAL
+            // store and still recalls its own prior test conversations.
             project_id: None,
+            include_sandbox: true,
             container_id: None,
             mode: req.mode.clone(),
             modes: None,
@@ -408,7 +413,7 @@ async fn run_turn(
             event_time: None,
             source: SOURCE_USER.into(),
             source_ref: None,
-            project_id: None,
+            project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
             container_id: Some(req.container_id.clone()),
             mode: req.mode.clone(),
             importance: None,
@@ -490,7 +495,7 @@ async fn run_turn(
                 event_time: None,
                 source: SOURCE_ASSISTANT.into(),
                 source_ref: None,
-                project_id: None,
+                project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
                 container_id: Some(req.container_id.clone()),
                 mode: req.mode.clone(),
                 importance: None,

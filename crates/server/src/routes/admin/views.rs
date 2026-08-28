@@ -1684,6 +1684,7 @@ pub fn playground_view(
 </div>
 <p class="muted" style="margin-top:0;font-size:13px">
   Retrieval and the write use the same seams ritsu does — what happens here is what a real host gets.
+  Reads see your real memories; writes stay in the <code>playground</code> sandbox scope and never infect them.
 </p>
 {warn_banner}
 

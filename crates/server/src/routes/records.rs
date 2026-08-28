@@ -565,10 +565,16 @@ const W_DECAY: f64 = 0.075;
 /// Half-life (hours) of the recency term e^(-age/REC_S). ~30 days.
 const REC_S_HOURS: f64 = 30.0 * 24.0;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AssembleRequest {
     #[serde(default)]
     pub project_id: Option<String>,
+    /// Include the playground sandbox scope in an UNSCOPED request. Off by
+    /// default so hosts never retrieve sandbox chatter as memory; the
+    /// playground sets it so its own prior test conversations stay
+    /// recallable beside the real store. An explicit `project_id` ignores it.
+    #[serde(default)]
+    pub include_sandbox: bool,
     #[serde(default)]
     pub container_id: Option<String>,
     /// The cognitive register to search. A single mode name uses that mode's
@@ -604,6 +610,12 @@ pub struct AssembleResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
+
+/// The project scope every playground write lands in. Same pipeline, separate
+/// data space: sandbox records promote, cluster and distill inside their own
+/// per-project curation bucket, and an unscoped context assembly excludes them
+/// unless the caller opts in via `include_sandbox`.
+pub(crate) const SANDBOX_PROJECT: &str = "playground";
 
 async fn assemble(
     State(state): State<AppState>,
@@ -670,6 +682,8 @@ pub(crate) async fn assemble_inner(
 ) -> AppResult<AssembleResponse> {
     let limit = req.limit.unwrap_or(50).clamp(1, 200);
     let query = req.query.clone().unwrap_or_default();
+    // SQL literal for the sandbox opt-in — a compile-time-safe constant, not user input.
+    let sandbox_gate = if req.include_sandbox { "TRUE" } else { "FALSE" };
 
     // A cross-mode request can't compare cosine across mismatched dims. When the
     // caller asks for `all` (or names more than one distinct mode) we degrade to
@@ -707,6 +721,7 @@ pub(crate) async fn assemble_inner(
             SELECT {COLS} FROM raw_records
             WHERE user_id = $1
               AND ($2::text IS NULL OR project_id = $2)
+              AND ($2::text IS NOT NULL OR {sandbox_gate} OR project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
               AND ($3::text IS NULL OR container_id = $3)
               AND ($4::text IS NULL OR mode = $4)
               AND ($6::text IS NULL OR container_id IS DISTINCT FROM $6)
@@ -774,6 +789,7 @@ pub(crate) async fn assemble_inner(
             LEFT JOIN ref_weights rw ON rw.ref_id = n.id
             WHERE n.user_id = $2
               AND ($3::text IS NULL OR n.project_id = $3)
+              AND ($3::text IS NOT NULL OR {sandbox_gate} OR n.project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
               AND n.mode IS NOT DISTINCT FROM $4
               AND NOT EXISTS (
                   SELECT 1 FROM curated_edges s WHERE s.to_id = n.id AND s.kind = 'supersedes'
@@ -943,6 +959,8 @@ async fn cross_mode_degraded(
     limit: i64,
 ) -> AppResult<Vec<RawRecordRow>> {
     let entities = nlp.extract_entities(query);
+    // SQL literal for the sandbox opt-in — a compile-time-safe constant, not user input.
+    let sandbox_gate = if req.include_sandbox { "TRUE" } else { "FALSE" };
     let sql = format!(
         r#"
         SELECT {COLS_R} FROM raw_records r
@@ -954,6 +972,7 @@ async fn cross_mode_degraded(
         ) ent ON ent.record_id = r.id
         WHERE r.user_id = $2
           AND ($3::text IS NULL OR r.project_id = $3)
+          AND ($3::text IS NOT NULL OR {sandbox_gate} OR r.project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
           AND ($4::text IS NULL OR r.container_id = $4)
           AND ($7::text IS NULL OR r.container_id IS DISTINCT FROM $7)
           AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
@@ -1028,6 +1047,8 @@ async fn reference_hits(
     limit: i64,
 ) -> AppResult<Vec<RawRecordRow>> {
     // emb_col is a trusted constant from embedding_col_for_dim; all values bound.
+    // SQL literal for the sandbox opt-in — a compile-time-safe constant, not user input.
+    let sandbox_gate = if req.include_sandbox { "TRUE" } else { "FALSE" };
     let sql = format!(
         r#"
         SELECT {COLS_R} FROM raw_records r
@@ -1035,6 +1056,7 @@ async fn reference_hits(
         WHERE r.user_id = $2
           AND r.type = 'state_object'
           AND ($3::text IS NULL OR r.project_id = $3)
+          AND ($3::text IS NOT NULL OR {sandbox_gate} OR r.project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
           AND ($4::text IS NULL OR r.container_id = $4)
           AND ($10::text IS NULL OR r.container_id IS DISTINCT FROM $10)
           AND r.mode IS NOT DISTINCT FROM $5
@@ -1155,6 +1177,8 @@ async fn raw_hybrid(
     limit: i64,
     exclude: &[Uuid],
 ) -> AppResult<Vec<RawRecordRow>> {
+    // SQL literal for the sandbox opt-in — a compile-time-safe constant, not user input.
+    let sandbox_gate = if req.include_sandbox { "TRUE" } else { "FALSE" };
     // emb_col is a trusted constant from embedding_col_for_dim; all values bound.
     let sql = format!(
         r#"
@@ -1162,6 +1186,7 @@ async fn raw_hybrid(
         LEFT JOIN raw_embeddings e ON e.record_id = r.id AND e.model = $1
         WHERE r.user_id = $2
           AND ($3::text IS NULL OR r.project_id = $3)
+          AND ($3::text IS NOT NULL OR {sandbox_gate} OR r.project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
           AND ($4::text IS NULL OR r.container_id = $4)
           AND ($10::text IS NULL OR r.container_id IS DISTINCT FROM $10)
           AND r.mode IS NOT DISTINCT FROM $5
@@ -1518,6 +1543,95 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn sandbox_scope_never_reaches_an_unscoped_assembly(pool: PgPool) {
+        // One real record, one sandbox record, same topic; curate so the
+        // exclusion is exercised through the curated layer too, not just raw.
+        ingest_record(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            IngestRecordRequest {
+                project_id: None,
+                ..req("the deploy target for the pgvector service is staging")
+            },
+        )
+        .await
+        .unwrap();
+        ingest_record(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            IngestRecordRequest {
+                project_id: Some(SANDBOX_PROJECT.into()),
+                ..req("sandbox chatter: the deploy target for the pgvector service is bananas")
+            },
+        )
+        .await
+        .unwrap();
+        crate::curation::rebuild(&pool, &ModeAwareStub, "leslie")
+            .await
+            .unwrap();
+
+        let base = AssembleRequest {
+            include_sandbox: false,
+            project_id: None,
+            container_id: None,
+            mode: None,
+            modes: None,
+            exclude_container_id: None,
+            query: Some("deploy target".into()),
+            limit: Some(10),
+        };
+
+        // Unscoped: the sandbox is invisible — a host never retrieves it.
+        let out = assemble_inner(&pool, &ModeAwareStub, "leslie", base.clone())
+            .await
+            .unwrap();
+        assert!(!out.records.is_empty());
+        assert!(
+            out.records
+                .iter()
+                .all(|r| r.project_id.as_deref() != Some(SANDBOX_PROJECT)),
+            "sandbox record leaked into an unscoped assembly"
+        );
+
+        // Opt-in: the playground sees both spaces.
+        let out = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            AssembleRequest {
+                include_sandbox: true,
+                ..base.clone()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(out
+            .records
+            .iter()
+            .any(|r| r.project_id.as_deref() == Some(SANDBOX_PROJECT)));
+
+        // Explicit sandbox scope: only the sandbox.
+        let out = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            AssembleRequest {
+                project_id: Some(SANDBOX_PROJECT.into()),
+                ..base
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!out.records.is_empty());
+        assert!(out
+            .records
+            .iter()
+            .all(|r| r.project_id.as_deref() == Some(SANDBOX_PROJECT)));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn assemble_limit_binds_even_through_a_summary_tree(pool: PgPool) {
         // Eight same-topic documents curate into episodic nodes plus a summary
         // covering all of them. A ranked summary hit used to expand to its
@@ -1554,6 +1668,7 @@ mod tests {
             &ModeAwareStub,
             "leslie",
             AssembleRequest {
+                include_sandbox: false,
                 project_id: None,
                 container_id: None,
                 mode: None,
@@ -1587,6 +1702,7 @@ mod tests {
             &ModeAwareStub,
             "leslie",
             AssembleRequest {
+                include_sandbox: false,
                 project_id: Some("health".into()),
                 container_id: None,
                 mode: None,
@@ -1722,6 +1838,7 @@ mod tests {
             &StubNlp,
             "leslie",
             AssembleRequest {
+                include_sandbox: false,
                 project_id: None,
                 container_id: None,
                 mode: None,
@@ -1749,6 +1866,7 @@ mod tests {
             &StubNlp,
             "leslie",
             AssembleRequest {
+                include_sandbox: false,
                 project_id: None,
                 container_id: None,
                 mode: None,
@@ -1884,6 +2002,7 @@ mod tests {
             &StubNlp,
             "leslie",
             AssembleRequest {
+                include_sandbox: false,
                 project_id: None,
                 container_id: None,
                 mode: None,
@@ -1996,6 +2115,7 @@ mod tests {
 
     fn ctx_req(query: &str) -> AssembleRequest {
         AssembleRequest {
+            include_sandbox: false,
             project_id: None,
             container_id: None,
             mode: None,
@@ -2377,6 +2497,7 @@ mod tests {
 
     fn ctx_mode(query: &str, mode: &str) -> AssembleRequest {
         AssembleRequest {
+            include_sandbox: false,
             project_id: None,
             container_id: None,
             mode: Some(mode.into()),
@@ -2481,6 +2602,7 @@ mod tests {
             &ModeAwareStub,
             "leslie",
             AssembleRequest {
+                include_sandbox: false,
                 project_id: None,
                 container_id: None,
                 mode: Some("all".into()),
@@ -2518,6 +2640,7 @@ mod tests {
             &ModeAwareStub,
             "leslie",
             AssembleRequest {
+                include_sandbox: false,
                 project_id: None,
                 container_id: None,
                 mode: None,
@@ -2612,6 +2735,7 @@ mod tests {
             &StubNlp,
             "leslie",
             AssembleRequest {
+                include_sandbox: false,
                 project_id: None,
                 container_id: None,
                 mode: None,
