@@ -22,6 +22,10 @@
 //!   GET  /admin/api/map.json   — projected coordinates for the scatterplot
 //!   GET  /admin/curate         — curation status + trigger
 //!   POST /admin/api/curate     — run the curated-layer rebuild for this user
+//!   GET  /admin/settings       — system provider settings page
+//!   POST /admin/api/settings   — save settings + hot-swap the provider
+//!   GET  /admin/api/settings/models — models the configured endpoint serves
+//!   POST /admin/api/settings/test   — one real extraction with draft settings
 //!   GET  /admin/style.css      — embedded stylesheet
 
 use axum::{
@@ -34,6 +38,7 @@ use crate::AppState;
 mod handlers;
 pub(crate) mod playground;
 mod projection;
+mod settings_api;
 mod style;
 pub mod views;
 
@@ -92,5 +97,9 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/playground", get(handlers::playground_view))
         .route("/api/playground/turn", post(playground::turn))
         .route("/api/playground/settings", post(playground::save_settings))
+        .route("/settings", get(settings_api::view))
+        .route("/api/settings", post(settings_api::save))
+        .route("/api/settings/models", get(settings_api::models))
+        .route("/api/settings/test", post(settings_api::test_extraction))
         .with_state(state)
 }

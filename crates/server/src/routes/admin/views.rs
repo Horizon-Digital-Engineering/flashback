@@ -86,6 +86,7 @@ fn render_nav(active: &str, user_id: &str) -> String {
   {h}
   {i}
   {j}
+  {k}
   <span class="spacer"></span>
   <span class="user">{user_id}</span>
   <a href="/admin/logout">logout</a>
@@ -99,7 +100,8 @@ fn render_nav(active: &str, user_id: &str) -> String {
         g = item("map", "/admin/map", "Map"),
         h = item("curate", "/admin/curate", "Curate"),
         i = item("playground", "/admin/playground", "Playground"),
-        j = item("tokens", "/admin/tokens", "Tokens"),
+        j = item("settings", "/admin/settings", "Settings"),
+        k = item("tokens", "/admin/tokens", "Tokens"),
     )
 }
 
@@ -1401,6 +1403,241 @@ mod tests {
 /// like it remembered, and only then by asking why. Settings are server-side
 /// and per-operator, so they survive a different browser, a different origin,
 /// or a rebuilt machine.
+// ---------------------------------------------------------------------------
+// Settings — the runtime provider control surface.
+// ---------------------------------------------------------------------------
+
+/// Everything the settings page renders: the stored overrides, the effective
+/// config they resolve to over the environment, and what is actually live.
+pub struct SettingsInfo {
+    pub stored: crate::settings::SystemSettings,
+    pub effective_provider: &'static str,
+    pub effective_backend: String,
+    pub effective_api_base: Option<String>,
+    pub effective_extract_model: String,
+    pub effective_distill_model: String,
+    pub effective_extract_timeout_ms: u32,
+    pub effective_distill_timeout_ms: u32,
+    pub live_provider: &'static str,
+    pub live_models: Option<(String, String)>,
+    pub can_distill: bool,
+    pub env_has_key: bool,
+}
+
+/// Static so the script needs no brace-escaping; every dynamic value arrives
+/// through the JSON data island rendered next to it.
+const SETTINGS_JS: &str = r##"<script>
+const $ = id => document.getElementById(id);
+const DATA = JSON.parse($('settings-data').textContent);
+
+// Prefill: a field shows its stored override; empty means "inherit", and the
+// placeholder shows what is inherited so blank is never a mystery.
+$('st-provider').value = DATA.stored.provider || '';
+$('st-backend').value = DATA.stored.remote_backend || '';
+$('st-base').value = DATA.stored.api_base || '';
+$('st-base').placeholder = (DATA.effective.api_base || 'backend default') + ' — inherited';
+$('st-extract').value = DATA.stored.extract_model || '';
+$('st-extract').placeholder = DATA.effective.extract_model + ' — inherited';
+$('st-distill').value = DATA.stored.distill_model || '';
+$('st-distill').placeholder = DATA.effective.distill_model + ' — inherited';
+$('st-extract-t').value = DATA.stored.extract_timeout_ms ?? '';
+$('st-extract-t').placeholder = DATA.effective.extract_timeout_ms + ' — inherited';
+$('st-distill-t').value = DATA.stored.distill_timeout_ms ?? '';
+$('st-distill-t').placeholder = DATA.effective.distill_timeout_ms + ' — inherited';
+
+function currentBase() {
+  return $('st-base').value.trim() || DATA.effective.api_base || '';
+}
+function collect() {
+  const v = id => $(id).value.trim() || null;
+  const n = id => { const x = parseInt($(id).value, 10); return Number.isFinite(x) ? x : null; };
+  return {
+    provider: v('st-provider'), remote_backend: v('st-backend'), api_base: v('st-base'),
+    extract_model: v('st-extract'), distill_model: v('st-distill'),
+    extract_timeout_ms: n('st-extract-t'), distill_timeout_ms: n('st-distill-t'),
+  };
+}
+async function post(url, body) {
+  const res = await fetch(url, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+  return res.json();
+}
+
+$('st-load-models').addEventListener('click', async e => {
+  e.preventDefault();
+  const base = currentBase();
+  if (!base) { $('st-models-status').textContent = 'set a base URL first'; return; }
+  $('st-models-status').textContent = 'asking the endpoint…';
+  try {
+    const res = await fetch('/admin/api/settings/models?base=' + encodeURIComponent(base));
+    if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+    const { models } = await res.json();
+    const dl = $('st-model-list');
+    dl.replaceChildren(...models.map(m => Object.assign(document.createElement('option'), { value: m })));
+    $('st-models-status').textContent = models.length + ' model(s) served — the fields now autocomplete from them';
+  } catch (err) {
+    $('st-models-status').textContent = 'failed: ' + err.message;
+  }
+});
+
+$('st-test').addEventListener('click', async e => {
+  e.preventDefault();
+  $('st-test-out').textContent = 'running one real extraction…';
+  try {
+    const r = await post('/admin/api/settings/test', collect());
+    $('st-test-out').textContent = r.ok
+      ? 'ok — ' + r.model + ' answered in ' + r.latency_ms + ' ms\n\n'
+        + JSON.stringify(r.extraction, null, 2)
+      : 'FAILED after ' + r.latency_ms + ' ms — ' + r.error;
+  } catch (err) {
+    $('st-test-out').textContent = 'FAILED — ' + err.message;
+  }
+});
+
+$('st-save').addEventListener('click', async e => {
+  e.preventDefault();
+  $('st-save-status').textContent = 'saving + applying…';
+  try {
+    const r = await post('/admin/api/settings', collect());
+    $('st-save-status').textContent = r.warning
+      ? 'saved, but: ' + r.warning
+      : 'applied — pipeline now runs ' + r.applied_provider
+        + (r.applied_models ? ' (' + r.applied_models[0] + ')' : '');
+    if (!r.warning) setTimeout(() => location.reload(), 900);
+  } catch (err) {
+    $('st-save-status').textContent = 'failed: ' + err.message;
+  }
+});
+
+// Load the model list on open when a base URL is known — the dropdown being
+// pre-populated is the point of the page.
+if (currentBase()) $('st-load-models').click();
+</script>"##;
+
+pub fn settings_view(user_id: &str, info: &SettingsInfo) -> String {
+    let live_pill = if info.can_distill {
+        format!(
+            r#"<span class="pill" style="color:var(--good)">live: {}</span>"#,
+            esc(info.live_provider)
+        )
+    } else {
+        format!(
+            r#"<span class="pill" style="color:var(--warn)">live: {} — no semantic facts</span>"#,
+            esc(info.live_provider)
+        )
+    };
+    let live_models = match &info.live_models {
+        Some((e, d)) if e == d => format!("model <code>{}</code>", esc(e)),
+        Some((e, d)) => format!(
+            "extract <code>{}</code> · distill <code>{}</code>",
+            esc(e),
+            esc(d)
+        ),
+        None => "no model (provider runs without one)".to_string(),
+    };
+    let key_note = if info.env_has_key {
+        "an API key is present in the server environment and is sent to the endpoint"
+    } else {
+        "no API key in the server environment — fine for local endpoints; hosted \
+         backends need one set there (keys are never stored in the database)"
+    };
+    // `<` is escaped so no stored value can close the JSON script element and
+    // start its own — the one break-out this embedding shape allows.
+    let data = serde_json::json!({
+        "stored": info.stored,
+        "effective": {
+            "provider": info.effective_provider,
+            "backend": info.effective_backend,
+            "api_base": info.effective_api_base,
+            "extract_model": info.effective_extract_model,
+            "distill_model": info.effective_distill_model,
+            "extract_timeout_ms": info.effective_extract_timeout_ms,
+            "distill_timeout_ms": info.effective_distill_timeout_ms,
+        },
+    })
+    .to_string()
+    .replace('<', "\\u003c");
+
+    let content = format!(
+        r#"<div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+  <h1 style="margin-bottom:4px">Settings</h1>
+  {live_pill}
+</div>
+<p class="muted" style="margin-top:0;font-size:13px">
+  The extraction + distillation provider the whole pipeline runs on — every ingest and
+  curation pass, server-wide. The environment seeds these values; anything saved here wins
+  over it and applies immediately, no restart. Currently {live_models}.
+</p>
+
+<div class="card">
+  <div class="row" style="gap:8px;flex-wrap:wrap">
+    <label style="flex:0 0 160px">provider
+      <select id="st-provider" style="width:100%">
+        <option value="">inherit ({effective_provider})</option>
+        <option value="heuristic">heuristic — in-process, no model</option>
+        <option value="remote">remote — HTTP endpoint</option>
+      </select>
+    </label>
+    <label style="flex:0 0 200px">backend
+      <select id="st-backend" style="width:100%">
+        <option value="">inherit ({effective_backend})</option>
+        <option value="openai">openai-compatible</option>
+        <option value="anthropic">anthropic</option>
+        <option value="openrouter">openrouter</option>
+      </select>
+    </label>
+    <label style="flex:2;min-width:260px">base URL
+      <input id="st-base" style="width:100%;box-sizing:border-box" />
+    </label>
+  </div>
+  <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px;align-items:flex-end">
+    <label style="flex:1;min-width:200px">extract model
+      <input id="st-extract" list="st-model-list" style="width:100%;box-sizing:border-box" />
+    </label>
+    <label style="flex:1;min-width:200px">distill model
+      <input id="st-distill" list="st-model-list" style="width:100%;box-sizing:border-box" />
+    </label>
+    <button id="st-load-models" title="ask the endpoint what it serves">Load models</button>
+  </div>
+  <datalist id="st-model-list"></datalist>
+  <div class="muted" id="st-models-status" style="font-size:12px;margin-top:4px"></div>
+  <div class="row" style="gap:8px;flex-wrap:wrap;margin-top:10px">
+    <label style="flex:0 0 180px">extract timeout (ms)
+      <input id="st-extract-t" style="width:100%;box-sizing:border-box" />
+    </label>
+    <label style="flex:0 0 180px">distill timeout (ms)
+      <input id="st-distill-t" style="width:100%;box-sizing:border-box" />
+    </label>
+  </div>
+  <div class="row" style="align-items:center;gap:10px;margin-top:14px">
+    <button id="st-test">Test extraction</button>
+    <button id="st-save">Save &amp; apply</button>
+    <span id="st-save-status" class="muted" style="font-size:12px"></span>
+  </div>
+  <p class="muted" style="font-size:12px;margin-bottom:0">
+    Model fields autocomplete from what the endpoint actually serves — load the list and
+    pick from it. Leave a field blank to inherit the environment value shown in its
+    placeholder. Note: {key_note}.
+  </p>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h2 style="margin-top:0">Test result</h2>
+  <pre id="st-test-out" class="mono" style="white-space:pre-wrap;margin:0;min-height:40px">Run a test to see one real extraction with the draft settings — nothing is saved by testing.</pre>
+</div>
+
+<script id="settings-data" type="application/json">{data}</script>
+{SETTINGS_JS}"#,
+        effective_provider = esc(info.effective_provider),
+        effective_backend = esc(&info.effective_backend),
+        data = data,
+    );
+
+    page("settings", user_id, &content)
+}
+
 pub fn playground_view(
     user_id: &str,
     can_distill: bool,
