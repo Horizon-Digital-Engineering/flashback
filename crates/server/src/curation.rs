@@ -87,6 +87,11 @@ pub struct CurationStats {
     /// starvation this field exists to make visible.
     pub pending_sessions: i64,
     pub pending_solos: i64,
+    /// Episodes still carrying no `distilled_at` marker after the pass —
+    /// the distill-stage backlog, counted so IT can't starve silently either.
+    pub pending_undistilled: i64,
+    /// Another pass held this user's curation lock; nothing was done.
+    pub locked_out: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -659,7 +664,8 @@ pub async fn distill_semantic(
               SELECT 1 FROM curated_edges s
               WHERE s.to_id = n.id AND s.kind = 'supersedes'
           )
-        ORDER BY n.event_time ASC NULLS LAST, n.id ASC
+        ORDER BY COALESCE((n.meta->>'distill_attempts')::int, 0) ASC,
+                 n.event_time ASC NULLS LAST, n.id ASC
         LIMIT $4
         "#,
     )
@@ -737,6 +743,29 @@ pub async fn distill_semantic(
 
     let clusters = cluster_by_entities(&episodes);
     stats.clusters_seen = clusters.len() as i64;
+
+    // Singletons stay eligible (a future related episode can still pull them
+    // into a cluster), but their attempt count is bumped so the batch ordering
+    // rotates PAST them next pass. Without this, one-off topics accumulate at
+    // the head of the oldest-first batch and — past the cap — newer episodes
+    // never enter distillation at all: the promotion-stage starvation bug,
+    // reborn one stage down.
+    let singleton_ids: Vec<Uuid> = clusters
+        .iter()
+        .filter(|c| c.len() < 2)
+        .flat_map(|c| c.iter().map(|&i| episodes[i].node_id))
+        .collect();
+    if !singleton_ids.is_empty() {
+        sqlx::query(
+            "UPDATE curated_nodes \
+             SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object( \
+                 'distill_attempts', COALESCE((meta->>'distill_attempts')::int, 0) + 1) \
+             WHERE id = ANY($1)",
+        )
+        .bind(&singleton_ids)
+        .execute(pool)
+        .await?;
+    }
 
     for cluster in clusters.iter().filter(|c| c.len() >= 2) {
         // One EpisodeRef per EPISODE — the transcript, the unioned entities,
@@ -838,6 +867,47 @@ pub async fn distill_semantic(
 }
 
 // ---------------------------------------------------------------------------
+// The per-user curation lock
+// ---------------------------------------------------------------------------
+
+/// Advisory-lock namespace for curation. The scheduler tick, the admin curate
+/// button and the rebuild endpoint can otherwise overlap — and under the
+/// incremental path a race no longer self-heals: two passes that both see a
+/// session as unpromoted insert duplicate episodes that then cluster with each
+/// other and distill duplicate facts, permanently. One pass per user at a
+/// time, everywhere, is the invariant.
+const CURATION_LOCK_NS: i32 = 421_337;
+
+/// Try to take the per-user curation lock. `Some(conn)` holds the lock for as
+/// long as the connection is kept AND must be released via
+/// `release_curation_lock` on the same connection — a pooled session outlives
+/// this call, so dropping without unlocking would wedge the user until that
+/// session closes. Postgres frees the lock if the process dies.
+async fn try_curation_lock(
+    pool: &PgPool,
+    user_id: &str,
+) -> AppResult<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>> {
+    let mut conn = pool.acquire().await?;
+    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext($2))")
+        .bind(CURATION_LOCK_NS)
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(got.then_some(conn))
+}
+
+async fn release_curation_lock(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    user_id: &str,
+) {
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
+        .bind(CURATION_LOCK_NS)
+        .bind(user_id)
+        .execute(&mut **conn)
+        .await;
+}
+
+// ---------------------------------------------------------------------------
 // curate — the incremental hot path
 // ---------------------------------------------------------------------------
 
@@ -846,8 +916,27 @@ pub async fn distill_semantic(
 /// distilled, and rebuild the summary tree only when level 0 actually changed.
 /// Never wipes episodic or semantic state — `rebuild` is the recovery tool,
 /// this is the scheduled path. Repeated calls with no new raw records do no
-/// LLM work at all.
+/// LLM work at all. Single-flight per user: a pass that finds another running
+/// (scheduler vs button vs rebuild) skips with `locked_out` set instead of
+/// racing it into duplicate state.
 pub async fn curate(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+) -> AppResult<CurationStats> {
+    let Some(mut lock) = try_curation_lock(pool, user_id).await? else {
+        tracing::warn!(user = %user_id, "curation already running for this user; pass skipped");
+        return Ok(CurationStats {
+            locked_out: true,
+            ..Default::default()
+        });
+    };
+    let result = curate_inner(pool, nlp, user_id).await;
+    release_curation_lock(&mut lock, user_id).await;
+    result
+}
+
+async fn curate_inner(
     pool: &PgPool,
     nlp: &dyn NlpService,
     user_id: &str,
@@ -889,6 +978,7 @@ pub async fn curate(
         let (ps, po) = pending_promotable(pool, &scope).await?;
         total.pending_sessions += ps;
         total.pending_solos += po;
+        total.pending_undistilled += pending_undistilled(pool, &scope).await?;
     }
     if total.pending_sessions + total.pending_solos > 0 {
         tracing::warn!(
@@ -898,7 +988,38 @@ pub async fn curate(
              it drains on subsequent passes — rising numbers mean starvation"
         );
     }
+    if total.pending_undistilled > 0 {
+        tracing::info!(
+            pending_undistilled = total.pending_undistilled,
+            "curation: episodes not yet distilled — singletons waiting for \
+             related evidence are normal; a count that only ever rises while \
+             new records arrive means the distill stage is starving"
+        );
+    }
     Ok(total)
+}
+
+/// Episodes in scope still without a `distilled_at` marker — the distill-stage
+/// backlog. Includes lone singletons waiting for related evidence, which is
+/// why a non-zero value is normal; the trend is the signal.
+async fn pending_undistilled(pool: &PgPool, scope: &Scope) -> AppResult<i64> {
+    let n: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM curated_nodes n
+        WHERE n.kind = 'episodic'
+          AND n.user_id = $1
+          AND n.project_id IS NOT DISTINCT FROM $2
+          AND n.mode IS NOT DISTINCT FROM $3
+          AND (n.meta->>'distilled_at') IS NULL
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
 }
 
 /// Incremental pass for every user with raw records — the scheduler's call.
@@ -1024,6 +1145,26 @@ async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64
 /// never touched. Edges + embeddings cascade from the node delete (embeddings
 /// via FK; edges are wiped explicitly since they carry no FK to nodes).
 pub async fn rebuild(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+) -> AppResult<CurationStats> {
+    // Same single-flight lock as `curate`: a scheduler tick landing mid-wipe
+    // would re-promote sessions the wipe removed but the rebuild has not yet
+    // re-derived, and the duplicates would then be permanent.
+    let Some(mut lock) = try_curation_lock(pool, user_id).await? else {
+        tracing::warn!(user = %user_id, "curation already running for this user; rebuild skipped");
+        return Ok(CurationStats {
+            locked_out: true,
+            ..Default::default()
+        });
+    };
+    let result = rebuild_inner(pool, nlp, user_id).await;
+    release_curation_lock(&mut lock, user_id).await;
+    result
+}
+
+async fn rebuild_inner(
     pool: &PgPool,
     nlp: &dyn NlpService,
     user_id: &str,
@@ -2136,6 +2277,77 @@ mod tests {
             before, after,
             "summary tree must be untouched by an idle pass"
         );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_curation_is_single_flight_per_user(pool: PgPool) {
+        insert_document_raw(&pool, "alice", None, None, "the deploy target is staging").await;
+
+        // Hold alice's curation lock on a separate connection — exactly what a
+        // racing scheduler tick or rebuild holds.
+        let mut holder = pool.acquire().await.unwrap();
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext('alice'))")
+            .bind(CURATION_LOCK_NS)
+            .fetch_one(&mut *holder)
+            .await
+            .unwrap();
+        assert!(got);
+
+        let stats = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert!(stats.locked_out, "a held lock must skip the pass");
+        assert_eq!(count_nodes(&pool, "alice", "episodic").await, 0);
+        let stats = rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert!(stats.locked_out, "rebuild honors the same lock");
+
+        sqlx::query("SELECT pg_advisory_unlock($1, hashtext('alice'))")
+            .bind(CURATION_LOCK_NS)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let stats = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert!(!stats.locked_out);
+        assert_eq!(stats.promoted, 1, "released lock, pass proceeds");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn singletons_bump_attempts_and_undistilled_backlog_is_counted(pool: PgPool) {
+        // Two topics with disjoint entities: neither clusters, both stay
+        // eligible, and each pass must bump their attempt counter — the
+        // rotation key that keeps head-of-line singletons from starving the
+        // distill batch — while the undistilled backlog stays visible.
+        insert_document_raw(&pool, "alice", None, None, "the rocket launch window moved").await;
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "repotted the garden basil today",
+        )
+        .await;
+
+        let first = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(first.promoted, 2);
+        assert_eq!(first.distilled, 0, "disjoint topics must not cluster");
+        assert_eq!(first.pending_undistilled, 2);
+        let attempts: Vec<i64> = sqlx::query_scalar(
+            "SELECT (meta->>'distill_attempts')::bigint FROM curated_nodes \
+             WHERE kind = 'episodic' AND user_id = 'alice' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, vec![1, 1]);
+
+        let second = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(second.pending_undistilled, 2);
+        let attempts: Vec<i64> = sqlx::query_scalar(
+            "SELECT (meta->>'distill_attempts')::bigint FROM curated_nodes \
+             WHERE kind = 'episodic' AND user_id = 'alice' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, vec![2, 2], "each pass rotates the counter");
     }
 
     // -- rebuild -----------------------------------------------------------
