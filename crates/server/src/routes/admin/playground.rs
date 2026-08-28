@@ -44,7 +44,9 @@ use crate::auth::AuthUser;
 use sqlx::PgPool;
 
 /// Source tags for playground writes. They are ordinary `conversation` records
-/// — the point is that curation can't tell them apart from a host's.
+/// running the ordinary pipeline — but scoped to the sandbox project, so test
+/// chatter promotes, clusters and distills in its own bucket and never
+/// infects the real store. Same code path, separate data space.
 const SOURCE_USER: &str = "playground:user";
 const SOURCE_ASSISTANT: &str = "playground:assistant";
 
@@ -74,6 +76,25 @@ pub struct TurnRequest {
     /// migration for why it isn't stored). Local model servers ignore it.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Also retrieve from the REAL store. Off by default: the sandbox is a
+    /// self-contained bench whose contents you control; checking the box on
+    /// the page widens reads to real memories. Writes stay sandboxed always.
+    #[serde(default)]
+    pub include_real: bool,
+}
+
+/// The retrieval scope a turn runs with: sandbox-only by default, sandbox plus
+/// the real store when the operator asks. `(project_id, include_sandbox)` in
+/// `AssembleRequest` terms.
+fn turn_scope(include_real: bool) -> (Option<String>, bool) {
+    if include_real {
+        (None, true)
+    } else {
+        (
+            Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
+            false,
+        )
+    }
 }
 
 /// The default framing. Deliberately plain: it tells the model the memories are
@@ -91,6 +112,9 @@ pub struct RetrievedItem {
     pub content: String,
     pub event_time: String,
     pub container_id: Option<String>,
+    /// True when the record lives in the sandbox scope — the diagnostics tag
+    /// each memory so a mixed retrieval says which store it came from.
+    pub sandbox: bool,
 }
 
 impl From<&RawRecordRow> for RetrievedItem {
@@ -102,6 +126,7 @@ impl From<&RawRecordRow> for RetrievedItem {
             content: r.content.clone(),
             event_time: r.event_time.to_rfc3339(),
             container_id: r.container_id.clone(),
+            sandbox: r.project_id.as_deref() == Some(crate::routes::records::SANDBOX_PROJECT),
         }
     }
 }
@@ -134,8 +159,51 @@ pub struct TraceEvent {
     pub written: Vec<Uuid>,
     pub degraded: bool,
     pub warning: Option<String>,
+    /// The model that will answer, and whether it was inherited from the
+    /// system provider rather than set in the sandbox.
+    pub model: Option<String>,
+    pub model_inherited: bool,
     /// Set when no model will run (not configured); the stream ends after this.
     pub llm_error: Option<String>,
+}
+
+/// The model a playground turn runs with: the sandbox override when both of
+/// its fields are set, otherwise the SYSTEM provider — the playground's job is
+/// to exercise the configured pipeline, so the configured distill-role model
+/// is the default probe. Returns `(settings, inherited)`.
+pub(crate) async fn resolve_llm_settings(
+    pool: &PgPool,
+    env: &crate::config::ProviderConfig,
+    own: &Settings,
+    browser_key: Option<String>,
+) -> (Option<LlmSettings>, bool) {
+    if let (Some(base), Some(model)) = (own.base_url.as_deref(), own.model.as_deref()) {
+        return (
+            Some(LlmSettings {
+                base_url: base.to_string(),
+                model: model.to_string(),
+                api_key: browser_key,
+            }),
+            false,
+        );
+    }
+    let sys = crate::settings::resolve_from_db(pool, env).await;
+    if sys.kind == crate::config::ProviderKind::Remote {
+        if let Some(base) = sys.remote.api_base.clone() {
+            // The server-held key is the same one the pipeline itself sends to
+            // this endpoint; a browser-supplied key still wins for overrides.
+            let env_key = (!sys.remote.api_key.is_empty()).then(|| sys.remote.api_key.clone());
+            return (
+                Some(LlmSettings {
+                    base_url: base,
+                    model: sys.remote.distill_model.clone(),
+                    api_key: browser_key.or(env_key),
+                }),
+                true,
+            );
+        }
+    }
+    (None, false)
 }
 
 /// Phase 3: the wrap-up after the model finishes (or fails).
@@ -298,6 +366,7 @@ async fn run_turn(
     let settings = load_settings(&state.pool, &user_id)
         .await
         .unwrap_or_default();
+    let (scope_project, scope_include_sandbox) = turn_scope(req.include_real);
 
     // 1) Retrieval — the same call a host makes.
     let assembled = match assemble_inner(
@@ -305,7 +374,8 @@ async fn run_turn(
         &*state.nlp,
         &user_id,
         AssembleRequest {
-            project_id: None,
+            project_id: scope_project.clone(),
+            include_sandbox: scope_include_sandbox,
             container_id: None,
             mode: req.mode.clone(),
             modes: None,
@@ -365,7 +435,7 @@ async fn run_turn(
             event_time: None,
             source: SOURCE_USER.into(),
             source_ref: None,
-            project_id: None,
+            project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
             container_id: Some(req.container_id.clone()),
             mode: req.mode.clone(),
             importance: None,
@@ -384,14 +454,31 @@ async fn run_turn(
 
     // The endpoint comes from saved settings, never from the request — so a
     // half-filled form can't silently degrade the turn to retrieval-only.
-    let llm_cfg = match (settings.base_url.as_deref(), settings.model.as_deref()) {
-        (Some(base), Some(model)) => Some(LlmSettings {
-            base_url: base.to_string(),
-            model: model.to_string(),
-            api_key: req.api_key.clone(),
-        }),
-        _ => None,
-    };
+    let (llm_cfg, inherited) = resolve_llm_settings(
+        &state.pool,
+        &state.cfg.provider,
+        &settings,
+        req.api_key.clone(),
+    )
+    .await;
+
+    // The extractor's reading of this turn, concurrently with the reply — the
+    // half of the pipeline this page exists to make visible. Same model, same
+    // input as the ingest path's own extraction.
+    {
+        let nlp = state.nlp.clone();
+        let msg = req.message.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let payload = match nlp.extract_full(&msg).await {
+                Ok(x) => serde_json::to_string(&x).unwrap_or_default(),
+                Err(e) => json!({ "error": e.to_string() }).to_string(),
+            };
+            let _ = tx
+                .send(Event::default().event("extraction").data(payload))
+                .await;
+        });
+    }
 
     let trace = TraceEvent {
         retrieved,
@@ -399,10 +486,13 @@ async fn run_turn(
         written: written.clone(),
         degraded: assembled.degraded,
         warning: assembled.warning,
+        model: llm_cfg.as_ref().map(|c| c.model.clone()),
+        model_inherited: inherited,
         llm_error: llm_cfg.is_none().then(|| {
-            "No model configured — set a base URL and model name in settings. \
-             Retrieval still ran; the trace is complete up to the point a model \
-             would have been called."
+            "No model configured — set a base URL and model in the playground \
+             settings, or configure the system provider on the Settings page \
+             (the playground inherits it). Retrieval still ran; the trace is \
+             complete up to the point a model would have been called."
                 .to_string()
         }),
     };
@@ -427,14 +517,14 @@ async fn run_turn(
                 event_time: None,
                 source: SOURCE_ASSISTANT.into(),
                 source_ref: None,
-                project_id: None,
+                project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
                 container_id: Some(req.container_id.clone()),
                 mode: req.mode.clone(),
                 importance: None,
                 supersedes: None,
                 payload: Some(json!({
                     "origin": "playground",
-                    "model": settings.model,
+                    "model": cfg.model,
                 })),
             },
         )
@@ -466,6 +556,7 @@ mod tests {
             content: "  the quarterly report is due friday  ".into(),
             event_time: "2026-07-26T12:00:00+00:00".into(),
             container_id: Some("conv-9".into()),
+            sandbox: false,
         }];
         let block = render_context_block(&items);
         assert!(block.contains("[1] (conversation, host:helper:user, 2026-07-26T12:00:00+00:00)"));
@@ -477,6 +568,332 @@ mod tests {
     fn empty_retrieval_still_renders_a_header() {
         assert!(render_context_block(&[]).starts_with("Relevant memories"));
     }
+
+    #[test]
+    fn turn_scope_is_sandbox_only_unless_real_is_asked_for() {
+        let (project, include_sandbox) = turn_scope(false);
+        assert_eq!(project.as_deref(), Some("playground"));
+        assert!(!include_sandbox);
+        let (project, include_sandbox) = turn_scope(true);
+        assert!(project.is_none());
+        assert!(include_sandbox);
+    }
+
+    #[test]
+    fn seed_lines_parse_the_optional_date_prefix() {
+        let (t, c) = parse_seed_line("2025-11-02 | switched the backup drive");
+        assert_eq!(c, "switched the backup drive");
+        assert_eq!(t.unwrap().to_rfc3339(), "2025-11-02T12:00:00+00:00");
+        let (t, c) = parse_seed_line("prefers coffee at 93C");
+        assert!(t.is_none());
+        assert_eq!(c, "prefers coffee at 93C");
+        // A pipe without a date stays content, whole.
+        let (t, c) = parse_seed_line("a | b");
+        assert!(t.is_none());
+        assert_eq!(c, "a | b");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn seeded_memories_are_sandbox_documents_with_their_dates(pool: PgPool) {
+        use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+        struct SeedStub;
+        #[async_trait::async_trait]
+        impl crate::nlp::NlpService for SeedStub {
+            fn provider_name(&self) -> &'static str {
+                "stub"
+            }
+            fn provider_can_distill(&self) -> bool {
+                false
+            }
+            fn embedder_model_name(&self) -> &str {
+                "stub"
+            }
+            fn embedder_dimension(&self) -> usize {
+                384
+            }
+            async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
+                Ok(vec![0.1; 384])
+            }
+            async fn embed_batch(&self, t: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+                Ok(t.iter().map(|_| vec![0.1; 384]).collect())
+            }
+            fn extract_entities(&self, _t: &str) -> Vec<String> {
+                Vec::new()
+            }
+            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
+                Ok(Extraction::empty())
+            }
+            async fn distill_facts(
+                &self,
+                _e: &[EpisodeRef],
+            ) -> Result<Vec<DistilledFact>, ProviderError> {
+                Err(ProviderError::NotConfigured("stub".into()))
+            }
+        }
+
+        let n = seed_lines(
+            &pool,
+            &SeedStub,
+            "alice",
+            "2025-11-02 | switched the backup drive\n\nprefers coffee at 93C\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 2, "blank lines are skipped, not seeded");
+
+        let rows: Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT content, project_id, event_time FROM raw_records \
+             WHERE user_id = 'alice' ORDER BY content",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| r.1.as_deref() == Some("playground")),
+            "every seed lands in the sandbox scope"
+        );
+        let dated = rows.iter().find(|r| r.0.contains("backup")).unwrap();
+        assert_eq!(dated.2.to_rfc3339(), "2025-11-02T12:00:00+00:00");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn llm_settings_inherit_the_system_provider_when_sandbox_is_blank(pool: PgPool) {
+        let mut env = crate::config::ProviderConfig::from_env();
+        env.kind = crate::config::ProviderKind::Heuristic;
+        env.remote.api_base = None;
+
+        // Nothing anywhere → no model, not inherited.
+        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &Settings::default(), None).await;
+        assert!(cfg.is_none());
+        assert!(!inherited);
+
+        // A system settings row → the distill-role model, marked inherited.
+        crate::settings::save(
+            &pool,
+            &crate::settings::SystemSettings {
+                provider: Some("remote".into()),
+                remote_backend: Some("openai".into()),
+                api_base: Some("http://127.0.0.1:11434/v1".into()),
+                extract_model: Some("small:3b".into()),
+                distill_model: Some("gemma4:12b".into()),
+                extract_timeout_ms: None,
+                distill_timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &Settings::default(), None).await;
+        let cfg = cfg.expect("system provider must be inherited");
+        assert!(inherited);
+        assert_eq!(cfg.model, "gemma4:12b", "the distill role is the probe");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:11434/v1");
+
+        // A sandbox override still wins.
+        let own = Settings {
+            base_url: Some("http://127.0.0.1:1234/v1".into()),
+            model: Some("probe:7b".into()),
+            ..Default::default()
+        };
+        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &own, None).await;
+        assert!(!inherited);
+        assert_eq!(cfg.unwrap().model, "probe:7b");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn facts_for_container_scopes_to_the_conversation(pool: PgPool) {
+        let raw_here = Uuid::new_v4();
+        let raw_other = Uuid::new_v4();
+        for (id, container) in [(raw_here, "here"), (raw_other, "elsewhere")] {
+            sqlx::query(
+                "INSERT INTO raw_records (id, type, content, event_time, source, user_id, container_id) \
+                 VALUES ($1, 'conversation', 'x', NOW(), 'test', 'alice', $2)",
+            )
+            .bind(id)
+            .bind(container)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (fact, raw, content) in [
+            (Uuid::new_v4(), raw_here, "learned from here"),
+            (Uuid::new_v4(), raw_other, "learned elsewhere"),
+        ] {
+            sqlx::query(
+                "INSERT INTO curated_nodes (id, kind, content, level, user_id) \
+                 VALUES ($1, 'semantic', $2, 0, 'alice')",
+            )
+            .bind(fact)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO curated_edges (from_id, to_id, kind) VALUES ($1, $2, 'derived_from')",
+            )
+            .bind(fact)
+            .bind(raw)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let facts = facts_for_container(&pool, "alice", "here").await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "learned from here");
+        assert!(facts_for_container(&pool, "bob", "here")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seed — fill the sandbox with memories to play against.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SeedRequest {
+    /// One memory per line. A line may start with `YYYY-MM-DD |` to backdate
+    /// its event time — that is what makes recency ranking and the distill
+    /// prompt's newest-wins rule testable against seeded history.
+    pub text: String,
+}
+
+/// Ingest pasted lines as sandbox `document` records through the REAL ingest
+/// path — embeddings, entity extraction, everything — so what you play with
+/// was made exactly the way real memories are.
+pub async fn seed(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<SeedRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let user_id = user.user_id.clone();
+    if user_id == crate::auth::ALL_USERS {
+        return Err(AppError::bad_request(
+            "seeding needs a concrete user_id; sign in as a non-wildcard operator",
+        ));
+    }
+    let seeded = seed_lines(&state.pool, &*state.nlp, &user_id, &req.text).await?;
+    Ok(Json(json!({ "seeded": seeded })))
+}
+
+/// Parse `YYYY-MM-DD | content` when the prefix is present.
+fn parse_seed_line(line: &str) -> (Option<chrono::DateTime<chrono::Utc>>, &str) {
+    if let Some((date, rest)) = line.split_once('|') {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d") {
+            let t = d
+                .and_hms_opt(12, 0, 0)
+                .map(|dt| chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc));
+            return (t, rest.trim());
+        }
+    }
+    (None, line.trim())
+}
+
+pub(crate) async fn seed_lines(
+    pool: &PgPool,
+    nlp: &dyn crate::nlp::NlpService,
+    user_id: &str,
+    text: &str,
+) -> AppResult<i64> {
+    let mut seeded = 0_i64;
+    for line in text.lines() {
+        let (event_time, content) = parse_seed_line(line);
+        if content.is_empty() {
+            continue;
+        }
+        ingest_record(
+            pool,
+            nlp,
+            user_id,
+            IngestRecordRequest {
+                r#type: "document".into(),
+                content: content.to_string(),
+                event_time,
+                source: "playground:seed".into(),
+                source_ref: None,
+                project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
+                container_id: None,
+                mode: None,
+                importance: None,
+                supersedes: None,
+                payload: Some(json!({ "origin": "playground-seed" })),
+            },
+        )
+        .await?;
+        seeded += 1;
+    }
+    Ok(seeded)
+}
+
+// ---------------------------------------------------------------------------
+// Distill now — watch the conversation become facts.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct DistillNowRequest {
+    pub container_id: String,
+}
+
+/// Run one REAL incremental curation pass — the same one the scheduler runs,
+/// same per-user lock — then report the semantic facts whose lineage reaches
+/// this conversation. Talk, distill, see what it learned.
+pub async fn distill_now(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<DistillNowRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let user_id = user.user_id.clone();
+    if user_id == crate::auth::ALL_USERS {
+        return Err(AppError::bad_request(
+            "distillation needs a concrete user_id; sign in as a non-wildcard operator",
+        ));
+    }
+    let stats = crate::curation::curate(&state.pool, &*state.nlp, &user_id).await?;
+    let facts = facts_for_container(&state.pool, &user_id, &req.container_id).await?;
+    Ok(Json(json!({
+        "locked_out": stats.locked_out,
+        "promoted": stats.promoted,
+        "refreshed": stats.refreshed,
+        "distilled": stats.distilled,
+        "skipped_distill": stats.skipped_distill,
+        "provider": state.nlp.provider_name(),
+        "facts": facts,
+    })))
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ContainerFact {
+    pub id: Uuid,
+    pub content: String,
+    pub event_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Semantic facts whose `derived_from` lineage includes any raw record of this
+/// conversation — what the store has learned from it, newest evidence first.
+pub(crate) async fn facts_for_container(
+    pool: &PgPool,
+    user_id: &str,
+    container_id: &str,
+) -> AppResult<Vec<ContainerFact>> {
+    let rows = sqlx::query_as::<_, ContainerFact>(
+        r#"
+        SELECT DISTINCT n.id, n.content, n.event_time
+        FROM curated_nodes n
+        JOIN curated_edges e ON e.from_id = n.id AND e.kind = 'derived_from'
+        JOIN raw_records r ON r.id = e.to_id
+        WHERE n.kind = 'semantic'
+          AND n.user_id = $1
+          AND r.container_id = $2
+        ORDER BY n.event_time DESC NULLS LAST, n.id
+        "#,
+    )
+    .bind(user_id)
+    .bind(container_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------------

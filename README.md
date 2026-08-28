@@ -290,6 +290,7 @@ For every deployment there's a built-in admin UI at `/admin`. Login with any min
 - **Memory detail** — full content, structured extraction, lineage (supersede chain) walked both directions
 - **State** — current value of every state object you maintain
 - **Settings** — the live extraction/distillation provider: model picked from what the endpoint actually serves, one-click test extraction, applies without a restart
+- **Playground** — a seedable, sandboxed test bench for the whole loop: retrieval, the exact prompt, per-turn extraction, the streamed reply, and one-click distillation of the conversation into facts. Writes stay in a sandbox scope; reads can opt into the real store
 - **Tokens** — list + revoke per-client tokens
 - **Mind map** — force-directed network graph of your memories, edges for supersede / entity-overlap / same-session. Server-rendered HTML + inline vanilla JS, no framework, no CDN, no external assets.
 

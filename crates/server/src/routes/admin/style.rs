@@ -52,6 +52,17 @@ a:hover { color: var(--accent-hover); text-decoration: underline; }
     padding: 24px;
 }
 
+/* The build stamp shares the page's column instead of hugging the viewport
+   edge, and reads as chrome, not content. */
+footer.build {
+    max-width: 1180px;
+    margin: 32px auto 16px;
+    padding: 8px 24px;
+    color: var(--fg-2);
+    font-size: 11px;
+    opacity: 0.7;
+}
+
 .nav {
     display: flex;
     align-items: center;

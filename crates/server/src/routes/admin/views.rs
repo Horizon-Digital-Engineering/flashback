@@ -946,7 +946,7 @@ pub fn curate_view(
 
     let content = format!(
         r#"<h1>Curate</h1>
-<p class="muted">Rebuild the curated layer from raw: promote important/accessed <code>working</code> records to <code>episodic</code>, then cluster episodic records by topic + entity overlap and distill them into <code>semantic</code> facts. Raw is never touched — curation only writes the <code>curated_*</code> tables.</p>
+<p class="muted">Run an incremental curation pass: promote new records to <code>episodic</code>, refresh grown conversations, cluster and distill the undistilled into <code>semantic</code> facts, and re-derive summaries when anything changed. Raw is never touched, and an unchanged store costs no model work. The destructive wipe-and-re-derive rebuild lives behind the API, not this button.</p>
 {distill_note}
 <div class="card" style="display:flex;gap:12px;align-items:center">
   <form method="post" action="/admin/api/curate" class="inline">
@@ -1645,6 +1645,7 @@ pub fn playground_view(
     user_id: &str,
     can_distill: bool,
     settings: &super::playground::Settings,
+    system_model: Option<String>,
 ) -> String {
     let distill_note = if can_distill {
         r#"<span class="pill" style="color:var(--good)">distillation on</span>"#
@@ -1652,14 +1653,24 @@ pub fn playground_view(
         r#"<span class="pill" style="color:var(--warn)">heuristic provider — no semantic facts yet</span>"#
     };
     let configured = settings.base_url.is_some() && settings.model.is_some();
-    // The failure this replaces: a half-filled form silently degrading to
-    // retrieval-only, with the only clue a line of grey text under the input.
+    // Three states, in order of preference: a sandbox override (silent), no
+    // override but a system provider to inherit (a note, not a warning), and
+    // nothing anywhere (the original loud banner — a turn will get no reply).
     let warn_banner = if configured {
         String::new()
+    } else if let Some(m) = &system_model {
+        format!(
+            r#"<p class="muted" style="margin:12px 0;font-size:13px">
+  Turns use the system provider — <code>{}</code>, the model that distills your
+  memories. Set a base URL and model in ⚙ settings to probe a different one.
+</p>"#,
+            esc(m)
+        )
     } else {
         r#"<div class="error" style="margin:12px 0">
   <strong>No model configured.</strong> Turns will retrieve and write, but nothing will reply.
-  Set a base URL <em>and</em> a model name below — both are required.
+  Set a base URL and model below, or configure the system provider on the
+  <a href="/admin/settings">Settings</a> page — the playground inherits it.
 </div>"#
             .to_string()
     };
@@ -1673,6 +1684,8 @@ pub fn playground_view(
 </div>
 <p class="muted" style="margin-top:0;font-size:13px">
   Retrieval and the write use the same seams ritsu does — what happens here is what a real host gets.
+  Sandboxed by default: reads and writes stay in the <code>playground</code> scope. Tick
+  <em>include real memories</em> to also probe the real store — writes never leave the sandbox either way.
 </p>
 {warn_banner}
 
@@ -1687,6 +1700,16 @@ pub fn playground_view(
     System prompt — how retrieved memories get framed. The biggest lever on whether the model uses them.
   </label>
   <textarea id="pg-sys" rows="3" style="width:100%;box-sizing:border-box;margin-top:4px">{sys}</textarea>
+  <label class="muted" style="font-size:12px;display:block;margin-top:12px">
+    Seed the sandbox — one memory per line; an optional <code>YYYY-MM-DD |</code> prefix backdates it
+    (that's how you test recency and newest-wins distillation).
+  </label>
+  <textarea id="pg-seed" rows="3" style="width:100%;box-sizing:border-box;margin-top:4px"
+    placeholder="2025-11-02 | switched the home backup drive to the 4TB one&#10;prefers coffee brewed at 93C"></textarea>
+  <div class="row" style="align-items:center;gap:10px;margin-top:6px">
+    <button id="pg-seed-btn">Seed memories</button>
+    <span id="pg-seed-status" class="muted" style="font-size:12px"></span>
+  </div>
   <div class="row" style="align-items:center;gap:10px;margin-top:8px">
     <button id="pg-save">Save settings</button>
     <button id="pg-sys-reset" class="muted">reset prompt</button>
@@ -1710,6 +1733,9 @@ pub fn playground_view(
         style="width:100%;box-sizing:border-box"></textarea>
       <div class="row" style="align-items:center;gap:10px;margin-top:6px">
         <button id="pg-send">Send</button>
+        <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="pg-real" /> include real memories
+        </label>
         <span id="pg-status" class="muted" style="font-size:12px"></span>
       </div>
     </div>
@@ -1737,6 +1763,27 @@ $('pg-sys-reset').addEventListener('click', e => {{ e.preventDefault(); $('pg-sy
 // The API key is the only browser-held value; everything else is server-side.
 $('pg-key').value = localStorage.getItem('fb_pg_key') || '';
 $('pg-key').addEventListener('change', () => localStorage.setItem('fb_pg_key', $('pg-key').value));
+
+$('pg-real').checked = localStorage.getItem('fb_pg_real') === '1';
+$('pg-real').addEventListener('change', () => localStorage.setItem('fb_pg_real', $('pg-real').checked ? '1' : '0'));
+
+$('pg-seed-btn').addEventListener('click', async e => {{
+  e.preventDefault();
+  const text = $('pg-seed').value;
+  if (!text.trim()) {{ $('pg-seed-status').textContent = 'nothing to seed'; return; }}
+  $('pg-seed-status').textContent = 'seeding…';
+  try {{
+    const res = await fetch('/admin/api/playground/seed', {{
+      method: 'POST', headers: {{ 'content-type': 'application/json' }}, body: JSON.stringify({{ text }}),
+    }});
+    if (!res.ok) throw new Error((await res.text()).slice(0, 200));
+    const d = await res.json();
+    $('pg-seed-status').textContent = d.seeded + ' memories seeded — ask about them, or Distill now';
+    $('pg-seed').value = '';
+  }} catch (err) {{
+    $('pg-seed-status').textContent = 'failed: ' + err.message;
+  }}
+}});
 
 $('pg-save').addEventListener('click', async e => {{
   e.preventDefault();
@@ -1801,6 +1848,7 @@ function renderTrace(t, retrievalMs) {{
   parts.push(stat('retrieval', (retrievalMs / 1000).toFixed(2) + 's'));
   parts.push('</div>');
 
+  if (t.model) parts.push(`<p class="muted mono" style="font-size:11px;margin:4px 0">model: ${{esc(t.model)}}${{t.model_inherited ? ' · system default' : ''}}</p>`);
   if (t.degraded) parts.push(`<p class="pill" style="color:var(--warn)">degraded: ${{esc(t.warning || '')}}</p>`);
   parts.push('<div id="pg-llm-note"></div>');
   if (t.llm_error) llmNoteHtml = noReply(t.llm_error);
@@ -1812,7 +1860,7 @@ function renderTrace(t, retrievalMs) {{
     mem = '<ol style="padding-left:18px;margin:0">';
     for (const r of t.retrieved) {{
       mem += `<li style="margin-bottom:10px">
-        <div class="muted mono" style="font-size:11px">${{esc(r.type)}} · ${{esc(r.source)}}
+        <div class="muted mono" style="font-size:11px">${{r.sandbox ? 'sandbox' : 'real'}} · ${{esc(r.type)}} · ${{esc(r.source)}}
           · <time class="ts" datetime="${{esc(r.event_time)}}">${{esc(r.event_time)}}</time></div>
         <div style="white-space:pre-wrap;font-size:13px">${{esc(r.content.slice(0, 320))}}${{r.content.length > 320 ? '…' : ''}}</div>
       </li>`;
@@ -1829,11 +1877,18 @@ function renderTrace(t, retrievalMs) {{
   }}
   parts.push(section('Prompt sent — exactly what the model saw', pr, false));
 
+  parts.push(section('Extraction — what the pipeline understood', '<div id="pg-extraction"><p class="muted">extracting…</p></div>', true));
+
   parts.push(section('Written to raw', `<p class="mono" id="pg-written" style="font-size:12px"></p>
     <p class="muted" style="font-size:12px">Run <a href="/admin/curate">Curate</a> to derive episodes from these turns.</p>`, false));
 
+  parts.push(section('Distillation', `<button id="pg-distill">Distill now</button>
+    <span class="muted" style="font-size:12px"> runs a real curation pass, then shows what this conversation produced</span>
+    <div id="pg-distill-out" style="margin-top:8px"></div>`, false));
+
   $('pg-trace').innerHTML = parts.join('');
   if (llmNoteHtml) $('pg-llm-note').innerHTML = llmNoteHtml;
+  if (lastExtraction) renderExtraction(lastExtraction);
   patchWritten(t.written);
   for (const el of document.querySelectorAll('#pg-trace time.ts')) {{
     const d = new Date(el.getAttribute('datetime'));
@@ -1844,6 +1899,51 @@ function renderTrace(t, retrievalMs) {{
 let llmNoteHtml = '';
 const noReply = m => `<div class="error" style="margin:10px 0"><strong>No reply.</strong>
   <div style="font-size:12px;margin-top:4px;white-space:pre-wrap">${{esc(m)}}</div></div>`;
+
+// The extraction event can land before or after the trace rebuilds the panel;
+// keep the latest and render whenever both exist.
+let lastExtraction = null;
+function renderExtraction(x) {{
+  const el = $('pg-extraction');
+  if (!el) return;
+  if (x.error) {{ el.innerHTML = `<p class="muted">extraction failed: ${{esc(x.error)}}</p>`; return; }}
+  const ent = (x.entities || []).map(e => `<code>${{esc(e)}}</code>`).join(' ');
+  el.innerHTML = `<div class="mono" style="font-size:12px;line-height:1.9">
+    topic: ${{esc(x.topic || '—')}} · intent: ${{esc(x.intent || '—')}} · operation: ${{esc(x.operation || '—')}}
+    · mode: ${{esc(x.mode || '—')}} · confidence: ${{x.confidence != null ? Number(x.confidence).toFixed(2) : '—'}}<br/>
+    entities: ${{ent || '—'}}</div>`;
+}}
+
+// Delegated: the button is recreated with every trace render.
+$('pg-trace').addEventListener('click', async e => {{
+  if (!e.target || e.target.id !== 'pg-distill') return;
+  e.preventDefault();
+  const out = $('pg-distill-out');
+  e.target.disabled = true;
+  out.innerHTML = '<p class="muted">running a curation pass…</p>';
+  try {{
+    const res = await fetch('/admin/api/playground/distill', {{
+      method: 'POST', headers: {{ 'content-type': 'application/json' }},
+      body: JSON.stringify({{ container_id: container }}),
+    }});
+    if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+    const d = await res.json();
+    if (d.locked_out) {{ out.innerHTML = '<p class="muted">a curation pass is already running — try again in a moment</p>'; return; }}
+    if (d.skipped_distill) {{ out.innerHTML = `<p class="muted">provider ${{esc(d.provider)}} cannot distill — configure a remote provider in Settings</p>`; return; }}
+    let h = `<p class="muted mono" style="font-size:11px">promoted ${{d.promoted}} · refreshed ${{d.refreshed}} · distilled ${{d.distilled}}</p>`;
+    if (!d.facts.length) {{
+      h += '<p class="muted">No facts trace back to this conversation yet. A lone conversation stays a singleton until related evidence exists — revisit the topic in another conversation and distill again.</p>';
+    }} else {{
+      h += '<ul style="padding-left:18px;margin:0">' + d.facts.map(f =>
+        `<li style="margin-bottom:6px;font-size:13px">${{esc(f.content)}}</li>`).join('') + '</ul>';
+    }}
+    out.innerHTML = h;
+  }} catch (err) {{
+    out.innerHTML = `<p class="muted">failed: ${{esc(err.message)}}</p>`;
+  }} finally {{
+    e.target.disabled = false;
+  }}
+}});
 
 function patchWritten(ids) {{
   const el = $('pg-written');
@@ -1871,6 +1971,7 @@ async function send() {{
   bubble('user', msg);
   $('pg-msg').value = '';
   llmNoteHtml = '';
+  lastExtraction = null;
 
   const t0 = performance.now();
   let gotFirstDelta = false;
@@ -1884,7 +1985,7 @@ async function send() {{
   try {{
     const res = await fetch('/admin/api/playground/turn', {{
       method: 'POST', headers: {{ 'content-type': 'application/json' }},
-      body: JSON.stringify({{ message: msg, container_id: container, api_key: $('pg-key').value || null }}),
+      body: JSON.stringify({{ message: msg, container_id: container, api_key: $('pg-key').value || null, include_real: $('pg-real').checked }}),
     }});
     if (!res.ok) throw new Error((await res.text()).slice(0, 300));
 
@@ -1907,6 +2008,9 @@ async function send() {{
         if (!data) continue;
         if (ev === 'trace') {{
           renderTrace(JSON.parse(data), performance.now() - t0);
+        }} else if (ev === 'extraction') {{
+          lastExtraction = JSON.parse(data);
+          renderExtraction(lastExtraction);
         }} else if (ev === 'delta') {{
           if (!assistantEl) {{
             gotFirstDelta = true;
