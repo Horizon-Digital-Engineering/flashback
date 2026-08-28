@@ -74,10 +74,16 @@ pub struct RemoteLlmProvider {
 
 impl RemoteLlmProvider {
     pub fn new(config: RemoteLlmConfig) -> Result<Self, ProviderError> {
-        if config.api_key.is_empty() {
+        // A key is only mandatory when the endpoint is a hosted default. With
+        // an explicit api_base the endpoint is self-chosen — a local Ollama or
+        // vLLM needs no key, and refusing one here silently downgraded every
+        // such deploy to the heuristic provider at startup.
+        if config.api_key.is_empty() && config.api_base.is_none() {
             return Err(ProviderError::NotConfigured(
-                "RemoteLlmProvider requires an API key — set PROVIDER_REMOTE_API_KEY \
-                 (or OPENROUTER_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY)"
+                "RemoteLlmProvider requires an API key for hosted backends — set \
+                 PROVIDER_REMOTE_API_KEY (or OPENROUTER_API_KEY / ANTHROPIC_API_KEY / \
+                 OPENAI_API_KEY), or point PROVIDER_REMOTE_API_BASE at a self-hosted \
+                 endpoint that needs none"
                     .into(),
             ));
         }
@@ -202,8 +208,12 @@ impl RemoteLlmProvider {
             .http
             .post(&url)
             .timeout(Duration::from_millis(timeout_ms as u64))
-            .bearer_auth(&self.config.api_key)
             .json(&body);
+        // Keyless is a real configuration (self-hosted endpoint); don't send
+        // an empty Authorization header to servers that may reject it.
+        if !self.config.api_key.is_empty() {
+            req = req.bearer_auth(&self.config.api_key);
+        }
 
         // OpenRouter accepts (and recommends) HTTP-Referer + X-Title for
         // attribution. Harmless on OpenAI direct.
@@ -429,6 +439,22 @@ mod tests {
         let raw = "Here is the extraction:\n{\"topic\":\"x\",\"intent\":\"unknown\"}\nDone.";
         let e = parse_extraction(raw).unwrap();
         assert_eq!(e.topic.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn keyless_with_explicit_base_constructs() {
+        let cfg = RemoteLlmConfig {
+            api_base: Some("http://127.0.0.1:11434/v1".into()),
+            ..Default::default()
+        };
+        assert!(cfg.api_key.is_empty());
+        assert!(RemoteLlmProvider::new(cfg).is_ok());
+    }
+
+    #[test]
+    fn keyless_against_a_hosted_default_is_refused() {
+        let err = RemoteLlmProvider::new(RemoteLlmConfig::default()).err();
+        assert!(matches!(err, Some(ProviderError::NotConfigured(_))));
     }
 }
 
