@@ -111,15 +111,72 @@ install_tree() {
     log "installed binaries and migrations to $INSTALL_DIR"
 }
 
+# Ask the model runtime what it serves instead of requiring the name up
+# front. Discovery is not guessing: only a model the endpoint reports can be
+# chosen, so a model that isn't pulled can never be configured here. Among
+# several, prefer one reporting the `tools` capability — extraction output is
+# parsed as JSON, and models trained for function calling emit it reliably.
+# Prints "<model>\t<count>\t<all models>"; fails when nothing answers.
+discover_ollama_model() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "${OLLAMA_BASE%/v1}" <<'PY' 2>/dev/null
+import json, sys, urllib.request
+
+root = sys.argv[1]
+
+def call(path, payload=None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        root + path, data=data,
+        headers={"Content-Type": "application/json"} if data else {})
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.load(r)
+
+models = [m["name"] for m in call("/api/tags").get("models", [])]
+if not models:
+    sys.exit(1)
+
+def tools_capable(name):
+    try:
+        return "tools" in (call("/api/show", {"model": name}).get("capabilities") or [])
+    except Exception:
+        return False
+
+chosen = next((m for m in models if tools_capable(m)), models[0])
+print(chosen + "\t" + str(len(models)) + "\t" + " ".join(models))
+PY
+}
+
 write_env() {
     if [ -f "$ENV_FILE" ]; then
         log "$ENV_FILE exists — leaving it alone"
         return
     fi
 
-    # Only claim a provider when a model was named. Guessing a model that isn't
-    # pulled yields a service that starts, accepts writes, and silently fails
-    # every distillation — worse than an honest heuristic fallback.
+    if [ -z "$OLLAMA_MODEL" ]; then
+        log "FLASHBACK_OLLAMA_MODEL not set — asking ${OLLAMA_BASE%/v1} what it serves"
+        local discovered
+        if discovered="$(discover_ollama_model)"; then
+            OLLAMA_MODEL="$(printf '%s' "$discovered" | cut -f1)"
+            local count all
+            count="$(printf '%s' "$discovered" | cut -f2)"
+            all="$(printf '%s' "$discovered" | cut -f3)"
+            if [ "$count" = 1 ]; then
+                log "one model served — using $OLLAMA_MODEL"
+            else
+                log "$count models served ($all) — using $OLLAMA_MODEL; change it any time on /admin/settings"
+            fi
+        else
+            log "WARNING: no model runtime answered at ${OLLAMA_BASE%/v1} — starting with the"
+            log "WARNING: heuristic provider, which produces NO semantic facts. Pull a model"
+            log "WARNING: and pick it on the admin settings page (/admin/settings)."
+        fi
+    fi
+
+    # Only claim a provider when a model is known — named explicitly or
+    # discovered above. A model name the endpoint never reported yields a
+    # service that starts, accepts writes, and silently fails every
+    # distillation — worse than an honest heuristic fallback.
     local provider_block="PROVIDER=heuristic"
     if [ -n "$OLLAMA_MODEL" ]; then
         provider_block="PROVIDER=remote
