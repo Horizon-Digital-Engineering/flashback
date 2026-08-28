@@ -1684,7 +1684,8 @@ pub fn playground_view(
 </div>
 <p class="muted" style="margin-top:0;font-size:13px">
   Retrieval and the write use the same seams ritsu does — what happens here is what a real host gets.
-  Reads see your real memories; writes stay in the <code>playground</code> sandbox scope and never infect them.
+  Sandboxed by default: reads and writes stay in the <code>playground</code> scope. Tick
+  <em>include real memories</em> to also probe the real store — writes never leave the sandbox either way.
 </p>
 {warn_banner}
 
@@ -1699,6 +1700,16 @@ pub fn playground_view(
     System prompt — how retrieved memories get framed. The biggest lever on whether the model uses them.
   </label>
   <textarea id="pg-sys" rows="3" style="width:100%;box-sizing:border-box;margin-top:4px">{sys}</textarea>
+  <label class="muted" style="font-size:12px;display:block;margin-top:12px">
+    Seed the sandbox — one memory per line; an optional <code>YYYY-MM-DD |</code> prefix backdates it
+    (that's how you test recency and newest-wins distillation).
+  </label>
+  <textarea id="pg-seed" rows="3" style="width:100%;box-sizing:border-box;margin-top:4px"
+    placeholder="2025-11-02 | switched the home backup drive to the 4TB one&#10;prefers coffee brewed at 93C"></textarea>
+  <div class="row" style="align-items:center;gap:10px;margin-top:6px">
+    <button id="pg-seed-btn">Seed memories</button>
+    <span id="pg-seed-status" class="muted" style="font-size:12px"></span>
+  </div>
   <div class="row" style="align-items:center;gap:10px;margin-top:8px">
     <button id="pg-save">Save settings</button>
     <button id="pg-sys-reset" class="muted">reset prompt</button>
@@ -1722,6 +1733,9 @@ pub fn playground_view(
         style="width:100%;box-sizing:border-box"></textarea>
       <div class="row" style="align-items:center;gap:10px;margin-top:6px">
         <button id="pg-send">Send</button>
+        <label class="muted" style="font-size:12px;display:flex;align-items:center;gap:6px">
+          <input type="checkbox" id="pg-real" /> include real memories
+        </label>
         <span id="pg-status" class="muted" style="font-size:12px"></span>
       </div>
     </div>
@@ -1749,6 +1763,27 @@ $('pg-sys-reset').addEventListener('click', e => {{ e.preventDefault(); $('pg-sy
 // The API key is the only browser-held value; everything else is server-side.
 $('pg-key').value = localStorage.getItem('fb_pg_key') || '';
 $('pg-key').addEventListener('change', () => localStorage.setItem('fb_pg_key', $('pg-key').value));
+
+$('pg-real').checked = localStorage.getItem('fb_pg_real') === '1';
+$('pg-real').addEventListener('change', () => localStorage.setItem('fb_pg_real', $('pg-real').checked ? '1' : '0'));
+
+$('pg-seed-btn').addEventListener('click', async e => {{
+  e.preventDefault();
+  const text = $('pg-seed').value;
+  if (!text.trim()) {{ $('pg-seed-status').textContent = 'nothing to seed'; return; }}
+  $('pg-seed-status').textContent = 'seeding…';
+  try {{
+    const res = await fetch('/admin/api/playground/seed', {{
+      method: 'POST', headers: {{ 'content-type': 'application/json' }}, body: JSON.stringify({{ text }}),
+    }});
+    if (!res.ok) throw new Error((await res.text()).slice(0, 200));
+    const d = await res.json();
+    $('pg-seed-status').textContent = d.seeded + ' memories seeded — ask about them, or Distill now';
+    $('pg-seed').value = '';
+  }} catch (err) {{
+    $('pg-seed-status').textContent = 'failed: ' + err.message;
+  }}
+}});
 
 $('pg-save').addEventListener('click', async e => {{
   e.preventDefault();
@@ -1950,7 +1985,7 @@ async function send() {{
   try {{
     const res = await fetch('/admin/api/playground/turn', {{
       method: 'POST', headers: {{ 'content-type': 'application/json' }},
-      body: JSON.stringify({{ message: msg, container_id: container, api_key: $('pg-key').value || null }}),
+      body: JSON.stringify({{ message: msg, container_id: container, api_key: $('pg-key').value || null, include_real: $('pg-real').checked }}),
     }});
     if (!res.ok) throw new Error((await res.text()).slice(0, 300));
 

@@ -76,6 +76,25 @@ pub struct TurnRequest {
     /// migration for why it isn't stored). Local model servers ignore it.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Also retrieve from the REAL store. Off by default: the sandbox is a
+    /// self-contained bench whose contents you control; checking the box on
+    /// the page widens reads to real memories. Writes stay sandboxed always.
+    #[serde(default)]
+    pub include_real: bool,
+}
+
+/// The retrieval scope a turn runs with: sandbox-only by default, sandbox plus
+/// the real store when the operator asks. `(project_id, include_sandbox)` in
+/// `AssembleRequest` terms.
+fn turn_scope(include_real: bool) -> (Option<String>, bool) {
+    if include_real {
+        (None, true)
+    } else {
+        (
+            Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
+            false,
+        )
+    }
 }
 
 /// The default framing. Deliberately plain: it tells the model the memories are
@@ -343,6 +362,7 @@ async fn run_turn(
     let settings = load_settings(&state.pool, &user_id)
         .await
         .unwrap_or_default();
+    let (scope_project, scope_include_sandbox) = turn_scope(req.include_real);
 
     // 1) Retrieval — the same call a host makes.
     let assembled = match assemble_inner(
@@ -350,10 +370,8 @@ async fn run_turn(
         &*state.nlp,
         &user_id,
         AssembleRequest {
-            // Unscoped read + sandbox opt-in: the playground probes the REAL
-            // store and still recalls its own prior test conversations.
-            project_id: None,
-            include_sandbox: true,
+            project_id: scope_project.clone(),
+            include_sandbox: scope_include_sandbox,
             container_id: None,
             mode: req.mode.clone(),
             modes: None,
@@ -546,6 +564,94 @@ mod tests {
         assert!(render_context_block(&[]).starts_with("Relevant memories"));
     }
 
+    #[test]
+    fn turn_scope_is_sandbox_only_unless_real_is_asked_for() {
+        let (project, include_sandbox) = turn_scope(false);
+        assert_eq!(project.as_deref(), Some("playground"));
+        assert!(!include_sandbox);
+        let (project, include_sandbox) = turn_scope(true);
+        assert!(project.is_none());
+        assert!(include_sandbox);
+    }
+
+    #[test]
+    fn seed_lines_parse_the_optional_date_prefix() {
+        let (t, c) = parse_seed_line("2025-11-02 | switched the backup drive");
+        assert_eq!(c, "switched the backup drive");
+        assert_eq!(t.unwrap().to_rfc3339(), "2025-11-02T12:00:00+00:00");
+        let (t, c) = parse_seed_line("prefers coffee at 93C");
+        assert!(t.is_none());
+        assert_eq!(c, "prefers coffee at 93C");
+        // A pipe without a date stays content, whole.
+        let (t, c) = parse_seed_line("a | b");
+        assert!(t.is_none());
+        assert_eq!(c, "a | b");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn seeded_memories_are_sandbox_documents_with_their_dates(pool: PgPool) {
+        use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+        struct SeedStub;
+        #[async_trait::async_trait]
+        impl crate::nlp::NlpService for SeedStub {
+            fn provider_name(&self) -> &'static str {
+                "stub"
+            }
+            fn provider_can_distill(&self) -> bool {
+                false
+            }
+            fn embedder_model_name(&self) -> &str {
+                "stub"
+            }
+            fn embedder_dimension(&self) -> usize {
+                384
+            }
+            async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
+                Ok(vec![0.1; 384])
+            }
+            async fn embed_batch(&self, t: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+                Ok(t.iter().map(|_| vec![0.1; 384]).collect())
+            }
+            fn extract_entities(&self, _t: &str) -> Vec<String> {
+                Vec::new()
+            }
+            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
+                Ok(Extraction::empty())
+            }
+            async fn distill_facts(
+                &self,
+                _e: &[EpisodeRef],
+            ) -> Result<Vec<DistilledFact>, ProviderError> {
+                Err(ProviderError::NotConfigured("stub".into()))
+            }
+        }
+
+        let n = seed_lines(
+            &pool,
+            &SeedStub,
+            "alice",
+            "2025-11-02 | switched the backup drive\n\nprefers coffee at 93C\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 2, "blank lines are skipped, not seeded");
+
+        let rows: Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT content, project_id, event_time FROM raw_records \
+             WHERE user_id = 'alice' ORDER BY content",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| r.1.as_deref() == Some("playground")),
+            "every seed lands in the sandbox scope"
+        );
+        let dated = rows.iter().find(|r| r.0.contains("backup")).unwrap();
+        assert_eq!(dated.2.to_rfc3339(), "2025-11-02T12:00:00+00:00");
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn llm_settings_inherit_the_system_provider_when_sandbox_is_blank(pool: PgPool) {
         let mut env = crate::config::ProviderConfig::from_env();
@@ -635,6 +741,85 @@ mod tests {
             .unwrap()
             .is_empty());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Seed — fill the sandbox with memories to play against.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SeedRequest {
+    /// One memory per line. A line may start with `YYYY-MM-DD |` to backdate
+    /// its event time — that is what makes recency ranking and the distill
+    /// prompt's newest-wins rule testable against seeded history.
+    pub text: String,
+}
+
+/// Ingest pasted lines as sandbox `document` records through the REAL ingest
+/// path — embeddings, entity extraction, everything — so what you play with
+/// was made exactly the way real memories are.
+pub async fn seed(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Json(req): Json<SeedRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let user_id = user.user_id.clone();
+    if user_id == crate::auth::ALL_USERS {
+        return Err(AppError::bad_request(
+            "seeding needs a concrete user_id; sign in as a non-wildcard operator",
+        ));
+    }
+    let seeded = seed_lines(&state.pool, &*state.nlp, &user_id, &req.text).await?;
+    Ok(Json(json!({ "seeded": seeded })))
+}
+
+/// Parse `YYYY-MM-DD | content` when the prefix is present.
+fn parse_seed_line(line: &str) -> (Option<chrono::DateTime<chrono::Utc>>, &str) {
+    if let Some((date, rest)) = line.split_once('|') {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d") {
+            let t = d
+                .and_hms_opt(12, 0, 0)
+                .map(|dt| chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc));
+            return (t, rest.trim());
+        }
+    }
+    (None, line.trim())
+}
+
+pub(crate) async fn seed_lines(
+    pool: &PgPool,
+    nlp: &dyn crate::nlp::NlpService,
+    user_id: &str,
+    text: &str,
+) -> AppResult<i64> {
+    let mut seeded = 0_i64;
+    for line in text.lines() {
+        let (event_time, content) = parse_seed_line(line);
+        if content.is_empty() {
+            continue;
+        }
+        ingest_record(
+            pool,
+            nlp,
+            user_id,
+            IngestRecordRequest {
+                r#type: "document".into(),
+                content: content.to_string(),
+                event_time,
+                source: "playground:seed".into(),
+                source_ref: None,
+                project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
+                container_id: None,
+                mode: None,
+                importance: None,
+                supersedes: None,
+                payload: Some(json!({ "origin": "playground-seed" })),
+            },
+        )
+        .await?;
+        seeded += 1;
+    }
+    Ok(seeded)
 }
 
 // ---------------------------------------------------------------------------

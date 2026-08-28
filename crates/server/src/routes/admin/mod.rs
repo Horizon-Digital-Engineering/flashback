@@ -98,6 +98,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/playground/turn", post(playground::turn))
         .route("/api/playground/settings", post(playground::save_settings))
         .route("/api/playground/distill", post(playground::distill_now))
+        .route("/api/playground/seed", post(playground::seed))
         .route("/settings", get(settings_api::view))
         .route("/api/settings", post(settings_api::save))
         .route("/api/settings/models", post(settings_api::models))
