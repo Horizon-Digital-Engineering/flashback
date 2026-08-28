@@ -601,6 +601,13 @@ pub struct AssembleRequest {
 
 #[derive(Debug, Serialize)]
 pub struct AssembleResponse {
+    /// Distilled facts and summaries, rank order — the synthesis-first feed.
+    /// The curated layer was previously ranked and then thrown away, its
+    /// content reachable only through a viz endpoint; this is where the money
+    /// spent distilling actually reaches a consumer. Raw evidence follows in
+    /// `records`; each item carries drill-down ids into it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub synthesis: Vec<SynthesisItem>,
     pub records: Vec<RawRecordRow>,
     /// True when the request spanned modes and fell back to keyword/entity/
     /// recency retrieval (no cross-dimension vector search). The `warning`
@@ -610,6 +617,23 @@ pub struct AssembleResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
+
+/// One served curated node: a semantic fact or a summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct SynthesisItem {
+    pub id: Uuid,
+    /// `semantic` or `summary`.
+    pub kind: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_time: Option<DateTime<Utc>>,
+    /// A few raw ids to drill into the evidence; capped, not exhaustive.
+    pub source_raw_ids: Vec<Uuid>,
+}
+
+/// Synthesis items served per assembly, and drill ids carried per item.
+const SYNTHESIS_MAX: usize = 5;
+const SYNTHESIS_DRILL_IDS: i64 = 5;
 
 /// The project scope every playground write lands in. Same pipeline, separate
 /// data space: sandbox records promote, cluster and distill inside their own
@@ -741,6 +765,7 @@ pub(crate) async fn assemble_inner(
             .await?;
         let clip = clamp_assembled(&mut records, limit);
         return Ok(AssembleResponse {
+            synthesis: Vec::new(),
             records,
             degraded: false,
             warning: clip,
@@ -753,6 +778,7 @@ pub(crate) async fn assemble_inner(
         let mut records = cross_mode_degraded(pool, nlp, user_id, &req, &query, limit).await?;
         let clip = clamp_assembled(&mut records, limit);
         return Ok(AssembleResponse {
+            synthesis: Vec::new(),
             records,
             degraded: true,
             warning: merge_warning(
@@ -780,10 +806,10 @@ pub(crate) async fn assemble_inner(
     // ref_weights row scores 1.0 so absence never demotes it). The `mode` scope
     // is exact (never crosses a register), and the embedding column matches the
     // mode's dimension.
-    let curated_scored: Vec<(Uuid, i32)> = {
+    let curated_scored: Vec<(Uuid, i32, String, String, Option<DateTime<Utc>>)> = {
         let sql = format!(
             r#"
-            SELECT n.id, n.level
+            SELECT n.id, n.level, n.kind, n.content, n.event_time
             FROM curated_nodes n
             LEFT JOIN curated_embeddings ce ON ce.node_id = n.id AND ce.model = $1
             LEFT JOIN ref_weights rw ON rw.ref_id = n.id
@@ -815,7 +841,7 @@ pub(crate) async fn assemble_inner(
         );
         // emb_col is a trusted constant from embedding_col_for_dim; all values
         // are $-bound params.
-        sqlx::query_as::<_, (Uuid, i32)>(AssertSqlSafe(sql))
+        sqlx::query_as::<_, (Uuid, i32, String, String, Option<DateTime<Utc>>)>(AssertSqlSafe(sql))
             .bind(&model)
             .bind(user_id)
             .bind(&req.project_id)
@@ -836,8 +862,26 @@ pub(crate) async fn assemble_inner(
 
     // Bump the decay clock for every curated node we're serving (accessing a
     // node resets its retention to 1.0). Never deletes.
-    let touched: Vec<Uuid> = curated_scored.iter().map(|(id, _)| *id).collect();
+    let touched: Vec<Uuid> = curated_scored.iter().map(|(id, ..)| *id).collect();
     crate::decay::touch_refs(pool, crate::decay::REF_KIND_CURATED, &touched).await?;
+
+    // The synthesis feed: facts and summaries in rank order, each with a few
+    // drill ids into its evidence. Episodic nodes stay out — their substance
+    // is the raw records that follow.
+    let mut synthesis: Vec<SynthesisItem> = Vec::new();
+    for (node_id, _level, kind, content, event_time) in curated_scored
+        .iter()
+        .filter(|(_, _, kind, ..)| kind == "semantic" || kind == "summary")
+        .take(SYNTHESIS_MAX)
+    {
+        synthesis.push(SynthesisItem {
+            id: *node_id,
+            kind: kind.clone(),
+            content: content.clone(),
+            event_time: *event_time,
+            source_raw_ids: raw_ids_under_node(pool, *node_id, SYNTHESIS_DRILL_IDS).await?,
+        });
+    }
 
     // 2) Resolve curated hits -> source raw ids, in curated-rank order. A
     // summary resolves through its `summarizes` chain down to level-0 nodes,
@@ -846,7 +890,7 @@ pub(crate) async fn assemble_inner(
     // expansion query — the limit binds during expansion, never after it.
     let mut ordered_raw_ids: Vec<Uuid> = Vec::new();
     let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    for (node_id, _level) in &curated_scored {
+    for (node_id, ..) in &curated_scored {
         let remaining = limit - ordered_raw_ids.len() as i64;
         if remaining <= 0 {
             break;
@@ -922,6 +966,7 @@ pub(crate) async fn assemble_inner(
 
     let clip = clamp_assembled(&mut records, limit);
     Ok(AssembleResponse {
+        synthesis,
         records,
         degraded: false,
         warning: clip,
@@ -1629,6 +1674,100 @@ mod tests {
             .records
             .iter()
             .all(|r| r.project_id.as_deref() == Some(SANDBOX_PROJECT)));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn assembly_serves_the_synthesis_feed(pool: PgPool) {
+        // Same-topic documents curate into a semantic fact (the distilling
+        // stub lives in curation's tests, so drive rebuild with a local one).
+        use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+        struct Distilling;
+        #[async_trait]
+        impl NlpService for Distilling {
+            fn provider_name(&self) -> &'static str {
+                "test-distill"
+            }
+            fn provider_can_distill(&self) -> bool {
+                true
+            }
+            fn embedder_model_name(&self) -> &str {
+                "sentence-transformers/all-MiniLM-L6-v2"
+            }
+            fn embedder_dimension(&self) -> usize {
+                384
+            }
+            async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
+                Ok(vec![0.1_f32; 384])
+            }
+            async fn embed_batch(&self, t: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+                Ok(t.iter().map(|_| vec![0.1_f32; 384]).collect())
+            }
+            fn extract_entities(&self, t: &str) -> Vec<String> {
+                flashback_nlp::extract_entities(t)
+            }
+            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
+                Ok(Extraction::empty())
+            }
+            async fn distill_facts(
+                &self,
+                e: &[EpisodeRef],
+            ) -> Result<Vec<DistilledFact>, ProviderError> {
+                Ok(vec![DistilledFact {
+                    content: "the deploy target is staging".into(),
+                    topic: None,
+                    source_episode_ids: e.iter().map(|x| x.id).collect(),
+                    confidence: 0.9,
+                }])
+            }
+        }
+        for i in 0..2 {
+            ingest_record(
+                &pool,
+                &Distilling,
+                "leslie",
+                IngestRecordRequest {
+                    project_id: None,
+                    ..req(&format!(
+                        "note {i}: the deploy target for the pgvector service is staging"
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        }
+        crate::curation::rebuild(&pool, &Distilling, "leslie")
+            .await
+            .unwrap();
+
+        let out = assemble_inner(
+            &pool,
+            &Distilling,
+            "leslie",
+            AssembleRequest {
+                include_sandbox: false,
+                project_id: None,
+                container_id: None,
+                mode: None,
+                modes: None,
+                exclude_container_id: None,
+                query: Some("deploy target".into()),
+                limit: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.synthesis
+                .iter()
+                .any(|s| s.kind == "semantic" && s.content.contains("staging")),
+            "the distilled fact must be SERVED, got {:?}",
+            out.synthesis
+        );
+        assert!(out.synthesis.len() <= 5);
+        assert!(
+            out.synthesis.iter().all(|s| !s.source_raw_ids.is_empty()),
+            "every synthesis item carries drill-down evidence"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

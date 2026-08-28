@@ -1867,6 +1867,15 @@ function renderTrace(t, retrievalMs) {{
     }}
     mem += '</ol>';
   }}
+  if (t.synthesis && t.synthesis.length) {{
+    let syn = '<ul style="padding-left:18px;margin:0">';
+    for (const f of t.synthesis) {{
+      syn += `<li style="margin-bottom:8px"><span class="muted mono" style="font-size:11px">${{esc(f.kind)}}</span>
+        <div style="font-size:13px">${{esc(f.content)}}</div></li>`;
+    }}
+    syn += '</ul>';
+    parts.push(section(`Synthesis — what memory has distilled (${{t.synthesis.length}})`, syn, true));
+  }}
   parts.push(section(`Retrieved memories (${{t.retrieved.length}})`, mem, true));
 
   let pr = '';
