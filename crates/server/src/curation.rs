@@ -1,9 +1,10 @@
 //! Curation pipeline over `raw_records` — the derived layer.
 //!
 //! Built on the immutable raw layer. The contract: raw is read-only and
-//! immutable; curation only ever INSERTs into `curated_*`, and the whole curated
-//! set is rebuildable from raw. That's what `rebuild` proves — wipe curation,
-//! re-derive, get the same set back.
+//! immutable; the whole curated set is rebuildable from raw. `curate` is the
+//! hot path — an incremental pass that only touches what changed since the
+//! last one — and `rebuild` (wipe + re-derive) is the recovery tool that
+//! proves the rebuildability contract, not the schedule.
 //!
 //! Raw `type` names a kind of evidence, never a tier — a writer says what it
 //! arrived, this module says what that arrival became. Tier vocabulary
@@ -72,6 +73,8 @@ pub(crate) fn curation_batch_cap() -> i64 {
 #[derive(Debug, Default, Clone)]
 pub struct CurationStats {
     pub promoted: i64,
+    /// Existing episodes refreshed in place because their session grew.
+    pub refreshed: i64,
     pub distilled: i64,
     pub clusters_seen: i64,
     pub skipped_distill: bool,
@@ -79,6 +82,11 @@ pub struct CurationStats {
     pub summarized: i64,
     /// Deepest summary level reached (0 = flat, no summaries).
     pub max_level: i32,
+    /// Promotable work still waiting after the pass (batch cap left it for the
+    /// next tick). Non-zero is normal mid-drain; non-zero forever is the
+    /// starvation this field exists to make visible.
+    pub pending_sessions: i64,
+    pub pending_solos: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +220,123 @@ fn derive_title(turns: &[PromotableRaw]) -> String {
     truncate_chars(first_line, TITLE_BUDGET)
 }
 
+/// The active turns of one session, oldest first.
+async fn load_session_turns(
+    pool: &PgPool,
+    scope: &Scope,
+    container_id: &str,
+) -> AppResult<Vec<PromotableRaw>> {
+    let turns = sqlx::query_as::<_, PromotableRaw>(
+        r#"
+        SELECT r.id, r.content, r.event_time, r.importance, r.source, r.payload
+        FROM raw_records r
+        WHERE r.type = 'conversation'
+          AND r.user_id = $1
+          AND r.project_id IS NOT DISTINCT FROM $2
+          AND r.mode IS NOT DISTINCT FROM $3
+          AND r.container_id = $4
+          AND r.id NOT IN (
+              SELECT supersedes FROM raw_records
+              WHERE supersedes IS NOT NULL AND user_id = $1
+          )
+        ORDER BY r.event_time ASC, r.ingest_time ASC
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(container_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(turns)
+}
+
+/// Derive and write one session's episode under `node_id` — the transcript,
+/// title, span meta, per-turn lineage and entity edges, and the embedding.
+/// `refresh` re-derives an EXISTING node in place: same id (retrieval
+/// references and decay state survive), fresh content/meta/edges/embedding.
+/// Rewriting `meta` whole drops any `distilled_at` marker, which is the point —
+/// a grown conversation must be distillable again.
+async fn write_session_episode(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    scope: &Scope,
+    node_id: Uuid,
+    container_id: &str,
+    turns: &[PromotableRaw],
+    refresh: bool,
+) -> AppResult<()> {
+    let content = render_transcript(turns);
+    let title = derive_title(turns);
+    let started = turns[0].event_time;
+    let ended = turns[turns.len() - 1].event_time;
+    // An episode inherits the weight of its most-weighted turn; a
+    // conversation matters as much as the most important thing said in it.
+    let importance = turns
+        .iter()
+        .filter_map(|t| t.importance)
+        .fold(None, |acc, i| Some(acc.map_or(i, |a: f32| a.max(i))));
+
+    if refresh {
+        sqlx::query(
+            "UPDATE curated_nodes SET content = $2, importance = $3, event_time = $4 WHERE id = $1",
+        )
+        .bind(node_id)
+        .bind(&content)
+        .bind(importance)
+        .bind(started)
+        .execute(pool)
+        .await?;
+        // The old edges and embedding describe the old transcript.
+        sqlx::query(
+            "DELETE FROM curated_edges WHERE from_id = $1 AND kind IN ('derived_from', 'entity')",
+        )
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+        sqlx::query("DELETE FROM curated_embeddings WHERE node_id = $1")
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+    } else {
+        insert_node(
+            pool,
+            node_id,
+            "episodic",
+            &content,
+            scope,
+            importance,
+            Some(started),
+        )
+        .await?;
+    }
+    set_node_meta(
+        pool,
+        node_id,
+        serde_json::json!({
+            "container_id": container_id,
+            "title": title,
+            "turns": turns.len(),
+            "started_at": started,
+            "ended_at": ended,
+        }),
+    )
+    .await?;
+    embed_node(pool, nlp, scope, node_id, &content).await;
+
+    // Lineage and entity index run per turn, so the glass-box view still
+    // resolves to the individual raw rows an episode was built from.
+    for t in turns {
+        add_edge(pool, node_id, t.id, "derived_from").await?;
+        let entities = nlp.extract_entities(&t.content);
+        index_entities(pool, &scope.user_id, t.id, &entities).await?;
+        for entity in &entities {
+            add_entity_edge(pool, node_id, t.id, entity).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Derive episodic nodes from the promotable raw records in scope.
 ///
 /// A `conversation` turn is not an episode on its own — an episode is the whole
@@ -221,8 +346,9 @@ fn derive_title(turns: &[PromotableRaw]) -> String {
 /// no container (and `document` rows) stand alone, one node each.
 ///
 /// Idempotent at the session level: a session that already has an episode is
-/// skipped rather than duplicated. A session that has since grown picks up its
-/// new turns on the next `rebuild`, which wipes and re-derives from raw.
+/// skipped rather than duplicated. A session that has since GROWN is refreshed
+/// in place — same node id, fresh transcript/meta/edges/embedding — so its new
+/// turns are picked up without waiting for a destructive rebuild.
 pub async fn promote_raw_to_episodic(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -265,79 +391,61 @@ pub async fn promote_raw_to_episodic(
     .await?;
 
     for container_id in sessions {
-        let turns = sqlx::query_as::<_, PromotableRaw>(
-            r#"
-            SELECT r.id, r.content, r.event_time, r.importance, r.source, r.payload
-            FROM raw_records r
-            WHERE r.type = 'conversation'
-              AND r.user_id = $1
-              AND r.project_id IS NOT DISTINCT FROM $2
-              AND r.mode IS NOT DISTINCT FROM $3
-              AND r.container_id = $4
-              AND r.id NOT IN (
-                  SELECT supersedes FROM raw_records
-                  WHERE supersedes IS NOT NULL AND user_id = $1
-              )
-            ORDER BY r.event_time ASC, r.ingest_time ASC
-            "#,
-        )
-        .bind(&scope.user_id)
-        .bind(&scope.project_id)
-        .bind(&scope.mode)
-        .bind(&container_id)
-        .fetch_all(pool)
-        .await?;
+        let turns = load_session_turns(pool, scope, &container_id).await?;
         if turns.is_empty() {
             continue;
         }
-
-        let content = render_transcript(&turns);
-        let title = derive_title(&turns);
-        let started = turns[0].event_time;
-        let ended = turns[turns.len() - 1].event_time;
-        // An episode inherits the weight of its most-weighted turn; a
-        // conversation matters as much as the most important thing said in it.
-        let importance = turns
-            .iter()
-            .filter_map(|t| t.importance)
-            .fold(None, |acc, i| Some(acc.map_or(i, |a: f32| a.max(i))));
-
         let node_id = Uuid::new_v4();
-        insert_node(
-            pool,
-            node_id,
-            "episodic",
-            &content,
-            scope,
-            importance,
-            Some(started),
-        )
-        .await?;
-        set_node_meta(
-            pool,
-            node_id,
-            serde_json::json!({
-                "container_id": container_id,
-                "title": title,
-                "turns": turns.len(),
-                "started_at": started,
-                "ended_at": ended,
-            }),
-        )
-        .await?;
-        embed_node(pool, nlp, scope, node_id, &content).await;
-
-        // Lineage and entity index run per turn, so the glass-box view still
-        // resolves to the individual raw rows an episode was built from.
-        for t in &turns {
-            add_edge(pool, node_id, t.id, "derived_from").await?;
-            let entities = nlp.extract_entities(&t.content);
-            index_entities(pool, &scope.user_id, t.id, &entities).await?;
-            for entity in &entities {
-                add_entity_edge(pool, node_id, t.id, entity).await?;
-            }
-        }
+        write_session_episode(pool, nlp, scope, node_id, &container_id, &turns, false).await?;
         stats.promoted += 1;
+    }
+
+    // --- grown sessions: refresh the episode in place ------------------------
+    // A session that gained turns since its episode was derived is stale: the
+    // transcript misses the new turns and any distillation marker no longer
+    // covers the conversation. Refresh reuses the SAME node id, so retrieval
+    // references and decay state survive; rewriting `meta` clears
+    // `distilled_at`, making the episode eligible for distillation again.
+    let grown: Vec<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT n.id, n.meta->>'container_id' AS container_id
+        FROM curated_nodes n
+        WHERE n.kind = 'episodic'
+          AND n.user_id = $1
+          AND n.project_id IS NOT DISTINCT FROM $2
+          AND n.mode IS NOT DISTINCT FROM $3
+          AND n.meta->>'container_id' IS NOT NULL
+          AND (n.meta->>'turns')::bigint <> (
+              SELECT COUNT(*)
+              FROM raw_records r
+              WHERE r.type = 'conversation'
+                AND r.user_id = $1
+                AND r.project_id IS NOT DISTINCT FROM $2
+                AND r.mode IS NOT DISTINCT FROM $3
+                AND r.container_id = n.meta->>'container_id'
+                AND r.id NOT IN (
+                    SELECT supersedes FROM raw_records
+                    WHERE supersedes IS NOT NULL AND user_id = $1
+                )
+          )
+        ORDER BY n.id
+        LIMIT $4
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(curation_batch_cap())
+    .fetch_all(pool)
+    .await?;
+
+    for (node_id, container_id) in grown {
+        let turns = load_session_turns(pool, scope, &container_id).await?;
+        if turns.is_empty() {
+            continue;
+        }
+        write_session_episode(pool, nlp, scope, node_id, &container_id, &turns, true).await?;
+        stats.refreshed += 1;
     }
 
     // --- standalone rows: documents, container-less turns -------------------
@@ -546,6 +654,7 @@ pub async fn distill_semantic(
           AND n.user_id = $1
           AND n.project_id IS NOT DISTINCT FROM $2
           AND n.mode IS NOT DISTINCT FROM $3
+          AND (n.meta->>'distilled_at') IS NULL
           AND NOT EXISTS (
               SELECT 1 FROM curated_edges s
               WHERE s.to_id = n.id AND s.kind = 'supersedes'
@@ -646,10 +755,28 @@ pub async fn distill_semantic(
         let facts = match nlp.distill_facts(&refs).await {
             Ok(f) => f,
             Err(e) => {
+                // NOT marked as distilled — a failed cluster is retried on the
+                // next pass instead of silently never producing facts.
                 tracing::warn!("curation: distillation failed on cluster: {e}");
                 continue;
             }
         };
+
+        // The provider answered, so this cluster is consumed — including a
+        // legitimate empty answer ("too noisy to distill"). The marker is what
+        // makes incremental passes append-only instead of re-distilling every
+        // episode forever; a session that later grows has its meta rewritten,
+        // which clears it. Singletons never reach here and stay eligible, so a
+        // future related episode can still pull them into a cluster.
+        let cluster_node_ids: Vec<Uuid> = cluster.iter().map(|&i| episodes[i].node_id).collect();
+        sqlx::query(
+            "UPDATE curated_nodes \
+             SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('distilled_at', NOW()) \
+             WHERE id = ANY($1)",
+        )
+        .bind(&cluster_node_ids)
+        .execute(pool)
+        .await?;
         if facts.is_empty() {
             continue;
         }
@@ -697,12 +824,195 @@ pub async fn distill_semantic(
             for raw_id in &raw_ids {
                 add_edge(pool, node_id, *raw_id, "derived_from").await?;
             }
+            // Episode-level lineage beside the raw-level edges: which curated
+            // episodes this fact was distilled from, as the distiller cited.
+            for ep in &evidence {
+                add_edge(pool, node_id, ep.node_id, "distilled_from").await?;
+            }
             embed_node(pool, nlp, scope, node_id, &fact.content).await;
             stats.distilled += 1;
         }
     }
 
     Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// curate — the incremental hot path
+// ---------------------------------------------------------------------------
+
+/// One incremental curation pass for a user: promote new sessions and solo
+/// records, refresh grown sessions in place, distill what has not been
+/// distilled, and rebuild the summary tree only when level 0 actually changed.
+/// Never wipes episodic or semantic state — `rebuild` is the recovery tool,
+/// this is the scheduled path. Repeated calls with no new raw records do no
+/// LLM work at all.
+pub async fn curate(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+) -> AppResult<CurationStats> {
+    let buckets: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT project_id, mode
+        FROM raw_records
+        WHERE user_id = $1
+        ORDER BY project_id, mode
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut total = CurationStats::default();
+    for (project_id, mode) in buckets {
+        let scope = Scope::new(user_id).with_project(project_id).with_mode(mode);
+        let p = promote_raw_to_episodic(pool, nlp, &scope).await?;
+        let d = distill_semantic(pool, nlp, &scope).await?;
+        // The summary tree has no incremental maintenance yet: it is derived
+        // whole from level 0, so it is re-derived only when level 0 changed —
+        // an unchanged scope costs zero summary work. The wipe is scoped to
+        // `kind='summary'` alone; episodes, facts and their markers survive.
+        let s = if p.promoted + p.refreshed + d.distilled > 0 {
+            wipe_summaries(pool, &scope).await?;
+            crate::summaries::build_summaries(pool, nlp, &scope).await?
+        } else {
+            crate::summaries::SummaryStats::default()
+        };
+        total.promoted += p.promoted;
+        total.refreshed += p.refreshed;
+        total.distilled += d.distilled;
+        total.clusters_seen += d.clusters_seen;
+        total.skipped_distill = total.skipped_distill || d.skipped_distill;
+        total.summarized += s.summaries;
+        total.max_level = total.max_level.max(s.max_level);
+        let (ps, po) = pending_promotable(pool, &scope).await?;
+        total.pending_sessions += ps;
+        total.pending_solos += po;
+    }
+    if total.pending_sessions + total.pending_solos > 0 {
+        tracing::warn!(
+            pending_sessions = total.pending_sessions,
+            pending_solos = total.pending_solos,
+            "curation: promotable backlog remains after this pass (batch cap); \
+             it drains on subsequent passes — rising numbers mean starvation"
+        );
+    }
+    Ok(total)
+}
+
+/// Incremental pass for every user with raw records — the scheduler's call.
+pub async fn curate_all_users(pool: &PgPool, nlp: &dyn NlpService) -> Vec<(String, CurationStats)> {
+    let users: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT user_id FROM raw_records ORDER BY user_id")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let mut out = Vec::new();
+    for u in users {
+        match curate(pool, nlp, &u).await {
+            Ok(stats) => out.push((u, stats)),
+            Err(e) => tracing::warn!(user = %u, "curation pass failed: {e}"),
+        }
+    }
+    out
+}
+
+/// Drop a scope's summary nodes (and their edges; embeddings cascade) so the
+/// tree can be re-derived from the current level 0. Never touches episodic or
+/// semantic nodes.
+async fn wipe_summaries(pool: &PgPool, scope: &Scope) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM curated_edges
+        WHERE from_id IN (
+            SELECT id FROM curated_nodes
+            WHERE kind = 'summary' AND user_id = $1
+              AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3
+        )
+        OR to_id IN (
+            SELECT id FROM curated_nodes
+            WHERE kind = 'summary' AND user_id = $1
+              AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3
+        )
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM curated_nodes WHERE kind = 'summary' AND user_id = $1 \
+         AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3",
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// How much promotable work is still waiting in a scope: sessions without an
+/// episode, and solo rows without a `derived_from` edge. What the batch cap
+/// left behind — the number that makes starvation visible instead of silent.
+async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64)> {
+    let sessions: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(DISTINCT r.container_id)
+        FROM raw_records r
+        WHERE r.type = 'conversation'
+          AND r.container_id IS NOT NULL
+          AND r.user_id = $1
+          AND r.project_id IS NOT DISTINCT FROM $2
+          AND r.mode IS NOT DISTINCT FROM $3
+          AND r.id NOT IN (
+              SELECT supersedes FROM raw_records
+              WHERE supersedes IS NOT NULL AND user_id = $1
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM curated_nodes n
+              WHERE n.kind = 'episodic'
+                AND n.user_id = $1
+                AND n.project_id IS NOT DISTINCT FROM $2
+                AND n.mode IS NOT DISTINCT FROM $3
+                AND n.meta->>'container_id' = r.container_id
+          )
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .fetch_one(pool)
+    .await?;
+    let solos: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM raw_records r
+        WHERE r.type = ANY($4)
+          AND (r.type <> 'conversation' OR r.container_id IS NULL)
+          AND r.user_id = $1
+          AND r.project_id IS NOT DISTINCT FROM $2
+          AND r.mode IS NOT DISTINCT FROM $3
+          AND r.id NOT IN (
+              SELECT supersedes FROM raw_records
+              WHERE supersedes IS NOT NULL AND user_id = $1
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM curated_edges e
+              JOIN curated_nodes n ON n.id = e.from_id
+              WHERE e.to_id = r.id AND e.kind = 'derived_from' AND n.kind = 'episodic'
+          )
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(PROMOTABLE_TYPES.as_slice())
+    .fetch_one(pool)
+    .await?;
+    Ok((sessions, solos))
 }
 
 // ---------------------------------------------------------------------------
@@ -1664,6 +1974,168 @@ mod tests {
         assert!(stats.skipped_distill);
         assert_eq!(stats.distilled, 0);
         assert_eq!(count_nodes(&pool, "alice", "semantic").await, 0);
+    }
+
+    // -- curate (the incremental hot path) ---------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn curate_twice_does_no_new_work_and_never_duplicates(pool: PgPool) {
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+
+        let first = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(first.promoted, 2);
+        assert_eq!(first.distilled, 1);
+        assert_eq!(first.pending_sessions + first.pending_solos, 0);
+
+        // Same call again with nothing new: no promotion, no distillation, no
+        // duplicate facts — the regression was every pass re-distilling every
+        // episode forever.
+        let second = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(second.promoted, 0);
+        assert_eq!(second.refreshed, 0);
+        assert_eq!(second.distilled, 0);
+        assert_eq!(count_nodes(&pool, "alice", "semantic").await, 1);
+
+        // New same-topic records arrive: only THEY get distilled, appending a
+        // second fact while the first survives untouched.
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "note 8: the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "note 9: the deploy target for the pgvector service is staging",
+        )
+        .await;
+        let third = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(third.promoted, 2);
+        assert_eq!(third.distilled, 1);
+        assert_eq!(count_nodes(&pool, "alice", "semantic").await, 2);
+        assert_eq!(count_nodes(&pool, "alice", "episodic").await, 4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn grown_session_refreshes_in_place_and_becomes_distillable_again(pool: PgPool) {
+        insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:user",
+            "first turn about the plan",
+            0,
+        )
+        .await;
+        insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:assistant",
+            "noted the plan",
+            60,
+        )
+        .await;
+        let first = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(first.promoted, 1);
+        let (node_id, meta): (Uuid, serde_json::Value) = sqlx::query_as(
+            "SELECT id, meta FROM curated_nodes WHERE kind = 'episodic' AND user_id = 'alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(meta["turns"], 2);
+
+        insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:user",
+            "third turn changes the plan",
+            120,
+        )
+        .await;
+        let second = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(second.promoted, 0, "no new episode — the session grew");
+        assert_eq!(second.refreshed, 1);
+
+        let (same_id, content, meta): (Uuid, String, serde_json::Value) = sqlx::query_as(
+            "SELECT id, content, meta FROM curated_nodes WHERE kind = 'episodic' AND user_id = 'alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            same_id, node_id,
+            "refresh keeps the node id (decay state survives)"
+        );
+        assert!(
+            content.contains("third turn changes the plan"),
+            "transcript grew: {content}"
+        );
+        assert_eq!(meta["turns"], 3);
+        assert!(
+            meta.get("distilled_at").is_none(),
+            "a grown session must be distillable again"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn curate_skips_summary_rebuild_when_nothing_changed(pool: PgPool) {
+        // Enough level-0 nodes to clear SUMMARY_FANOUT_STOP, or no tree forms.
+        for i in 0..8 {
+            insert_document_raw(
+                &pool,
+                "alice",
+                None,
+                None,
+                &format!("note {i}: the deploy target for the pgvector service is staging"),
+            )
+            .await;
+        }
+        curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        let mut before: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM curated_nodes WHERE kind = 'summary' AND user_id = 'alice'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        before.sort();
+        assert!(!before.is_empty(), "test needs a summary tree");
+
+        // An idle pass must not touch the tree — same node ids afterwards.
+        curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        let mut after: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM curated_nodes WHERE kind = 'summary' AND user_id = 'alice'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        after.sort();
+        assert_eq!(
+            before, after,
+            "summary tree must be untouched by an idle pass"
+        );
     }
 
     // -- rebuild -----------------------------------------------------------
