@@ -1,9 +1,10 @@
 //! Curation pipeline over `raw_records` — the derived layer.
 //!
 //! Built on the immutable raw layer. The contract: raw is read-only and
-//! immutable; curation only ever INSERTs into `curated_*`, and the whole curated
-//! set is rebuildable from raw. That's what `rebuild` proves — wipe curation,
-//! re-derive, get the same set back.
+//! immutable; the whole curated set is rebuildable from raw. `curate` is the
+//! hot path — an incremental pass that only touches what changed since the
+//! last one — and `rebuild` (wipe + re-derive) is the recovery tool that
+//! proves the rebuildability contract, not the schedule.
 //!
 //! Raw `type` names a kind of evidence, never a tier — a writer says what it
 //! arrived, this module says what that arrival became. Tier vocabulary
@@ -23,14 +24,17 @@
 //!     standalone row is skipped once a `derived_from` edge points at it.
 //!
 //!   - `distill_semantic`: clusters active episodic curated nodes by entity
-//!     overlap, then asks the configured `AiProvider` to distill each cluster
-//!     into semantic facts. Entities come from `entity_index` (the HippoRAG
-//!     pointer table, populated during promotion) so a pass reads them instead
-//!     of re-extracting every time; on-the-fly `extract_entities` is the
-//!     fallback when the index has no row for a raw id yet. Each fact becomes a
-//!     `kind='semantic'` node with `derived_from` edges to *every* source raw
-//!     id. Requires a provider that can distill; the heuristic provider
-//!     degrades gracefully (logs + no-op).
+//!     overlap — each episode carrying its whole transcript, the union of its
+//!     raw rows' entities, and the time span it covers — then asks the
+//!     configured `AiProvider` to distill each cluster into semantic facts.
+//!     Entities come from `entity_index` (the HippoRAG pointer table,
+//!     populated during promotion); on-the-fly `extract_entities` over the
+//!     node content is the fallback when the index has no rows yet. Each fact
+//!     becomes a `kind='semantic'` node dated by its newest evidence, with
+//!     `derived_from` edges to the raw rows of the episodes the distiller
+//!     cited (whole-cluster fallback when it cites nothing valid). Requires a
+//!     provider that can distill; the heuristic provider degrades gracefully
+//!     (logs + no-op).
 //!
 //! Every new curated node is embedded into `curated_embeddings`. Promotion also
 //! populates `entity_index` and emits `curated_edges(kind='entity')` tying the
@@ -69,6 +73,8 @@ pub(crate) fn curation_batch_cap() -> i64 {
 #[derive(Debug, Default, Clone)]
 pub struct CurationStats {
     pub promoted: i64,
+    /// Existing episodes refreshed in place because their session grew.
+    pub refreshed: i64,
     pub distilled: i64,
     pub clusters_seen: i64,
     pub skipped_distill: bool,
@@ -76,6 +82,16 @@ pub struct CurationStats {
     pub summarized: i64,
     /// Deepest summary level reached (0 = flat, no summaries).
     pub max_level: i32,
+    /// Promotable work still waiting after the pass (batch cap left it for the
+    /// next tick). Non-zero is normal mid-drain; non-zero forever is the
+    /// starvation this field exists to make visible.
+    pub pending_sessions: i64,
+    pub pending_solos: i64,
+    /// Episodes still carrying no `distilled_at` marker after the pass —
+    /// the distill-stage backlog, counted so IT can't starve silently either.
+    pub pending_undistilled: i64,
+    /// Another pass held this user's curation lock; nothing was done.
+    pub locked_out: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +225,123 @@ fn derive_title(turns: &[PromotableRaw]) -> String {
     truncate_chars(first_line, TITLE_BUDGET)
 }
 
+/// The active turns of one session, oldest first.
+async fn load_session_turns(
+    pool: &PgPool,
+    scope: &Scope,
+    container_id: &str,
+) -> AppResult<Vec<PromotableRaw>> {
+    let turns = sqlx::query_as::<_, PromotableRaw>(
+        r#"
+        SELECT r.id, r.content, r.event_time, r.importance, r.source, r.payload
+        FROM raw_records r
+        WHERE r.type = 'conversation'
+          AND r.user_id = $1
+          AND r.project_id IS NOT DISTINCT FROM $2
+          AND r.mode IS NOT DISTINCT FROM $3
+          AND r.container_id = $4
+          AND r.id NOT IN (
+              SELECT supersedes FROM raw_records
+              WHERE supersedes IS NOT NULL AND user_id = $1
+          )
+        ORDER BY r.event_time ASC, r.ingest_time ASC
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(container_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(turns)
+}
+
+/// Derive and write one session's episode under `node_id` — the transcript,
+/// title, span meta, per-turn lineage and entity edges, and the embedding.
+/// `refresh` re-derives an EXISTING node in place: same id (retrieval
+/// references and decay state survive), fresh content/meta/edges/embedding.
+/// Rewriting `meta` whole drops any `distilled_at` marker, which is the point —
+/// a grown conversation must be distillable again.
+async fn write_session_episode(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    scope: &Scope,
+    node_id: Uuid,
+    container_id: &str,
+    turns: &[PromotableRaw],
+    refresh: bool,
+) -> AppResult<()> {
+    let content = render_transcript(turns);
+    let title = derive_title(turns);
+    let started = turns[0].event_time;
+    let ended = turns[turns.len() - 1].event_time;
+    // An episode inherits the weight of its most-weighted turn; a
+    // conversation matters as much as the most important thing said in it.
+    let importance = turns
+        .iter()
+        .filter_map(|t| t.importance)
+        .fold(None, |acc, i| Some(acc.map_or(i, |a: f32| a.max(i))));
+
+    if refresh {
+        sqlx::query(
+            "UPDATE curated_nodes SET content = $2, importance = $3, event_time = $4 WHERE id = $1",
+        )
+        .bind(node_id)
+        .bind(&content)
+        .bind(importance)
+        .bind(started)
+        .execute(pool)
+        .await?;
+        // The old edges and embedding describe the old transcript.
+        sqlx::query(
+            "DELETE FROM curated_edges WHERE from_id = $1 AND kind IN ('derived_from', 'entity')",
+        )
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+        sqlx::query("DELETE FROM curated_embeddings WHERE node_id = $1")
+            .bind(node_id)
+            .execute(pool)
+            .await?;
+    } else {
+        insert_node(
+            pool,
+            node_id,
+            "episodic",
+            &content,
+            scope,
+            importance,
+            Some(started),
+        )
+        .await?;
+    }
+    set_node_meta(
+        pool,
+        node_id,
+        serde_json::json!({
+            "container_id": container_id,
+            "title": title,
+            "turns": turns.len(),
+            "started_at": started,
+            "ended_at": ended,
+        }),
+    )
+    .await?;
+    embed_node(pool, nlp, scope, node_id, &content).await;
+
+    // Lineage and entity index run per turn, so the glass-box view still
+    // resolves to the individual raw rows an episode was built from.
+    for t in turns {
+        add_edge(pool, node_id, t.id, "derived_from").await?;
+        let entities = nlp.extract_entities(&t.content);
+        index_entities(pool, &scope.user_id, t.id, &entities).await?;
+        for entity in &entities {
+            add_entity_edge(pool, node_id, t.id, entity).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Derive episodic nodes from the promotable raw records in scope.
 ///
 /// A `conversation` turn is not an episode on its own — an episode is the whole
@@ -218,8 +351,9 @@ fn derive_title(turns: &[PromotableRaw]) -> String {
 /// no container (and `document` rows) stand alone, one node each.
 ///
 /// Idempotent at the session level: a session that already has an episode is
-/// skipped rather than duplicated. A session that has since grown picks up its
-/// new turns on the next `rebuild`, which wipes and re-derives from raw.
+/// skipped rather than duplicated. A session that has since GROWN is refreshed
+/// in place — same node id, fresh transcript/meta/edges/embedding — so its new
+/// turns are picked up without waiting for a destructive rebuild.
 pub async fn promote_raw_to_episodic(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -262,79 +396,61 @@ pub async fn promote_raw_to_episodic(
     .await?;
 
     for container_id in sessions {
-        let turns = sqlx::query_as::<_, PromotableRaw>(
-            r#"
-            SELECT r.id, r.content, r.event_time, r.importance, r.source, r.payload
-            FROM raw_records r
-            WHERE r.type = 'conversation'
-              AND r.user_id = $1
-              AND r.project_id IS NOT DISTINCT FROM $2
-              AND r.mode IS NOT DISTINCT FROM $3
-              AND r.container_id = $4
-              AND r.id NOT IN (
-                  SELECT supersedes FROM raw_records
-                  WHERE supersedes IS NOT NULL AND user_id = $1
-              )
-            ORDER BY r.event_time ASC, r.ingest_time ASC
-            "#,
-        )
-        .bind(&scope.user_id)
-        .bind(&scope.project_id)
-        .bind(&scope.mode)
-        .bind(&container_id)
-        .fetch_all(pool)
-        .await?;
+        let turns = load_session_turns(pool, scope, &container_id).await?;
         if turns.is_empty() {
             continue;
         }
-
-        let content = render_transcript(&turns);
-        let title = derive_title(&turns);
-        let started = turns[0].event_time;
-        let ended = turns[turns.len() - 1].event_time;
-        // An episode inherits the weight of its most-weighted turn; a
-        // conversation matters as much as the most important thing said in it.
-        let importance = turns
-            .iter()
-            .filter_map(|t| t.importance)
-            .fold(None, |acc, i| Some(acc.map_or(i, |a: f32| a.max(i))));
-
         let node_id = Uuid::new_v4();
-        insert_node(
-            pool,
-            node_id,
-            "episodic",
-            &content,
-            scope,
-            importance,
-            Some(started),
-        )
-        .await?;
-        set_node_meta(
-            pool,
-            node_id,
-            serde_json::json!({
-                "container_id": container_id,
-                "title": title,
-                "turns": turns.len(),
-                "started_at": started,
-                "ended_at": ended,
-            }),
-        )
-        .await?;
-        embed_node(pool, nlp, scope, node_id, &content).await;
-
-        // Lineage and entity index run per turn, so the glass-box view still
-        // resolves to the individual raw rows an episode was built from.
-        for t in &turns {
-            add_edge(pool, node_id, t.id, "derived_from").await?;
-            let entities = nlp.extract_entities(&t.content);
-            index_entities(pool, &scope.user_id, t.id, &entities).await?;
-            for entity in &entities {
-                add_entity_edge(pool, node_id, t.id, entity).await?;
-            }
-        }
+        write_session_episode(pool, nlp, scope, node_id, &container_id, &turns, false).await?;
         stats.promoted += 1;
+    }
+
+    // --- grown sessions: refresh the episode in place ------------------------
+    // A session that gained turns since its episode was derived is stale: the
+    // transcript misses the new turns and any distillation marker no longer
+    // covers the conversation. Refresh reuses the SAME node id, so retrieval
+    // references and decay state survive; rewriting `meta` clears
+    // `distilled_at`, making the episode eligible for distillation again.
+    let grown: Vec<(Uuid, String)> = sqlx::query_as(
+        r#"
+        SELECT n.id, n.meta->>'container_id' AS container_id
+        FROM curated_nodes n
+        WHERE n.kind = 'episodic'
+          AND n.user_id = $1
+          AND n.project_id IS NOT DISTINCT FROM $2
+          AND n.mode IS NOT DISTINCT FROM $3
+          AND n.meta->>'container_id' IS NOT NULL
+          AND (n.meta->>'turns')::bigint <> (
+              SELECT COUNT(*)
+              FROM raw_records r
+              WHERE r.type = 'conversation'
+                AND r.user_id = $1
+                AND r.project_id IS NOT DISTINCT FROM $2
+                AND r.mode IS NOT DISTINCT FROM $3
+                AND r.container_id = n.meta->>'container_id'
+                AND r.id NOT IN (
+                    SELECT supersedes FROM raw_records
+                    WHERE supersedes IS NOT NULL AND user_id = $1
+                )
+          )
+        ORDER BY n.id
+        LIMIT $4
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(curation_batch_cap())
+    .fetch_all(pool)
+    .await?;
+
+    for (node_id, container_id) in grown {
+        let turns = load_session_turns(pool, scope, &container_id).await?;
+        if turns.is_empty() {
+            continue;
+        }
+        write_session_episode(pool, nlp, scope, node_id, &container_id, &turns, true).await?;
+        stats.refreshed += 1;
     }
 
     // --- standalone rows: documents, container-less turns -------------------
@@ -470,18 +586,42 @@ async fn entities_for_scope(pool: &PgPool, scope: &Scope) -> AppResult<HashMap<U
 // distill_semantic
 // ---------------------------------------------------------------------------
 
-/// An active episodic curated node plus the raw source content it derives from,
-/// with the entities it clusters on (read from `entity_index`, on-the-fly as
-/// fallback).
+/// An active episodic curated node, carried whole into distillation: its own
+/// content (the bounded transcript promotion rendered — never a single raw
+/// turn), the union of entities across every raw row it derives from, and the
+/// time span it covers.
 struct EpisodeNode {
-    /// Every raw id this episodic node was derived from (usually one).
+    node_id: Uuid,
+    /// Every raw id this episodic node was derived from.
     source_raw_ids: Vec<Uuid>,
     content: String,
     entities: Vec<String>,
+    /// When the episode started / ended. Equal for a single-record episode.
+    started: Option<DateTime<Utc>>,
+    ended: Option<DateTime<Utc>>,
+}
+
+impl EpisodeNode {
+    /// The `when` the distill prompt sees: an instant, or a `start..end` span.
+    fn when(&self) -> Option<String> {
+        match (self.started, self.ended) {
+            (Some(s), Some(e)) if s != e => Some(format!(
+                "{}..{}",
+                s.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                e.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            )),
+            (Some(s), _) => Some(s.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            _ => None,
+        }
+    }
 }
 
 /// Cluster active episodic curated nodes by entity overlap and distill each
-/// cluster into semantic facts. No-op (logged) when the provider can't distill.
+/// cluster into semantic facts. Episodes go to the distiller whole — the
+/// transcript promotion rendered, the union of entities across their raw rows,
+/// and when they happened — so a fact is derived from conversations, not from
+/// one arbitrary turn per conversation. No-op (logged) when the provider can't
+/// distill.
 pub async fn distill_semantic(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -498,24 +638,34 @@ pub async fn distill_semantic(
         return Ok(stats);
     }
 
-    // Active episodic nodes not already superseded by a semantic node, each with
-    // the raw ids they derive from. The raw content is what we extract entities
-    // from (raw is the source of truth; the episodic node content mirrors it).
-    let node_rows = sqlx::query_as::<_, (Uuid, Uuid, String)>(
+    // Active episodic nodes, read WHOLE: the node's own content is the bounded
+    // transcript promotion rendered, and `meta` carries the session span. The
+    // deterministic ordering (time, then id) makes a pass reproducible — the
+    // previous shape joined through raw rows and inherited whatever content the
+    // join happened to surface first.
+    let node_rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            Option<DateTime<Utc>>,
+            Option<serde_json::Value>,
+        ),
+    >(
         r#"
-        SELECT n.id, e.to_id AS raw_id, r.content
+        SELECT n.id, n.content, n.event_time, n.meta
         FROM curated_nodes n
-        JOIN curated_edges e ON e.from_id = n.id AND e.kind = 'derived_from'
-        JOIN raw_records r ON r.id = e.to_id
         WHERE n.kind = 'episodic'
           AND n.user_id = $1
           AND n.project_id IS NOT DISTINCT FROM $2
           AND n.mode IS NOT DISTINCT FROM $3
+          AND (n.meta->>'distilled_at') IS NULL
           AND NOT EXISTS (
               SELECT 1 FROM curated_edges s
               WHERE s.to_id = n.id AND s.kind = 'supersedes'
           )
-        ORDER BY n.created_at ASC
+        ORDER BY COALESCE((n.meta->>'distill_attempts')::int, 0) ASC,
+                 n.event_time ASC NULLS LAST, n.id ASC
         LIMIT $4
         "#,
     )
@@ -525,31 +675,68 @@ pub async fn distill_semantic(
     .bind(curation_batch_cap())
     .fetch_all(pool)
     .await?;
+    if node_rows.len() < 2 {
+        return Ok(stats);
+    }
+
+    // Lineage for the batch in one query: every raw id each node derives from.
+    let node_ids: Vec<Uuid> = node_rows.iter().map(|(id, ..)| *id).collect();
+    let edge_rows = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT from_id, to_id FROM curated_edges \
+         WHERE kind = 'derived_from' AND from_id = ANY($1) \
+         ORDER BY from_id, to_id",
+    )
+    .bind(&node_ids)
+    .fetch_all(pool)
+    .await?;
+    let mut raws_by_node: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (node_id, raw_id) in edge_rows {
+        raws_by_node.entry(node_id).or_default().push(raw_id);
+    }
 
     // The entities each raw id was indexed under, read from `entity_index`
-    // (the HippoRAG pointer table). Clustering reads this instead of
-    // re-extracting on every pass; when the index has no row for a raw id yet
-    // (e.g. a record promoted before the index existed), fall back to
-    // on-the-fly extraction so the pass still clusters correctly.
-    let mut entities_by_raw = entities_for_scope(pool, scope).await?;
+    // (the HippoRAG pointer table). An episode clusters on the UNION of its
+    // raw rows' entities — the whole conversation's signal, not one turn's.
+    // On-the-fly extraction over the node content is the fallback for records
+    // promoted before the index existed.
+    let entities_by_raw = entities_for_scope(pool, scope).await?;
 
-    // Fold (node, raw) rows into one EpisodeNode per node (a node can derive
-    // from several raw ids — e.g. a semantic node, but here only episodic).
-    let mut by_node: HashMap<Uuid, EpisodeNode> = HashMap::new();
-    for (node_id, raw_id, content) in node_rows {
-        let entities = entities_by_raw
-            .remove(&raw_id)
-            .filter(|e| !e.is_empty())
-            .unwrap_or_else(|| nlp.extract_entities(&content));
-        let entry = by_node.entry(node_id).or_insert_with(|| EpisodeNode {
-            source_raw_ids: Vec::new(),
-            content: content.clone(),
+    let mut episodes: Vec<EpisodeNode> = Vec::with_capacity(node_rows.len());
+    for (node_id, content, event_time, meta) in node_rows {
+        let source_raw_ids = raws_by_node.remove(&node_id).unwrap_or_default();
+        if source_raw_ids.is_empty() {
+            // An episode nothing points back at can't be cited; skip it.
+            continue;
+        }
+        let mut entities: Vec<String> = source_raw_ids
+            .iter()
+            .filter_map(|raw_id| entities_by_raw.get(raw_id))
+            .flatten()
+            .cloned()
+            .collect();
+        entities.sort();
+        entities.dedup();
+        if entities.is_empty() {
+            entities = nlp.extract_entities(&content);
+        }
+        let span = |key: &str| {
+            meta.as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&Utc))
+        };
+        let started = span("started_at").or(event_time);
+        let ended = span("ended_at").or(started);
+        episodes.push(EpisodeNode {
+            node_id,
+            source_raw_ids,
+            content,
             entities,
+            started,
+            ended,
         });
-        entry.source_raw_ids.push(raw_id);
     }
-    let episodes: Vec<EpisodeNode> = by_node.into_values().collect();
-
     if episodes.len() < 2 {
         return Ok(stats);
     }
@@ -557,49 +744,119 @@ pub async fn distill_semantic(
     let clusters = cluster_by_entities(&episodes);
     stats.clusters_seen = clusters.len() as i64;
 
+    // Singletons stay eligible (a future related episode can still pull them
+    // into a cluster), but their attempt count is bumped so the batch ordering
+    // rotates PAST them next pass. Without this, one-off topics accumulate at
+    // the head of the oldest-first batch and — past the cap — newer episodes
+    // never enter distillation at all: the promotion-stage starvation bug,
+    // reborn one stage down.
+    let singleton_ids: Vec<Uuid> = clusters
+        .iter()
+        .filter(|c| c.len() < 2)
+        .flat_map(|c| c.iter().map(|&i| episodes[i].node_id))
+        .collect();
+    if !singleton_ids.is_empty() {
+        sqlx::query(
+            "UPDATE curated_nodes \
+             SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object( \
+                 'distill_attempts', COALESCE((meta->>'distill_attempts')::int, 0) + 1) \
+             WHERE id = ANY($1)",
+        )
+        .bind(&singleton_ids)
+        .execute(pool)
+        .await?;
+    }
+
     for cluster in clusters.iter().filter(|c| c.len() >= 2) {
+        // One EpisodeRef per EPISODE — the transcript, the unioned entities,
+        // and when it happened, so the distiller can weigh recency.
         let refs: Vec<EpisodeRef> = cluster
             .iter()
-            .filter_map(|&i| {
-                // The distiller identifies sources by the raw id (that's what
-                // the semantic node points back at). One EpisodeRef per raw id.
-                // An episode with no source raw id can't be cited, so skip it
-                // rather than index an empty vec.
-                let id = *episodes[i].source_raw_ids.first()?;
-                Some(EpisodeRef {
-                    id,
-                    content: episodes[i].content.clone(),
-                    topic: None,
-                    entities: episodes[i].entities.clone(),
-                })
+            .map(|&i| EpisodeRef {
+                id: episodes[i].node_id,
+                content: episodes[i].content.clone(),
+                topic: None,
+                entities: episodes[i].entities.clone(),
+                when: episodes[i].when(),
             })
             .collect();
-        if refs.is_empty() {
-            continue;
-        }
 
         let facts = match nlp.distill_facts(&refs).await {
             Ok(f) => f,
             Err(e) => {
+                // NOT marked as distilled — a failed cluster is retried on the
+                // next pass instead of silently never producing facts.
                 tracing::warn!("curation: distillation failed on cluster: {e}");
                 continue;
             }
         };
+
+        // The provider answered, so this cluster is consumed — including a
+        // legitimate empty answer ("too noisy to distill"). The marker is what
+        // makes incremental passes append-only instead of re-distilling every
+        // episode forever; a session that later grows has its meta rewritten,
+        // which clears it. Singletons never reach here and stay eligible, so a
+        // future related episode can still pull them into a cluster.
+        let cluster_node_ids: Vec<Uuid> = cluster.iter().map(|&i| episodes[i].node_id).collect();
+        sqlx::query(
+            "UPDATE curated_nodes \
+             SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('distilled_at', NOW()) \
+             WHERE id = ANY($1)",
+        )
+        .bind(&cluster_node_ids)
+        .execute(pool)
+        .await?;
         if facts.is_empty() {
             continue;
         }
 
-        // Every raw id feeding this cluster is a source for the derived fact.
-        let cluster_raw_ids: Vec<Uuid> = cluster
+        let in_cluster: HashMap<Uuid, &EpisodeNode> = cluster
             .iter()
-            .flat_map(|&i| episodes[i].source_raw_ids.iter().copied())
+            .map(|&i| (episodes[i].node_id, &episodes[i]))
             .collect();
 
         for fact in facts {
+            // Evidence-granularity lineage: the distiller cites the episodes a
+            // fact came from, and the fact's edges point at THOSE episodes' raw
+            // rows. A fact citing nothing valid falls back to the whole cluster
+            // rather than dropping lineage.
+            let cited: Vec<&EpisodeNode> = fact
+                .source_episode_ids
+                .iter()
+                .filter_map(|id| in_cluster.get(id).copied())
+                .collect();
+            let evidence: Vec<&EpisodeNode> = if cited.is_empty() {
+                in_cluster.values().copied().collect()
+            } else {
+                cited
+            };
+            let raw_ids: Vec<Uuid> = evidence
+                .iter()
+                .flat_map(|e| e.source_raw_ids.iter().copied())
+                .collect();
+            // A fact is dated by the newest evidence that supports it — never
+            // by the moment curation happened to run, which made every old
+            // fact look freshly minted to recency ranking.
+            let fact_time = evidence.iter().filter_map(|e| e.ended.or(e.started)).max();
+
             let node_id = Uuid::new_v4();
-            insert_node(pool, node_id, "semantic", &fact.content, scope, None, None).await?;
-            for raw_id in &cluster_raw_ids {
+            insert_node(
+                pool,
+                node_id,
+                "semantic",
+                &fact.content,
+                scope,
+                None,
+                fact_time,
+            )
+            .await?;
+            for raw_id in &raw_ids {
                 add_edge(pool, node_id, *raw_id, "derived_from").await?;
+            }
+            // Episode-level lineage beside the raw-level edges: which curated
+            // episodes this fact was distilled from, as the distiller cited.
+            for ep in &evidence {
+                add_edge(pool, node_id, ep.node_id, "distilled_from").await?;
             }
             embed_node(pool, nlp, scope, node_id, &fact.content).await;
             stats.distilled += 1;
@@ -607,6 +864,276 @@ pub async fn distill_semantic(
     }
 
     Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// The per-user curation lock
+// ---------------------------------------------------------------------------
+
+/// Advisory-lock namespace for curation. The scheduler tick, the admin curate
+/// button and the rebuild endpoint can otherwise overlap — and under the
+/// incremental path a race no longer self-heals: two passes that both see a
+/// session as unpromoted insert duplicate episodes that then cluster with each
+/// other and distill duplicate facts, permanently. One pass per user at a
+/// time, everywhere, is the invariant.
+const CURATION_LOCK_NS: i32 = 421_337;
+
+/// Try to take the per-user curation lock. `Some(conn)` holds the lock for as
+/// long as the connection is kept AND must be released via
+/// `release_curation_lock` on the same connection — a pooled session outlives
+/// this call, so dropping without unlocking would wedge the user until that
+/// session closes. Postgres frees the lock if the process dies.
+async fn try_curation_lock(
+    pool: &PgPool,
+    user_id: &str,
+) -> AppResult<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>> {
+    let mut conn = pool.acquire().await?;
+    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext($2))")
+        .bind(CURATION_LOCK_NS)
+        .bind(user_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(got.then_some(conn))
+}
+
+async fn release_curation_lock(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    user_id: &str,
+) {
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1, hashtext($2))")
+        .bind(CURATION_LOCK_NS)
+        .bind(user_id)
+        .execute(&mut **conn)
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// curate — the incremental hot path
+// ---------------------------------------------------------------------------
+
+/// One incremental curation pass for a user: promote new sessions and solo
+/// records, refresh grown sessions in place, distill what has not been
+/// distilled, and rebuild the summary tree only when level 0 actually changed.
+/// Never wipes episodic or semantic state — `rebuild` is the recovery tool,
+/// this is the scheduled path. Repeated calls with no new raw records do no
+/// LLM work at all. Single-flight per user: a pass that finds another running
+/// (scheduler vs button vs rebuild) skips with `locked_out` set instead of
+/// racing it into duplicate state.
+pub async fn curate(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+) -> AppResult<CurationStats> {
+    let Some(mut lock) = try_curation_lock(pool, user_id).await? else {
+        tracing::warn!(user = %user_id, "curation already running for this user; pass skipped");
+        return Ok(CurationStats {
+            locked_out: true,
+            ..Default::default()
+        });
+    };
+    let result = curate_inner(pool, nlp, user_id).await;
+    release_curation_lock(&mut lock, user_id).await;
+    result
+}
+
+async fn curate_inner(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+) -> AppResult<CurationStats> {
+    let buckets: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT project_id, mode
+        FROM raw_records
+        WHERE user_id = $1
+        ORDER BY project_id, mode
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut total = CurationStats::default();
+    for (project_id, mode) in buckets {
+        let scope = Scope::new(user_id).with_project(project_id).with_mode(mode);
+        let p = promote_raw_to_episodic(pool, nlp, &scope).await?;
+        let d = distill_semantic(pool, nlp, &scope).await?;
+        // The summary tree has no incremental maintenance yet: it is derived
+        // whole from level 0, so it is re-derived only when level 0 changed —
+        // an unchanged scope costs zero summary work. The wipe is scoped to
+        // `kind='summary'` alone; episodes, facts and their markers survive.
+        let s = if p.promoted + p.refreshed + d.distilled > 0 {
+            wipe_summaries(pool, &scope).await?;
+            crate::summaries::build_summaries(pool, nlp, &scope).await?
+        } else {
+            crate::summaries::SummaryStats::default()
+        };
+        total.promoted += p.promoted;
+        total.refreshed += p.refreshed;
+        total.distilled += d.distilled;
+        total.clusters_seen += d.clusters_seen;
+        total.skipped_distill = total.skipped_distill || d.skipped_distill;
+        total.summarized += s.summaries;
+        total.max_level = total.max_level.max(s.max_level);
+        let (ps, po) = pending_promotable(pool, &scope).await?;
+        total.pending_sessions += ps;
+        total.pending_solos += po;
+        total.pending_undistilled += pending_undistilled(pool, &scope).await?;
+    }
+    if total.pending_sessions + total.pending_solos > 0 {
+        tracing::warn!(
+            pending_sessions = total.pending_sessions,
+            pending_solos = total.pending_solos,
+            "curation: promotable backlog remains after this pass (batch cap); \
+             it drains on subsequent passes — rising numbers mean starvation"
+        );
+    }
+    if total.pending_undistilled > 0 {
+        tracing::info!(
+            pending_undistilled = total.pending_undistilled,
+            "curation: episodes not yet distilled — singletons waiting for \
+             related evidence are normal; a count that only ever rises while \
+             new records arrive means the distill stage is starving"
+        );
+    }
+    Ok(total)
+}
+
+/// Episodes in scope still without a `distilled_at` marker — the distill-stage
+/// backlog. Includes lone singletons waiting for related evidence, which is
+/// why a non-zero value is normal; the trend is the signal.
+async fn pending_undistilled(pool: &PgPool, scope: &Scope) -> AppResult<i64> {
+    let n: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM curated_nodes n
+        WHERE n.kind = 'episodic'
+          AND n.user_id = $1
+          AND n.project_id IS NOT DISTINCT FROM $2
+          AND n.mode IS NOT DISTINCT FROM $3
+          AND (n.meta->>'distilled_at') IS NULL
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Incremental pass for every user with raw records — the scheduler's call.
+pub async fn curate_all_users(pool: &PgPool, nlp: &dyn NlpService) -> Vec<(String, CurationStats)> {
+    let users: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT user_id FROM raw_records ORDER BY user_id")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let mut out = Vec::new();
+    for u in users {
+        match curate(pool, nlp, &u).await {
+            Ok(stats) => out.push((u, stats)),
+            Err(e) => tracing::warn!(user = %u, "curation pass failed: {e}"),
+        }
+    }
+    out
+}
+
+/// Drop a scope's summary nodes (and their edges; embeddings cascade) so the
+/// tree can be re-derived from the current level 0. Never touches episodic or
+/// semantic nodes.
+async fn wipe_summaries(pool: &PgPool, scope: &Scope) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM curated_edges
+        WHERE from_id IN (
+            SELECT id FROM curated_nodes
+            WHERE kind = 'summary' AND user_id = $1
+              AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3
+        )
+        OR to_id IN (
+            SELECT id FROM curated_nodes
+            WHERE kind = 'summary' AND user_id = $1
+              AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3
+        )
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM curated_nodes WHERE kind = 'summary' AND user_id = $1 \
+         AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3",
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// How much promotable work is still waiting in a scope: sessions without an
+/// episode, and solo rows without a `derived_from` edge. What the batch cap
+/// left behind — the number that makes starvation visible instead of silent.
+async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64)> {
+    let sessions: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(DISTINCT r.container_id)
+        FROM raw_records r
+        WHERE r.type = 'conversation'
+          AND r.container_id IS NOT NULL
+          AND r.user_id = $1
+          AND r.project_id IS NOT DISTINCT FROM $2
+          AND r.mode IS NOT DISTINCT FROM $3
+          AND r.id NOT IN (
+              SELECT supersedes FROM raw_records
+              WHERE supersedes IS NOT NULL AND user_id = $1
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM curated_nodes n
+              WHERE n.kind = 'episodic'
+                AND n.user_id = $1
+                AND n.project_id IS NOT DISTINCT FROM $2
+                AND n.mode IS NOT DISTINCT FROM $3
+                AND n.meta->>'container_id' = r.container_id
+          )
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .fetch_one(pool)
+    .await?;
+    let solos: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM raw_records r
+        WHERE r.type = ANY($4)
+          AND (r.type <> 'conversation' OR r.container_id IS NULL)
+          AND r.user_id = $1
+          AND r.project_id IS NOT DISTINCT FROM $2
+          AND r.mode IS NOT DISTINCT FROM $3
+          AND r.id NOT IN (
+              SELECT supersedes FROM raw_records
+              WHERE supersedes IS NOT NULL AND user_id = $1
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM curated_edges e
+              JOIN curated_nodes n ON n.id = e.from_id
+              WHERE e.to_id = r.id AND e.kind = 'derived_from' AND n.kind = 'episodic'
+          )
+        "#,
+    )
+    .bind(&scope.user_id)
+    .bind(&scope.project_id)
+    .bind(&scope.mode)
+    .bind(PROMOTABLE_TYPES.as_slice())
+    .fetch_one(pool)
+    .await?;
+    Ok((sessions, solos))
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +1145,26 @@ pub async fn distill_semantic(
 /// never touched. Edges + embeddings cascade from the node delete (embeddings
 /// via FK; edges are wiped explicitly since they carry no FK to nodes).
 pub async fn rebuild(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    user_id: &str,
+) -> AppResult<CurationStats> {
+    // Same single-flight lock as `curate`: a scheduler tick landing mid-wipe
+    // would re-promote sessions the wipe removed but the rebuild has not yet
+    // re-derived, and the duplicates would then be permanent.
+    let Some(mut lock) = try_curation_lock(pool, user_id).await? else {
+        tracing::warn!(user = %user_id, "curation already running for this user; rebuild skipped");
+        return Ok(CurationStats {
+            locked_out: true,
+            ..Default::default()
+        });
+    };
+    let result = rebuild_inner(pool, nlp, user_id).await;
+    release_curation_lock(&mut lock, user_id).await;
+    result
+}
+
+async fn rebuild_inner(
     pool: &PgPool,
     nlp: &dyn NlpService,
     user_id: &str,
@@ -949,9 +1496,12 @@ mod tests {
 
     fn ep(entities: &[&str]) -> EpisodeNode {
         EpisodeNode {
+            node_id: Uuid::new_v4(),
             source_raw_ids: vec![Uuid::new_v4()],
             content: String::new(),
             entities: entities.iter().map(|s| s.to_string()).collect(),
+            started: None,
+            ended: None,
         }
     }
 
@@ -1004,6 +1554,54 @@ mod tests {
             &self,
             episodes: &[EpisodeRef],
         ) -> Result<Vec<DistilledFact>, ProviderError> {
+            Ok(vec![DistilledFact {
+                content: "distilled fact".to_string(),
+                topic: None,
+                source_episode_ids: episodes.iter().map(|e| e.id).collect(),
+                confidence: 0.9,
+            }])
+        }
+    }
+
+    /// Distilling stub that records the exact `EpisodeRef`s handed to it, so a
+    /// test can assert what distillation actually saw — the regression here was
+    /// an episode arriving as one arbitrary raw turn instead of its transcript.
+    #[derive(Clone, Default)]
+    struct CapturingNlp {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<EpisodeRef>>>,
+    }
+
+    #[async_trait]
+    impl NlpService for CapturingNlp {
+        fn provider_name(&self) -> &'static str {
+            "test-capture"
+        }
+        fn provider_can_distill(&self) -> bool {
+            true
+        }
+        fn embedder_model_name(&self) -> &str {
+            "test-embedder"
+        }
+        fn embedder_dimension(&self) -> usize {
+            384
+        }
+        async fn embed_one(&self, _text: &str) -> Result<Vec<f32>, AppError> {
+            Ok(vec![0.1_f32; 384])
+        }
+        async fn embed_batch(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+            Ok((0..texts.len()).map(|_| vec![0.1_f32; 384]).collect())
+        }
+        fn extract_entities(&self, text: &str) -> Vec<String> {
+            flashback_nlp::extract_entities(text)
+        }
+        async fn extract_full(&self, _text: &str) -> Result<Extraction, AppError> {
+            Ok(Extraction::empty())
+        }
+        async fn distill_facts(
+            &self,
+            episodes: &[EpisodeRef],
+        ) -> Result<Vec<DistilledFact>, ProviderError> {
+            self.seen.lock().unwrap().extend(episodes.iter().cloned());
             Ok(vec![DistilledFact {
                 content: "distilled fact".to_string(),
                 topic: None,
@@ -1412,6 +2010,96 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn distill_sees_whole_transcripts_spans_and_dates_the_fact(pool: PgPool) {
+        // Two sessions on the same topic, two turns each. The distiller must
+        // receive one ref per EPISODE carrying the transcript and the session
+        // span — not one arbitrary turn per session, which is what a
+        // join-ordering accident used to hand it.
+        let s1a = insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:user",
+            "the deploy target for the pgvector service is staging",
+            0,
+        )
+        .await;
+        let s1b = insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:assistant",
+            "confirmed, the deploy target for the pgvector service stays staging",
+            60,
+        )
+        .await;
+        let s2a = insert_turn(
+            &pool,
+            "alice",
+            "s2",
+            "host:agent:user",
+            "the deploy target for the pgvector service moved to production",
+            0,
+        )
+        .await;
+        let s2b = insert_turn(
+            &pool,
+            "alice",
+            "s2",
+            "host:agent:assistant",
+            "updating the deploy target for the pgvector service to production",
+            60,
+        )
+        .await;
+        let scope = Scope::new("alice");
+
+        let nlp = CapturingNlp::default();
+        promote_raw_to_episodic(&pool, &nlp, &scope).await.unwrap();
+        let stats = distill_semantic(&pool, &nlp, &scope).await.unwrap();
+        assert_eq!(stats.distilled, 1);
+
+        let refs = nlp.seen.lock().unwrap().clone();
+        assert_eq!(refs.len(), 2, "one ref per episode, not per raw turn");
+        for r in &refs {
+            assert!(
+                r.content.contains("user:"),
+                "transcript, not one turn: {}",
+                r.content
+            );
+            assert!(
+                r.content.contains("assistant:"),
+                "both speakers: {}",
+                r.content
+            );
+            let when = r.when.as_deref().expect("episode carries when");
+            assert!(when.contains(".."), "a session spans time, got {when}");
+        }
+
+        // The fact is dated by its newest evidence, never by the curation run,
+        // and its lineage reaches every cited episode's raw rows.
+        let (event_time, semantic_id): (Option<DateTime<Utc>>, Uuid) =
+            sqlx::query_as("SELECT event_time, id FROM curated_nodes WHERE kind = 'semantic'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            event_time.is_some(),
+            "semantic fact must carry evidence time"
+        );
+        let mut targets: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT to_id FROM curated_edges WHERE from_id = $1 AND kind = 'derived_from'",
+        )
+        .bind(semantic_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        targets.sort();
+        let mut want = vec![s1a, s1b, s2a, s2b];
+        want.sort();
+        assert_eq!(targets, want);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn distill_skips_gracefully_without_capability(pool: PgPool) {
         insert_document_raw(&pool, "alice", None, None, "the deploy target is staging").await;
         insert_document_raw(&pool, "alice", None, None, "switched the deploy target now").await;
@@ -1427,6 +2115,239 @@ mod tests {
         assert!(stats.skipped_distill);
         assert_eq!(stats.distilled, 0);
         assert_eq!(count_nodes(&pool, "alice", "semantic").await, 0);
+    }
+
+    // -- curate (the incremental hot path) ---------------------------------
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn curate_twice_does_no_new_work_and_never_duplicates(pool: PgPool) {
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+
+        let first = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(first.promoted, 2);
+        assert_eq!(first.distilled, 1);
+        assert_eq!(first.pending_sessions + first.pending_solos, 0);
+
+        // Same call again with nothing new: no promotion, no distillation, no
+        // duplicate facts — the regression was every pass re-distilling every
+        // episode forever.
+        let second = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(second.promoted, 0);
+        assert_eq!(second.refreshed, 0);
+        assert_eq!(second.distilled, 0);
+        assert_eq!(count_nodes(&pool, "alice", "semantic").await, 1);
+
+        // New same-topic records arrive: only THEY get distilled, appending a
+        // second fact while the first survives untouched.
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "note 8: the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "note 9: the deploy target for the pgvector service is staging",
+        )
+        .await;
+        let third = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(third.promoted, 2);
+        assert_eq!(third.distilled, 1);
+        assert_eq!(count_nodes(&pool, "alice", "semantic").await, 2);
+        assert_eq!(count_nodes(&pool, "alice", "episodic").await, 4);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn grown_session_refreshes_in_place_and_becomes_distillable_again(pool: PgPool) {
+        insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:user",
+            "first turn about the plan",
+            0,
+        )
+        .await;
+        insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:assistant",
+            "noted the plan",
+            60,
+        )
+        .await;
+        let first = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(first.promoted, 1);
+        let (node_id, meta): (Uuid, serde_json::Value) = sqlx::query_as(
+            "SELECT id, meta FROM curated_nodes WHERE kind = 'episodic' AND user_id = 'alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(meta["turns"], 2);
+
+        insert_turn(
+            &pool,
+            "alice",
+            "s1",
+            "host:agent:user",
+            "third turn changes the plan",
+            120,
+        )
+        .await;
+        let second = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(second.promoted, 0, "no new episode — the session grew");
+        assert_eq!(second.refreshed, 1);
+
+        let (same_id, content, meta): (Uuid, String, serde_json::Value) = sqlx::query_as(
+            "SELECT id, content, meta FROM curated_nodes WHERE kind = 'episodic' AND user_id = 'alice'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            same_id, node_id,
+            "refresh keeps the node id (decay state survives)"
+        );
+        assert!(
+            content.contains("third turn changes the plan"),
+            "transcript grew: {content}"
+        );
+        assert_eq!(meta["turns"], 3);
+        assert!(
+            meta.get("distilled_at").is_none(),
+            "a grown session must be distillable again"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn curate_skips_summary_rebuild_when_nothing_changed(pool: PgPool) {
+        // Enough level-0 nodes to clear SUMMARY_FANOUT_STOP, or no tree forms.
+        for i in 0..8 {
+            insert_document_raw(
+                &pool,
+                "alice",
+                None,
+                None,
+                &format!("note {i}: the deploy target for the pgvector service is staging"),
+            )
+            .await;
+        }
+        curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        let mut before: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM curated_nodes WHERE kind = 'summary' AND user_id = 'alice'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        before.sort();
+        assert!(!before.is_empty(), "test needs a summary tree");
+
+        // An idle pass must not touch the tree — same node ids afterwards.
+        curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        let mut after: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM curated_nodes WHERE kind = 'summary' AND user_id = 'alice'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        after.sort();
+        assert_eq!(
+            before, after,
+            "summary tree must be untouched by an idle pass"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn concurrent_curation_is_single_flight_per_user(pool: PgPool) {
+        insert_document_raw(&pool, "alice", None, None, "the deploy target is staging").await;
+
+        // Hold alice's curation lock on a separate connection — exactly what a
+        // racing scheduler tick or rebuild holds.
+        let mut holder = pool.acquire().await.unwrap();
+        let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1, hashtext('alice'))")
+            .bind(CURATION_LOCK_NS)
+            .fetch_one(&mut *holder)
+            .await
+            .unwrap();
+        assert!(got);
+
+        let stats = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert!(stats.locked_out, "a held lock must skip the pass");
+        assert_eq!(count_nodes(&pool, "alice", "episodic").await, 0);
+        let stats = rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert!(stats.locked_out, "rebuild honors the same lock");
+
+        sqlx::query("SELECT pg_advisory_unlock($1, hashtext('alice'))")
+            .bind(CURATION_LOCK_NS)
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let stats = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert!(!stats.locked_out);
+        assert_eq!(stats.promoted, 1, "released lock, pass proceeds");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn singletons_bump_attempts_and_undistilled_backlog_is_counted(pool: PgPool) {
+        // Two topics with disjoint entities: neither clusters, both stay
+        // eligible, and each pass must bump their attempt counter — the
+        // rotation key that keeps head-of-line singletons from starving the
+        // distill batch — while the undistilled backlog stays visible.
+        insert_document_raw(&pool, "alice", None, None, "the rocket launch window moved").await;
+        insert_document_raw(
+            &pool,
+            "alice",
+            None,
+            None,
+            "repotted the garden basil today",
+        )
+        .await;
+
+        let first = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(first.promoted, 2);
+        assert_eq!(first.distilled, 0, "disjoint topics must not cluster");
+        assert_eq!(first.pending_undistilled, 2);
+        let attempts: Vec<i64> = sqlx::query_scalar(
+            "SELECT (meta->>'distill_attempts')::bigint FROM curated_nodes \
+             WHERE kind = 'episodic' AND user_id = 'alice' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, vec![1, 1]);
+
+        let second = curate(&pool, &DistillingNlp, "alice").await.unwrap();
+        assert_eq!(second.pending_undistilled, 2);
+        let attempts: Vec<i64> = sqlx::query_scalar(
+            "SELECT (meta->>'distill_attempts')::bigint FROM curated_nodes \
+             WHERE kind = 'episodic' AND user_id = 'alice' ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(attempts, vec![2, 2], "each pass rotates the counter");
     }
 
     // -- rebuild -----------------------------------------------------------

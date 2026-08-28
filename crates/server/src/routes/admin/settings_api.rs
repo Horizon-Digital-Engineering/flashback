@@ -6,7 +6,7 @@
 //! through, server-wide, live. The flow the page drives:
 //!
 //!   GET  /admin/settings              — the page
-//!   GET  /admin/api/settings/models   — what the endpoint actually serves
+//!   POST /admin/api/settings/models   — what the endpoint actually serves
 //!   POST /admin/api/settings/test     — one real extraction with the draft config
 //!   POST /admin/api/settings          — persist + hot-swap the provider
 //!
@@ -15,7 +15,7 @@
 //! can never be configured. The API key is never accepted or returned here —
 //! it lives in the environment only (see the system_settings migration).
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::response::Html;
 use axum::Json;
 use serde::Deserialize;
@@ -61,18 +61,53 @@ pub struct ModelsQuery {
     pub base: String,
 }
 
-/// List the models an OpenAI-compatible endpoint serves. The key sent is the
-/// environment's — the browser never holds or supplies one.
+/// True when the environment's API key may accompany a probe of `requested`.
+/// Only the EFFECTIVE base — what the pipeline itself would call — qualifies.
+/// The key must never travel to a caller-supplied URL: a GET that forwarded it
+/// anywhere was a one-click credential exfiltration for anyone who could get
+/// the operator to follow a link.
+fn probe_key_allowed(effective: Option<&str>, requested: &str) -> bool {
+    match effective {
+        Some(e) => e.trim_end_matches('/') == requested.trim_end_matches('/'),
+        None => false,
+    }
+}
+
+/// List the models an OpenAI-compatible endpoint serves. POST, not GET, so the
+/// cross-site guard covers it; the environment key is attached only when the
+/// requested base IS the effective base (see `probe_key_allowed`). Probing any
+/// other endpoint works keyless — which is all a local model server needs.
 pub async fn models(
     State(state): State<AppState>,
     _user: AuthUser,
-    Query(q): Query<ModelsQuery>,
+    Json(q): Json<ModelsQuery>,
 ) -> AppResult<Json<serde_json::Value>> {
+    let stored = settings::load(&state.pool).await.unwrap_or_default();
+    let effective = settings::resolve(&state.cfg.provider, &stored);
     let key = state.cfg.provider.remote.api_key.clone();
-    let key = (!key.is_empty()).then_some(key);
+    let key = (!key.is_empty() && probe_key_allowed(effective.remote.api_base.as_deref(), &q.base))
+        .then_some(key);
     match settings::list_models(&q.base, key.as_deref()).await {
         Ok(models) => Ok(Json(json!({ "models": models }))),
         Err(e) => Err(AppError::bad_request(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_key_allowed;
+
+    #[test]
+    fn key_travels_only_to_the_effective_base() {
+        assert!(probe_key_allowed(
+            Some("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1/"
+        ));
+        assert!(!probe_key_allowed(
+            Some("http://127.0.0.1:11434/v1"),
+            "https://evil.example/v1"
+        ));
+        assert!(!probe_key_allowed(None, "http://127.0.0.1:11434/v1"));
     }
 }
 
@@ -152,17 +187,49 @@ pub async fn save(
     let wanted_remote = cfg.kind == ProviderKind::Remote;
     let applied = state.nlp.reconfigure_provider(&cfg).await;
 
-    let fell_back = wanted_remote && applied == "heuristic";
+    let mut warnings: Vec<String> = Vec::new();
+    if wanted_remote && applied == "heuristic" {
+        warnings.push(
+            "the saved config resolves to a remote provider but construction \
+             failed, so the pipeline fell back to heuristic — check the base \
+             URL, and the API key in the server environment if the backend \
+             needs one"
+                .to_string(),
+        );
+    }
+    // A name the endpoint doesn't serve constructs fine and then fails on
+    // every call — the silent-failure shape this page exists to kill. Verify
+    // the saved models against the endpoint and say so in the same response.
+    if wanted_remote && applied != "heuristic" {
+        if let Some(base) = cfg.remote.api_base.as_deref() {
+            let key = (!cfg.remote.api_key.is_empty()).then_some(cfg.remote.api_key.as_str());
+            match settings::list_models(base, key).await {
+                Ok(models) => {
+                    for (role, m) in [
+                        ("extract", &cfg.remote.extract_model),
+                        ("distill", &cfg.remote.distill_model),
+                    ] {
+                        if !models.iter().any(|x| x == m) {
+                            warnings.push(format!(
+                                "{role} model '{m}' is not served by the endpoint — every \
+                                 {role} call will fail until it is pulled or changed"
+                            ));
+                        }
+                    }
+                }
+                Err(e) => warnings.push(format!(
+                    "saved and applied, but the endpoint's model list could not be \
+                     checked ({e}) — model names are unverified"
+                )),
+            }
+        }
+    }
+
     Ok(Json(json!({
         "saved": s,
         "applied_provider": applied,
         "applied_models": state.nlp.provider_models(),
         "can_distill": state.nlp.provider_can_distill(),
-        "warning": fell_back.then_some(
-            "the saved config resolves to a remote provider but construction \
-             failed, so the pipeline fell back to heuristic — check the base \
-             URL, and the API key in the server environment if the backend \
-             needs one"
-        ),
+        "warning": (!warnings.is_empty()).then(|| warnings.join(" | ")),
     })))
 }

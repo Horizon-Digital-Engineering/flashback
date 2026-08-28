@@ -615,6 +615,53 @@ async fn assemble(
     ))
 }
 
+/// Ceiling on the total content characters one assemble response carries.
+/// Tokens are the real currency, but this server has no tokenizer; characters
+/// are an honest, deterministic proxy (~4 per English token). The default is
+/// sized so a full page never dominates a host's context window on its own.
+fn assemble_char_budget() -> usize {
+    std::env::var("FLASHBACK_ASSEMBLE_CHAR_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(60_000)
+}
+
+/// Enforce the record limit and the character budget on a final record set,
+/// in rank order. The first record always survives, so one long document can
+/// still be served alone. Returns a warning sentence when the budget clipped.
+fn clamp_assembled(records: &mut Vec<RawRecordRow>, limit: i64) -> Option<String> {
+    records.truncate(limit as usize);
+    let budget = assemble_char_budget();
+    let before = records.len();
+    let mut used = 0usize;
+    let mut keep = before;
+    for (i, r) in records.iter().enumerate() {
+        used = used.saturating_add(r.content.chars().count());
+        if used > budget && i > 0 {
+            keep = i;
+            break;
+        }
+    }
+    if keep < before {
+        records.truncate(keep);
+        Some(format!(
+            "content clipped to the {budget}-character budget: {keep} of {before} \
+             ranked records returned (raise FLASHBACK_ASSEMBLE_CHAR_BUDGET to widen)"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Merge an optional clip warning into an existing warning line.
+fn merge_warning(existing: Option<String>, clip: Option<String>) -> Option<String> {
+    match (existing, clip) {
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+        (a, b) => a.or(b),
+    }
+}
+
 pub(crate) async fn assemble_inner(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -668,7 +715,7 @@ pub(crate) async fn assemble_inner(
             LIMIT $5
             "#
         );
-        let records = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+        let mut records = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
             .bind(user_id)
             .bind(&req.project_id)
             .bind(&req.container_id)
@@ -677,24 +724,29 @@ pub(crate) async fn assemble_inner(
             .bind(&req.exclude_container_id)
             .fetch_all(pool)
             .await?;
+        let clip = clamp_assembled(&mut records, limit);
         return Ok(AssembleResponse {
             records,
             degraded: false,
-            warning: None,
+            warning: clip,
         });
     }
 
     // Cross-mode: no shared vector geometry — keyword(BM25) + entity + recency
     // over raw, across every mode. Visible `degraded` flag + a warning.
     if cross_mode {
-        let records = cross_mode_degraded(pool, nlp, user_id, &req, &query, limit).await?;
+        let mut records = cross_mode_degraded(pool, nlp, user_id, &req, &query, limit).await?;
+        let clip = clamp_assembled(&mut records, limit);
         return Ok(AssembleResponse {
             records,
             degraded: true,
-            warning: Some(
-                "cross-mode request: vector search skipped (modes live in different \
-                 embedding spaces); ranked by keyword, entity overlap, and recency."
-                    .to_string(),
+            warning: merge_warning(
+                Some(
+                    "cross-mode request: vector search skipped (modes live in different \
+                     embedding spaces); ranked by keyword, entity overlap, and recency."
+                        .to_string(),
+                ),
+                clip,
             ),
         });
     }
@@ -773,18 +825,21 @@ pub(crate) async fn assemble_inner(
 
     // 2) Resolve curated hits -> source raw ids, in curated-rank order. A
     // summary resolves through its `summarizes` chain down to level-0 nodes,
-    // then each level-0 node's `derived_from` edges to raw ids.
+    // then each level-0 node's `derived_from` edges to raw ids. Each node may
+    // only contribute up to the REMAINING capacity, enforced inside the
+    // expansion query — the limit binds during expansion, never after it.
     let mut ordered_raw_ids: Vec<Uuid> = Vec::new();
     let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     for (node_id, _level) in &curated_scored {
-        let raw_ids = raw_ids_under_node(pool, *node_id).await?;
+        let remaining = limit - ordered_raw_ids.len() as i64;
+        if remaining <= 0 {
+            break;
+        }
+        let raw_ids = raw_ids_under_node(pool, *node_id, remaining).await?;
         for rid in raw_ids {
-            if seen.insert(rid) {
+            if seen.insert(rid) && (ordered_raw_ids.len() as i64) < limit {
                 ordered_raw_ids.push(rid);
             }
-        }
-        if ordered_raw_ids.len() as i64 >= limit {
-            break;
         }
     }
 
@@ -849,10 +904,11 @@ pub(crate) async fn assemble_inner(
         records.extend(backstop);
     }
 
+    let clip = clamp_assembled(&mut records, limit);
     Ok(AssembleResponse {
         records,
         degraded: false,
-        warning: None,
+        warning: clip,
     })
 }
 
@@ -1007,11 +1063,20 @@ async fn reference_hits(
     Ok(rows)
 }
 
-/// Every raw id reachable from a curated node: walk `summarizes` down to the
+/// Raw ids reachable from a curated node: walk `summarizes` down to the
 /// level-0 nodes, then their `derived_from` edges to raw record ids. A level-0
 /// node (no `summarizes` children) resolves straight through its own
 /// `derived_from` edges.
-async fn raw_ids_under_node(pool: &PgPool, node_id: Uuid) -> AppResult<Vec<Uuid>> {
+///
+/// Capped and recency-ordered: a summary near the root of a large tree can
+/// reach most of the corpus, and an uncapped expansion once returned all of it
+/// from a single ranked hit. The cap keeps one node from monopolizing a page,
+/// and ordering by the raw record's event time means a truncated expansion
+/// keeps the newest evidence rather than an arbitrary subset.
+async fn raw_ids_under_node(pool: &PgPool, node_id: Uuid, cap: i64) -> AppResult<Vec<Uuid>> {
+    if cap <= 0 {
+        return Ok(Vec::new());
+    }
     let sql = r#"
         WITH RECURSIVE tree AS (
             SELECT $1::uuid AS id
@@ -1020,12 +1085,19 @@ async fn raw_ids_under_node(pool: &PgPool, node_id: Uuid) -> AppResult<Vec<Uuid>
             FROM curated_edges e
             JOIN tree t ON e.from_id = t.id AND e.kind = 'summarizes'
         )
-        SELECT DISTINCT df.to_id
-        FROM tree t
-        JOIN curated_edges df ON df.from_id = t.id AND df.kind = 'derived_from'
+        SELECT src.to_id
+        FROM (
+            SELECT DISTINCT df.to_id
+            FROM tree t
+            JOIN curated_edges df ON df.from_id = t.id AND df.kind = 'derived_from'
+        ) src
+        JOIN raw_records r ON r.id = src.to_id
+        ORDER BY r.event_time DESC
+        LIMIT $2
     "#;
     let ids: Vec<Uuid> = sqlx::query_scalar(sql)
         .bind(node_id)
+        .bind(cap)
         .fetch_all(pool)
         .await?;
     Ok(ids)
@@ -1443,6 +1515,94 @@ mod tests {
             until: None,
             limit: None,
         }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn assemble_limit_binds_even_through_a_summary_tree(pool: PgPool) {
+        // Eight same-topic documents curate into episodic nodes plus a summary
+        // covering all of them. A ranked summary hit used to expand to its
+        // whole subtree AFTER the limit check, so one node returned the whole
+        // corpus; the limit must bind during expansion.
+        for i in 0..8 {
+            ingest_record(
+                &pool,
+                &ModeAwareStub,
+                "leslie",
+                IngestRecordRequest {
+                    project_id: None,
+                    ..req(&format!(
+                        "note {i}: the deploy target for the pgvector service is staging"
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        }
+        crate::curation::rebuild(&pool, &ModeAwareStub, "leslie")
+            .await
+            .unwrap();
+        let summaries: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes WHERE kind = 'summary' AND user_id = 'leslie'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(summaries > 0, "test needs a summary tree to be meaningful");
+
+        let out = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            AssembleRequest {
+                project_id: None,
+                container_id: None,
+                mode: None,
+                modes: None,
+                exclude_container_id: None,
+                query: Some("deploy target".into()),
+                limit: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.records.len() <= 3,
+            "limit=3 must bind, got {} records",
+            out.records.len()
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn assemble_clips_to_the_character_budget_with_a_warning(pool: PgPool) {
+        // Three 25k-char documents against the default 60k budget: two fit,
+        // the third is clipped and the response says so.
+        for i in 0..3 {
+            let body = format!("filler document {i} ").repeat(1_400); // ~25k chars
+            ingest_record(&pool, &ModeAwareStub, "leslie", req(&body))
+                .await
+                .unwrap();
+        }
+        let out = assemble_inner(
+            &pool,
+            &ModeAwareStub,
+            "leslie",
+            AssembleRequest {
+                project_id: Some("health".into()),
+                container_id: None,
+                mode: None,
+                modes: None,
+                exclude_container_id: None,
+                query: Some("filler document".into()),
+                limit: Some(10),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.records.len(), 2, "third record must be clipped");
+        let warning = out.warning.expect("clip must be announced");
+        assert!(warning.contains("clipped"), "got: {warning}");
+        let total: usize = out.records.iter().map(|r| r.content.chars().count()).sum();
+        assert!(total <= 60_000, "budget must hold, got {total} chars");
     }
 
     #[sqlx::test(migrations = "../../migrations")]

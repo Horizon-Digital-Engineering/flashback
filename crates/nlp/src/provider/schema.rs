@@ -118,6 +118,11 @@ pub struct EpisodeRef {
     pub content: String,
     pub topic: Option<String>,
     pub entities: Vec<String>,
+    /// When the episode happened — an RFC 3339 instant, or `start..end` for a
+    /// span. Serialized into the distill prompt so the model can weigh recency
+    /// when episodes disagree; without it, "which claim is newer" is unknowable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 /// A semantic fact distilled from one or more episodic memories.

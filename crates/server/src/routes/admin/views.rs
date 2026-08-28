@@ -1476,9 +1476,7 @@ $('st-load-models').addEventListener('click', async e => {
   if (!base) { $('st-models-status').textContent = 'set a base URL first'; return; }
   $('st-models-status').textContent = 'asking the endpoint…';
   try {
-    const res = await fetch('/admin/api/settings/models?base=' + encodeURIComponent(base));
-    if (!res.ok) throw new Error((await res.text()).slice(0, 300));
-    const { models } = await res.json();
+    const { models } = await post('/admin/api/settings/models', { base });
     const dl = $('st-model-list');
     dl.replaceChildren(...models.map(m => Object.assign(document.createElement('option'), { value: m })));
     $('st-models-status').textContent = models.length + ' model(s) served — the fields now autocomplete from them';

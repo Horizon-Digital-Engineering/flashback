@@ -312,7 +312,11 @@ fn spawn_curation_scheduler(state: AppState) {
         loop {
             interval.tick().await;
             tracing::info!("curation: scheduled tick");
-            let _ = curation::rebuild_all_users(&state.pool, &*state.nlp).await;
+            // Incremental: promote/refresh/distill only what changed since the
+            // last tick. The wipe-and-re-derive `rebuild` stays available as
+            // the recovery tool behind the explicit rebuild endpoint — running
+            // it on a schedule re-billed the whole corpus every tick.
+            let _ = curation::curate_all_users(&state.pool, &*state.nlp).await;
         }
     });
 

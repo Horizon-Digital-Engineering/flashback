@@ -29,6 +29,9 @@ struct ProviderSlot {
     /// `(extract_model, distill_model)` for remote providers; `None` when the
     /// provider has no model (heuristic) or manages its own (embedded).
     models: Option<(String, String)>,
+    /// Travels with the provider it applies to — a runtime swap replaces the
+    /// whole behavior, not just the trait object.
+    fallback: FallbackPolicy,
 }
 
 /// Build a provider from config. Shared by startup and the settings page's
@@ -73,6 +76,7 @@ async fn build_provider(provider_cfg: &SrvProviderConfig) -> ProviderSlot {
                             provider_cfg.remote.extract_model.clone(),
                             provider_cfg.remote.distill_model.clone(),
                         )),
+                        fallback: provider_cfg.fallback,
                     }
                 }
                 Err(e) => {
@@ -80,7 +84,7 @@ async fn build_provider(provider_cfg: &SrvProviderConfig) -> ProviderSlot {
                         "Remote AI provider misconfigured ({e}); falling back to heuristic. \
                          Set PROVIDER=heuristic explicitly to silence this warning."
                     );
-                    heuristic_slot()
+                    heuristic_slot(provider_cfg.fallback)
                 }
             }
         }
@@ -101,6 +105,7 @@ async fn build_provider(provider_cfg: &SrvProviderConfig) -> ProviderSlot {
                         provider: Arc::new(p),
                         name: "embedded-llm",
                         models: None,
+                        fallback: provider_cfg.fallback,
                     }
                 }
                 Err(e) => {
@@ -108,22 +113,23 @@ async fn build_provider(provider_cfg: &SrvProviderConfig) -> ProviderSlot {
                         "Embedded LLM init failed ({e}); falling back to heuristic. \
                          Build with --features embedded-llm to enable in-process LLM."
                     );
-                    heuristic_slot()
+                    heuristic_slot(provider_cfg.fallback)
                 }
             }
         }
         ProviderKind::Heuristic => {
             tracing::info!("Heuristic AI provider configured (no LLM calls)");
-            heuristic_slot()
+            heuristic_slot(provider_cfg.fallback)
         }
     }
 }
 
-fn heuristic_slot() -> ProviderSlot {
+fn heuristic_slot(fallback: FallbackPolicy) -> ProviderSlot {
     ProviderSlot {
         provider: Arc::new(HeuristicProvider),
         name: "heuristic",
         models: None,
+        fallback,
     }
 }
 
@@ -142,7 +148,6 @@ pub struct Nlp {
     /// restart. Reads clone the inner `Arc` and drop the lock immediately; an
     /// in-flight call keeps the provider it started with alive via its clone.
     provider: Arc<std::sync::RwLock<ProviderSlot>>,
-    fallback: FallbackPolicy,
 }
 
 impl Nlp {
@@ -167,7 +172,6 @@ impl Nlp {
             extra_embedders: Arc::new(AsyncMutex::new(HashMap::new())),
             cache_dir,
             provider: Arc::new(std::sync::RwLock::new(slot)),
-            fallback: provider_cfg.fallback,
         })
     }
 
@@ -290,12 +294,16 @@ impl Nlp {
     /// the heuristic provider if remote fails and `PROVIDER_FALLBACK=heuristic`.
     pub async fn extract_full(&self, text: &str) -> Result<Extraction, AppError> {
         let ctx = ExtractContext::default();
-        match self.current_provider().extract(text, &ctx).await {
+        let (provider, fallback) = {
+            let slot = self.provider.read().expect("provider lock");
+            (slot.provider.clone(), slot.fallback)
+        };
+        match provider.extract(text, &ctx).await {
             Ok(e) => Ok(e),
             Err(ProviderError::NotConfigured(_))
             | Err(ProviderError::Upstream(_))
             | Err(ProviderError::Timeout(_))
-            | Err(ProviderError::BadOutput(_)) => match self.fallback {
+            | Err(ProviderError::BadOutput(_)) => match fallback {
                 FallbackPolicy::Heuristic => {
                     tracing::warn!(
                         "AI provider failed; falling back to heuristic (PROVIDER_FALLBACK=heuristic)"

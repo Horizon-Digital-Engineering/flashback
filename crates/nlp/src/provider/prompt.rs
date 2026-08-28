@@ -48,6 +48,8 @@ Rules:
 - Prefer fewer, denser facts (1-3 for most clusters) over many small ones.
 - `topic` is the shared canonical topic phrase.
 - `source_episode_ids` MUST be a subset of the input episodes' `id` field — list which episodes each fact was derived from.
+- Episodes may carry a `when` timestamp or `start..end` span. When episodes disagree, the most recent claim wins: state the CURRENT truth in present tense. If the change over time is itself the fact, state it as a change ("moved from X to Y").
+- Never present a superseded claim as current. If recency cannot be established for conflicting claims, drop the fact rather than guess.
 - `confidence` is your self-rating, 0.0-1.0. Higher when multiple episodes agree.
 - If the cluster is too noisy or inconsistent to distill, return { "facts": [] }.
 - No prose, no markdown fences. JSON only."#;
@@ -116,6 +118,16 @@ mod tests {
         let p = build_distill_system_prompt();
         for field in ["facts", "content", "source_episode_ids", "confidence"] {
             assert!(p.contains(field), "distill prompt missing {field}");
+        }
+    }
+
+    #[test]
+    fn distill_system_prompt_states_the_recency_rule() {
+        let p = build_distill_system_prompt();
+        // The temporal contract: the model is told about `when`, told newest
+        // wins, and told never to present a superseded claim as current.
+        for phrase in ["`when`", "most recent claim wins", "superseded"] {
+            assert!(p.contains(phrase), "distill prompt missing {phrase}");
         }
     }
 

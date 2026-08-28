@@ -904,25 +904,30 @@ pub(crate) async fn curated_summary(
     Ok(rows)
 }
 
-/// Glass-box trigger for the curated layer: promote working raw records to
-/// episodic + distill semantic facts for the caller, then redirect back.
+/// Glass-box trigger for the curated layer: an INCREMENTAL pass — promote new
+/// work, refresh grown sessions, distill the undistilled — then redirect back.
+/// The destructive wipe-and-re-derive lives behind the explicit rebuild
+/// endpoint, not behind a button this convenient.
 pub async fn curate_trigger(
     State(state): State<AppState>,
     user: AuthUser,
 ) -> Result<Response, super::Error> {
-    match crate::curation::rebuild(&state.pool, &*state.nlp, user.scope()).await {
+    match crate::curation::curate(&state.pool, &*state.nlp, user.scope()).await {
         Ok(stats) => {
             tracing::info!(
                 promoted = stats.promoted,
+                refreshed = stats.refreshed,
                 distilled = stats.distilled,
                 clusters = stats.clusters_seen,
                 distill_skipped = stats.skipped_distill,
-                "manual curation run complete"
+                pending_sessions = stats.pending_sessions,
+                pending_solos = stats.pending_solos,
+                "manual curation pass complete"
             );
             Ok(Redirect::to("/admin/curate").into_response())
         }
         Err(e) => {
-            tracing::error!("curation run failed: {e}");
+            tracing::error!("curation pass failed: {e}");
             Ok((StatusCode::INTERNAL_SERVER_ERROR, "curation failed").into_response())
         }
     }

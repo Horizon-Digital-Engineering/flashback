@@ -251,6 +251,9 @@ async fn summarize_cluster(nlp: &dyn NlpService, children: &[&LevelNode]) -> Str
                 content: c.content.clone(),
                 topic: None,
                 entities: c.entities.clone(),
+                // Summaries compress content, they don't adjudicate currency —
+                // the recency rule is distillation's job, one level down.
+                when: None,
             })
             .collect();
         if let Ok(facts) = nlp.distill_facts(&refs).await {
