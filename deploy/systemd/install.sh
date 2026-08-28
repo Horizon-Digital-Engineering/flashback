@@ -35,8 +35,9 @@ die() { printf '\n[flashback] ERROR: %s\n' "$*" >&2; exit 1; }
 [ -f "$REPO_ROOT/Cargo.toml" ] || die "can't find the repo root from $REPO_ROOT"
 
 # Builds run as the invoking user so cargo's caches and rustup toolchain stay
-# in their home, not root's. Skipped entirely if the binaries are already there
-# and newer than the sources.
+# in their home, not root's. Skipped only when the release binary is newer than
+# every source that goes into it, so a checkout that has moved on always
+# rebuilds. Set FLASHBACK_FORCE_BUILD=1 to build regardless.
 build_user="${SUDO_USER:-root}"
 
 require_postgres() {
@@ -80,13 +81,45 @@ provision_database() {
         || die "pgvector missing — install postgresql-$(psql -V | grep -oE '[0-9]+' | head -1)-pgvector"
 }
 
+# Anything whose contents end up compiled into the binary. Migrations are not
+# here: they are copied to the install directory as files, not built in.
+build_inputs() {
+    local p
+    for p in Cargo.toml Cargo.lock crates .sqlx rust-toolchain.toml rust-toolchain; do
+        [ -e "$REPO_ROOT/$p" ] && printf '%s\n' "$REPO_ROOT/$p"
+    done
+}
+
+# Prints the first input newer than the artifact, or nothing. -quit stops at the
+# first hit rather than walking the whole tree.
+newer_than_artifact() {
+    local artifact="$1"
+    find $(build_inputs) -newer "$artifact" -print -quit 2>/dev/null
+}
+
 build_binaries() {
-    if [ -x "$REPO_ROOT/target/release/flashback" ] \
-        && [ -z "${FLASHBACK_FORCE_BUILD:-}" ]; then
-        log "binaries present — skipping build (set FLASHBACK_FORCE_BUILD=1 to override)"
+    local artifact="$REPO_ROOT/target/release/flashback" reason newer
+
+    if [ -n "${FLASHBACK_FORCE_BUILD:-}" ]; then
+        reason="forced by FLASHBACK_FORCE_BUILD"
+    elif [ ! -x "$artifact" ]; then
+        reason="no release binary in the checkout yet"
+    else
+        newer="$(newer_than_artifact "$artifact")"
+        if [ -n "$newer" ]; then
+            reason="${newer#"$REPO_ROOT"/} is newer than the last build"
+        fi
+    fi
+
+    if [ -z "$reason" ]; then
+        # Say when it was built. "Skipping" on its own reads as success while
+        # deploying whatever happens to be sitting in target/, which is how a
+        # release-old binary reaches production looking freshly installed.
+        log "release binary is newer than every source — skipping build (built $(date -r "$artifact" '+%Y-%m-%d %H:%M'))"
         return
     fi
-    log "building (as $build_user)"
+
+    log "building (as $build_user) — $reason"
     sudo -u "$build_user" -H bash -lc \
         "cd '$REPO_ROOT' && cargo build --release --workspace" \
         || die "cargo build failed"
