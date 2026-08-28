@@ -13,6 +13,7 @@ pub async fn health_check(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "status": if db_ok { "ok" } else { "degraded" },
         "service": "flashback",
+        "build": crate::build_info::as_json(),
         "dev_mode": state.cfg.dev_mode,
         "db": { "ok": db_ok },
         "nlp": {

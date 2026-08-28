@@ -26,6 +26,10 @@ fn dev_mode_on() -> bool {
 /// Page chrome: head + nav + main + footer.
 pub fn page(active: &str, user_id: &str, content: &str) -> String {
     let nav = render_nav(active, user_id);
+    // On every page rather than only the dashboard: the question "what is
+    // running here" is asked from wherever the operator already is. The value
+    // is constrained to safe characters where it is stamped, not escaped here.
+    let build = crate::build_info::summary();
     let banner = if dev_mode_on() {
         r#"<div class="dev-banner">⚠ DEV MODE — auth bypassed. Every request runs as <code>user_id=dev</code>. Don't expose this server to the internet.</div>"#
     } else {
@@ -46,6 +50,7 @@ pub fn page(active: &str, user_id: &str, content: &str) -> String {
 <main class="page">
 {content}
 </main>
+<footer class="build">{build}</footer>
 {LOCAL_TIME_JS}
 </body>
 </html>"#

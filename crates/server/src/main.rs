@@ -1,4 +1,5 @@
 mod auth;
+mod build_info;
 mod catalog;
 mod config;
 mod curation;
@@ -82,8 +83,12 @@ async fn main() -> Result<()> {
         Some("doctor") => doctor::run().await,
         Some("token") => run_token(rest).await,
         Some("serve") | None => run_serve().await,
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("{}", build_info::summary());
+            Ok(())
+        }
         Some(other) => Err(anyhow!(
-            "Unknown subcommand: {other}. Try: serve | migrate | doctor | token mint|list|revoke"
+            "Unknown subcommand: {other}. Try: serve | migrate | doctor | version | token mint|list|revoke"
         )),
     }
 }
