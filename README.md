@@ -107,9 +107,10 @@ Flashback never deletes. Old records are marked superseded; new records carry a 
 
 ## Features
 
-- **Records and references** — five record-type memories (episodic, semantic, working, document, procedural) plus structured state objects (the "heap" — variables in memory). See [docs/REFERENCES.md](docs/REFERENCES.md).
+- **Raw and curated** — an append-only raw layer of three record types (`conversation`, `document`, `state_object`) and a rebuildable layer above it. Raw holds only what a writer sent; anything we worked out by reading it — the embedding register, the resolved order, tags, scores — lives above and a rebuild is free to disagree. See [docs/REFERENCES.md](docs/REFERENCES.md).
 - **Supersede-not-delete** — full temporal history of how beliefs evolved, queryable at any point in time
-- **Hybrid retrieval** — weighted combination of semantic similarity, BM25 keyword match, recency, importance, project context, and entity overlap
+- **Ordered, tamper-evident** — each record carries the writer's claim about what preceded it, so conversations keep their true order and their forks without trusting clocks; separately, a sha256 chain over arrival order makes an edited record invalidate every record stored after it
+- **Hybrid retrieval** — weighted combination of semantic similarity, BM25 keyword match, recency, and entity overlap, over HNSW vector indexes
 - **Two retrieval modes** — *answer mode* for questions, *manager mode* for reconstructing "what's going on" at session start
 - **Decay model** — retrieval scores degrade by half-life (not deletion); pinned memories never decay
 - **MCP server included** — wrap Flashback as a remote MCP server (Streamable HTTP) so Claude Desktop, Claude Code, Cursor, or anything MCP-aware can share memory across clients
@@ -142,7 +143,7 @@ Flashback never deletes. Old records are marked superseded; new records carry a 
                       ▼                 ▼
         ┌─────────────────────┐  ┌─────────────────────────┐
         │  sidecar (port 8081)│  │  Postgres + pgvector    │
-        │  Embeddings (MiniLM)│  │  memories, state, tokens│
+        │  Embeddings (MiniLM)│  │  raw_records, curated_* │
         │  Entity extraction  │  │  (recursive-CTE lineage)│
         │  (Python, for now)  │  └─────────────────────────┘
         └─────────────────────┘
@@ -292,7 +293,7 @@ For every deployment there's a built-in admin UI at `/admin`. Login with any min
 - **Settings** — the live extraction/distillation provider: model picked from what the endpoint actually serves, one-click test extraction, applies without a restart
 - **Playground** — a seedable, sandboxed test bench for the whole loop: retrieval, the exact prompt, per-turn extraction, the streamed reply, and one-click distillation of the conversation into facts. Writes stay in a sandbox scope; reads can opt into the real store
 - **Tokens** — list + revoke per-client tokens
-- **Mind map** — force-directed network graph of your memories, edges for supersede / entity-overlap / same-session. Server-rendered HTML + inline vanilla JS, no framework, no CDN, no external assets.
+- **Mind map** — force-directed network graph of your memories, edges for supersede / entity-overlap / same-thread. Server-rendered HTML + inline vanilla JS, no framework, no CDN, no external assets.
 
 Visit `http://<your-host>:8080/admin` after `docker compose up`.
 
@@ -339,79 +340,92 @@ Every request requires `Authorization: Bearer <token>`. `user_id` is derived fro
 **Before the LLM call** — retrieve context:
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/context/assemble \
+curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/records/context \
   -d '{
-    "session_id": "sess_abc123",
-    "project_id": "proj_flashback",
-    "query":      "what'\''s the current deploy target?"
+    "thread_id": "chat_abc123",
+    "query":     "what'"'"'s the current deploy target?",
+    "limit":     20
   }'
 ```
 
-Returns a 5-layer prompt context — procedural / active project (core memory + state objects) / retrieved memories / document chunks / recent conversation — ready to inject into your system prompt.
+Optional: `topic_id` (where the thread is filed), `mode` or `modes` (which
+cognitive register to search), and `exclude_thread_id` — usually the live
+conversation, since memory means *other* threads.
 
-**After the LLM call** — ingest the exchange:
+The response is bounded by a character budget, so it cannot blow your context
+window.
+
+**After the LLM call** — record each turn:
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/memory/ingest \
+curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/records \
   -d '{
-    "session_id":     "sess_abc123",
-    "project_id":     "proj_flashback",
-    "user_turn":      "what'\''s the current deploy target?",
-    "assistant_turn": "The current deploy target is production..."
+    "type":       "conversation",
+    "content":    "The current deploy target is production.",
+    "source":     "myapp:assistant",
+    "source_ref": "myapp:chat_abc123:42",
+    "thread_id":  "chat_abc123",
+    "prev_source_ref": "myapp:chat_abc123:41",
+    "payload":    { "model": "claude-opus-5", "usage": { "output_tokens": 91 } }
   }'
 ```
 
-The exchange is embedded, entity-extracted, and stored. If entities overlap heavily with a recent prior record in the same session, the new record supersedes the old. The next `/context/assemble` runs against an index that already includes this turn.
+One record per turn — a user turn and an assistant turn are two records, not one.
+
+Three fields are worth getting right:
+
+- **`source_ref`** is your own stable id for the message. It makes ingest
+  idempotent: re-sending the same record updates nothing instead of duplicating.
+- **`prev_source_ref`** is the `source_ref` of the turn this one followed. You
+  never handle a flashback id — it resolves yours. This builds the chain that
+  gives conversations real order and makes forks representable, so send turns
+  for one thread **in order**.
+- **`payload`** is whatever metadata you already have — model, token usage,
+  latency, attachments. Stored verbatim, never interpreted. Some of it cannot be
+  recovered later, so record it now even if nothing reads it yet.
 
 ### State objects — the reference half of memory
 
-For things you're *maintaining* rather than *logging* (a running todo list, an evolving plan), use the `/state` endpoints. The terminal node is always the current value; the chain preserves history. See [docs/REFERENCES.md](docs/REFERENCES.md).
+Things you *maintain* rather than *log* (a running todo list, an evolving plan)
+are records of `type: "state_object"`, and they get a projected API of their own
+under `/records/state`. The terminal record for a `(kind, key)` is the current
+value; the supersede chain is its whole history.
 
 ```bash
-# Create a todo list
-curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/state/todo_list \
-  -d '{
-    "project_id": "proj_flashback",
-    "state_key":  "deploy_checklist",
-    "initial":    { "items": [{ "text": "run tests" }, { "text": "build image" }] }
-  }'
+# set (or revise) a value — each POST appends, nothing is mutated
+curl -H "Authorization: Bearer $TOKEN" -X POST \
+  http://localhost:8080/records/state/todo_list/deploy_checklist \
+  -d '{ "data": { "items": [{ "text": "run tests" }, { "text": "build image" }] } }'
 
-# Apply an op — each PATCH creates a new terminal node
-curl -H "Authorization: Bearer $TOKEN" -X PATCH http://localhost:8080/state/todo_list/deploy_checklist \
-  -d '{ "op": "mark_done", "item_id": "..." }'
+# current value
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/records/state/todo_list/deploy_checklist
 
-# Current value
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/state/todo_list/deploy_checklist
+# every revision, oldest first
+curl -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8080/records/state/todo_list/deploy_checklist/history
 
-# Full evolution
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/state/todo_list/deploy_checklist/history
+# everything of this kind
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/records/state/todo_list
 ```
 
-### Core memory
+See [docs/REFERENCES.md](docs/REFERENCES.md).
+
+### Structured reads
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/core \
-  -d '{ "content": "Always use TypeScript. Never suggest full rewrites." }'
+# filter by scope and type
+curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/records/query \
+  -d '{ "thread_id": "chat_abc123", "type": "conversation", "limit": 50 }'
 
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/core
-```
+# bulk load a corpus (idempotent on source_ref)
+curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/records/import \
+  -d '{ "records": [ ... ] }'
 
-### Semantic search
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" -X POST http://localhost:8080/memory/search \
-  -d '{
-    "query":      "auth middleware changes",
-    "mode":       "answer",
-    "project_id": "proj_flashback",
-    "top_k":      10
-  }'
-```
-
-### Temporal lineage
-
-```bash
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/lineage/{memory_id}
+# one record, its supersede chain, and what curation derived from it
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/records/{id}
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/records/{id}/lineage
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/records/{id}/derivations
 ```
 
 ---

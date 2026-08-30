@@ -108,7 +108,7 @@ Conversation snapshots and event records. The "what happened" layer.
 {
   "type": "episodic",
   "timestamp": "2025-11-14T09:23:00Z",
-  "session_id": "sess_abc123",
+  "thread_id": "chat_abc123",
   "summary": "Refactored auth middleware to remove session token storage; discussed compliance requirements.",
   "entities": ["auth_middleware", "session_tokens", "compliance"],
   "embedding": [...],
@@ -147,7 +147,7 @@ Active context with explicit TTL. Things the system needs right now.
   "ttl_hours": 48,
   "expires_at": "2025-11-16T09:23:00Z",
   "priority": "high",
-  "session_id": "sess_abc123",
+  "thread_id": "chat_abc123",
   "decay_class": "fast"
 }
 ```
@@ -285,16 +285,23 @@ interface MemoryRecord {
   last_accessed_at: Date;
   expires_at?: Date;             // working memory only
 
-  // Scoring
-  importance: number;            // 0.0–1.0, set at write time + updated on access
+  // Scoring — DERIVED. None of this sits on a raw row: a score the writer set
+  // could never be disagreed with by a rebuild, which defeats the point of
+  // having a rebuildable layer at all.
+  importance: number;            // 0.0–1.0, curation's own conclusion
   access_count: number;
   decay_class: DecayClass;       // none | slow | medium | fast
 
   // Context
-  project_id?: string;
-  session_id?: string;
+  topic_id?: string;             // where the thread is filed; a filter, not a wall
+  thread_id?: string;            // the conversation this arrived on
   user_id: string;
-  entities: string[];            // named entities extracted at write time
+  entities: string[];            // DERIVED — extracted, not sent
+
+  // Order and integrity
+  prev_source_ref?: string;      // what the WRITER said preceded this, in its ids
+  seq: number;                   // arrival order per user; what the chain runs along
+  record_hash: string;           // sha256 over this row and the hash at seq - 1
 
   // Supersede chain
   superseded_by?: string;        // ID of the memory that replaces this one
@@ -316,7 +323,7 @@ type DecayClass = 'none' | 'slow' | 'medium' | 'fast';
 >
 > | Layer | Column | Values | Who sets it |
 > |---|---|---|---|
-> | raw | `raw_records.type` | `conversation`, `document`, `observation`, `state_object` | the writer |
+> | raw | `raw_records.type` | `conversation`, `document`, `state_object` | the writer |
 > | curated | `curated_nodes.kind` | `episodic`, `semantic`, `summary` | the curation pipeline |
 >
 > A raw type names **the kind of evidence**; a curated kind names **the tier it
@@ -327,8 +334,8 @@ type DecayClass = 'none' | 'slow' | 'medium' | 'fast';
 >
 > One consequence worth stating plainly, because the tier names invite the wrong
 > intuition: **a conversation turn is not an episode.** The episode is the whole
-> conversation, so `conversation` rows group by `session_id` into one episodic
-> node per session.
+> conversation, so `conversation` rows group by `thread_id` into one episodic
+> node per thread.
 
 ### Entity Node (graph schema)
 
@@ -412,8 +419,8 @@ final_score(m) =
     w_sem  * semantic_similarity(query_embedding, m.embedding)    // cosine similarity
   + w_kw   * bm25_score(query_text, m.content)                   // keyword match
   + w_rec  * recency_score(m.last_accessed_at)                   // exp decay
-  + w_imp  * m.importance                                         // explicit importance
-  + w_proj * project_match(active_project, m.project_id)         // 1.0 or 0.0
+  + w_imp  * m.importance                                         // curation's own weight
+  + w_topic * topic_match(active_topic, m.topic_id)              // 1.0 or 0.0
   + w_ent  * entity_overlap(query_entities, m.entities)          // Jaccard similarity
   + w_task * active_task_bonus(m, active_tasks)                  // 0.5 if referenced
 
@@ -435,7 +442,9 @@ Before scoring, a pre-filter step reduces the candidate set:
 
 1. **Type filter** — exclude memory types not relevant to the current retrieval mode
 2. **Decay filter** — exclude memories with `decay_factor < 0.05` and `access_count == 0`
-3. **Project filter** — optionally restrict to `project_id == active_project`
+3. **Topic filter** — optionally restrict to `topic_id == active_topic`. Optional
+   by design: a topic is where a thread was filed, not a wall, so scoping is a
+   query-time choice rather than a storage-time one
 4. **ANN pre-retrieval** — fetch top-200 candidates by approximate nearest neighbor before applying full scoring
 
 ### Re-ranking
@@ -633,27 +642,30 @@ RETURN latest
 ### REST Endpoints
 
 ```
-POST   /memory                    Create a memory record
-GET    /memory/:id                Retrieve by ID
-PUT    /memory/:id/supersede      Supersede with new content
-DELETE /memory/:id                Soft-delete (sets expired_at)
+GET    /health                       Liveness, build, db, embedder, extractor
 
-POST   /memory/search             Hybrid retrieval query
-POST   /memory/ingest             Ingest a document or URL
-POST   /memory/consolidate        Trigger manual consolidation
+POST   /records                      Append one record
+POST   /records/import               Bulk append; idempotent on source_ref
+POST   /records/query                Structured read by scope, type, time
+POST   /records/context              Assemble retrieval context (the read path)
+GET    /records/summaries            Curated summaries
+POST   /records/rebuild              Re-derive the curated layer from raw
+GET    /records/{id}                 One record
+GET    /records/{id}/lineage         Its supersede chain, oldest first
+GET    /records/{id}/derivations     What curation built from it
 
-GET    /memory/core               Get core memory (always-on context)
-PUT    /memory/core/:id           Update a core memory item
-POST   /memory/core               Pin a new core memory item
-
-GET    /tasks                     List active candidate tasks
-PUT    /tasks/:id/confirm         Promote candidate to tracked task
-DELETE /tasks/:id                 Dismiss a candidate task
-
-GET    /lineage/:entity_id        Walk supersede chain for an entity
-GET    /graph/entities            List entity nodes
-GET    /graph/relationships       List entity relationships
+/records/state/{kind}[/{key}[/history]]   state_object records, projected
+/modes  /catalog  /proposals         Registers, published facts, the propose→decide loop
+/admin                               Server-rendered operator UI (no API access)
 ```
+
+There is deliberately no `DELETE` and no update. Raw is append-only, enforced by
+a trigger rather than by convention — a correction is a new record whose
+`supersedes` points at the old one, which is never touched.
+
+`state_object` is a record *type* first; `/records/state` is a projection over
+those rows, not a second store. The terminal record for a `(kind, key)` is the
+current value, and the supersede chain is its history.
 
 ### Search Request Schema
 
@@ -662,7 +674,7 @@ interface SearchRequest {
   query: string;
   mode: 'answer' | 'manager';
   top_k?: number;                // default: 10
-  project_id?: string;
+  topic_id?: string;
   memory_types?: MemoryType[];   // filter by type
   since?: Date;                  // temporal lower bound
   until?: Date;                  // temporal upper bound
@@ -691,9 +703,9 @@ Returns the fully assembled layered prompt context for a given session, broken d
 
 ```typescript
 interface ContextAssemblyRequest {
-  session_id: string;
+  thread_id: string;
   user_id: string;
-  project_id?: string;
+  topic_id?: string;
   query?: string;               // if present, uses answer mode for Layer 3
   token_budget?: number;        // override total budget
 }
@@ -752,7 +764,7 @@ Built with Three.js on the frontend, served as a static SPA from the API server.
 **Data API for visualization**:
 
 ```
-GET /viz/graph?project_id=...&since=...&until=...
+GET /viz/graph?topic_id=...&since=...&until=...
 ```
 
 Returns nodes + edges in a format ready for Three.js scene construction:
@@ -819,42 +831,48 @@ interface VizGraph {
 
 ### Database Schema (PostgreSQL)
 
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+**`migrations/` is the schema.** It is not restated here — a copy in prose is a
+copy that goes stale, which is exactly what happened to this section before.
 
-CREATE TABLE memories (
-  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  type          TEXT NOT NULL,
-  content       TEXT NOT NULL,
-  embedding     vector(1536),
-  importance    FLOAT DEFAULT 0.5,
-  access_count  INT DEFAULT 0,
-  decay_class   TEXT DEFAULT 'medium',
-  project_id    UUID,
-  session_id    UUID,
-  user_id       UUID NOT NULL,
-  entities      TEXT[],
-  superseded_by UUID REFERENCES memories(id),
-  supersedes    UUID REFERENCES memories(id),
-  source_path   TEXT,
-  chunk_index   INT,
-  content_hash  TEXT,
-  expires_at    TIMESTAMPTZ,
-  created_at    TIMESTAMPTZ DEFAULT now(),
-  updated_at    TIMESTAMPTZ DEFAULT now(),
-  last_accessed_at TIMESTAMPTZ DEFAULT now(),
-  viz_position  FLOAT[3]   -- UMAP coordinates for visualization
-);
+The files are subsystems, not a change history, and read in order they are a tour
+of the system:
 
-CREATE INDEX ON memories USING ivfflat (embedding vector_cosine_ops)
-  WITH (lists = 100);
+| | |
+|---|---|
+| `001` `002` `003` | extensions, tokens, principals/grants |
+| `004` `005` | `raw_records` and its embeddings |
+| `006` `007` | the curated layer, the entity index |
+| `008`–`011` | ref weights, catalog, proposals, modes |
+| `012` | `derived_*` — the register, the resolved link, the supersede edge |
+| `013` | `raw_assertions` + `derived_labels` — tags, titles, sensitivity |
+| `014`–`016` | settings, playground settings, the `playground` schema |
 
-CREATE INDEX ON memories USING GIN (to_tsvector('english', content));
-CREATE INDEX ON memories (user_id, project_id, type);
-CREATE INDEX ON memories (expires_at) WHERE expires_at IS NOT NULL;
-CREATE INDEX ON memories (superseded_by) WHERE superseded_by IS NOT NULL;
-```
+Five properties of the raw layer are worth knowing before reading it:
+
+- **Append-only, enforced by trigger.** `UPDATE`, `DELETE` and `TRUNCATE` all
+  raise. Corrections are a new row pointing back via `supersedes`.
+- **Order is recorded, not inferred.** `prev_source_ref` is the writer's claim
+  about what this followed, kept in the writer's own id space. Resolving it to an
+  internal id is a conclusion, so that edge lives in `derived_link` and is
+  re-resolved on every rebuild — a parent that arrives late gets connected then,
+  instead of leaving a gap nothing could ever close.
+- **The tamper chain runs along `seq`, not along that link.** `record_hash` is
+  sha256 over the row plus the hash at `seq - 1`, so every record protects every
+  record that arrived after it and an edit invalidates all of them. Chaining
+  along the causal link instead left an imported corpus as thousands of
+  one-record chains protecting nothing. This detects tampering by someone with
+  database access; it does not stop someone who controls the application, which
+  would need an externally anchored checkpoint.
+- **Two hard partitions, and only two.** `user_id` is custody. The embedding
+  register is geometry — vectors of different dimensions cannot be compared — and
+  it lives in `derived_record_mode`, because which register a record belongs to
+  is a conclusion and a wrong one must be fixable. `topic_id` is *not* a
+  partition: it is where a thread is filed, and curation derives across it,
+  because material in a health topic should inform taxes in April.
+
+The playground sandbox is a separate Postgres schema rather than a marker column,
+so `public` carries no condition that knows it exists, and removing the feature
+is `DROP SCHEMA playground CASCADE`.
 
 ### Docker Compose (Development)
 
@@ -898,7 +916,7 @@ volumes:
 ### Scaling Considerations
 
 - **Embedding throughput**: batch embedding jobs run asynchronously via a task queue (Celery + Redis). Ingestion does not block the request path.
-- **Vector index**: pgvector's IVFFlat index requires a `VACUUM ANALYZE` after bulk inserts. For large stores (>1M vectors), consider migrating to Qdrant as a dedicated vector backend.
-- **Read replicas**: the retrieval path is read-heavy. Route `POST /memory/search` and `POST /context/assemble` to read replicas.
+- **Vector index**: HNSW, not IVFFlat. IVFFlat computes its cluster centroids when the index is built, so an index created on an empty table has meaningless centroids and never re-learns as rows arrive — wrong for a store that appends forever. HNSW needs no training step and absorbs inserts. For very large stores (>1M vectors), a dedicated vector backend becomes worth evaluating.
+- **Read replicas**: the retrieval path is read-heavy. Route `POST /records/query` and `POST /records/context` to read replicas.
 - **Consolidation jobs**: run on a separate worker process to avoid starving the API under heavy consolidation load.
 

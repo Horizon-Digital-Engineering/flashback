@@ -96,29 +96,32 @@ This refinement does not require a schema migration — the original `memories` 
 
 ## How `state_object` Works in Flashback
 
-A `state_object` is a memory whose type is `state_object` and which carries two additional columns:
+A `state_object` is a record whose type is `state_object` and whose `payload` carries the reference convention:
 
-```
-state_kind  TEXT           -- 'todo_list' | 'plan' | 'decision_log' | …
-state_data  JSONB          -- the actual structured value
-state_key   TEXT           -- canonical name within (user_id, state_kind),
-                              e.g. "groceries", "q3_plan"
+```json
+{
+  "kind": "todo_list",          // 'todo_list' | 'plan' | 'decision_log' | …
+  "key":  "groceries",          // canonical name within (user_id, kind)
+  "data": { }                   // the actual structured value
+}
 ```
 
-The triple `(user_id, state_kind, state_key)` identifies a logical variable. The terminal node — the row with no `superseded_by` — holds the current value. Older nodes are the audit trail.
+Identity lives in the payload and nowhere else. It used to be copied onto columns by an insert trigger, which is normalising on the way in — and the trigger fired after the one computing the tamper hash, so every state object reported itself as tampered. An expression index on `(user_id, payload->>'kind', payload->>'key')` makes it queryable without the copy, and is faster than the columns were.
+
+The triple `(user_id, kind, key)` identifies a logical variable. The terminal row — the newest for that identity — holds the current value. Older rows are the audit trail.
 
 **Invariants:**
 - `state_data` always contains the complete current value, not a delta. This means the terminal row is self-contained — no chain walk required to render the current state.
 - `content` is a deterministic textual rendering of `state_data`, so embeddings + BM25 still work and the object can show up in standard semantic retrieval.
-- Updates create new rows with `supersedes = old_id`; the old row's `superseded_by` is set in the same transaction.
+- Updates create new rows. The supersede edge is written to `derived_superseded`, not onto the raw row: the writer never claimed the older value was replaced, the server worked it out from identity and arrival order. That makes it a conclusion, and a rebuild is free to redo it.
 
 **Mutation API:**
 
 ```
-POST   /state/:kind                              create
-GET    /state/:kind/:state_key?user_id=…         current value
-PATCH  /state/:kind/:state_key                   apply an op
-GET    /state/:kind/:state_key/history           supersede chain
+POST   /records/state/:kind/:key                 set (or revise) the value
+GET    /records/state/:kind/:key                 current value
+GET    /records/state/:kind/:key/history         every revision, oldest first
+GET    /records/state/:kind                      everything of this kind
 ```
 
 The PATCH body declares an `op` whose verbs depend on the `kind`. For `todo_list`:

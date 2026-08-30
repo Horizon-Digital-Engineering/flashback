@@ -692,7 +692,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn csrf_allows_same_origin_and_non_browser_writes() {
         // Sec-Fetch-Site is what a current browser sends.
         let r = req_with_header("Sec-Fetch-Site", "same-origin");
@@ -738,6 +737,7 @@ mod tests {
         assert!(is_state_changing(&axum::http::Method::DELETE));
     }
 
+    #[test]
     fn admin_surface_detection_covers_admin_only() {
         assert!(is_admin_surface("/admin"));
         assert!(is_admin_surface("/admin/records"));

@@ -24,6 +24,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[derive(Clone)]
 pub struct AppState {
     pub pool: sqlx::PgPool,
+    pub playground: sqlx::PgPool,
     pub nlp: nlp::SharedNlp,
     pub cfg: Arc<config::Config>,
 }
@@ -126,6 +127,7 @@ async fn run_serve() -> Result<()> {
         tracing::info!("AUTO_MIGRATE=1 — running migrations on startup");
         db::migrate(&pool).await?;
     }
+    let playground = db::create_playground_pool(&cfg.database_url).await?;
 
     // The environment seeds the provider config; the settings row — written
     // from the admin settings page — wins over it once one exists.
@@ -147,6 +149,7 @@ async fn run_serve() -> Result<()> {
 
     let state = AppState {
         pool,
+        playground,
         nlp,
         cfg: cfg_arc.clone(),
     };

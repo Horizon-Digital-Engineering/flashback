@@ -12,11 +12,11 @@ CREATE TABLE raw_embeddings (
     PRIMARY KEY (record_id, model)
 );
 CREATE INDEX raw_embeddings_vec_idx
-    ON raw_embeddings USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
+    ON raw_embeddings USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)
     WHERE embedding IS NOT NULL;
 CREATE INDEX raw_embeddings_vec768_idx
-    ON raw_embeddings USING ivfflat (embedding_768 vector_cosine_ops) WITH (lists = 100)
+    ON raw_embeddings USING hnsw (embedding_768 vector_cosine_ops) WITH (m = 16, ef_construction = 64)
     WHERE embedding_768 IS NOT NULL;
 CREATE INDEX raw_embeddings_vec1024_idx
-    ON raw_embeddings USING ivfflat (embedding_1024 vector_cosine_ops) WITH (lists = 100)
+    ON raw_embeddings USING hnsw (embedding_1024 vector_cosine_ops) WITH (m = 16, ef_construction = 64)
     WHERE embedding_1024 IS NOT NULL;

@@ -547,6 +547,7 @@ pub(crate) async fn sync_store_inner(
     let records: Vec<ImportRecord> = facts
         .into_iter()
         .map(|f| ImportRecord {
+            prev_source_ref: None,
             // A fact carrying a payload is a structured slice (state_object);
             // a bare fact is text the store published, so it lands as a
             // document — evidence arriving from outside, not a tier we derived.
@@ -559,10 +560,9 @@ pub(crate) async fn sync_store_inner(
             event_time: f.event_time,
             source: store.name.clone(),
             source_ref: Some(f.id.to_string()),
-            project_id: None,
-            container_id: None,
+            topic_id: None,
+            thread_id: None,
             mode: None,
-            importance: None,
             payload: f.payload,
         })
         .collect();
@@ -629,15 +629,15 @@ mod tests {
             &StubNlp,
             user_id,
             crate::routes::records::IngestRecordRequest {
+                prev_source_ref: None,
                 r#type: "document".into(),
                 content: content.into(),
                 event_time: None,
                 source: "test".into(),
                 source_ref: None,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
-                importance: None,
                 supersedes: None,
                 payload: None,
             },

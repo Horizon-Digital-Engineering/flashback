@@ -59,8 +59,8 @@ pub struct ReferenceView {
     pub state_kind: String,
     pub state_key: String,
     pub user_id: String,
-    pub project_id: Option<String>,
-    pub container_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub thread_id: Option<String>,
     /// The COMPLETE current value (never a delta).
     pub state_data: Value,
     pub supersedes: Option<Uuid>,
@@ -80,8 +80,8 @@ fn to_view(row: RawRecordRow) -> AppResult<ReferenceView> {
         state_kind,
         state_key,
         user_id: row.user_id,
-        project_id: row.project_id,
-        container_id: row.container_id,
+        topic_id: row.topic_id,
+        thread_id: row.thread_id,
         state_data,
         supersedes: row.supersedes,
         event_time: row.event_time,
@@ -111,7 +111,18 @@ pub(crate) async fn get_current_inner(
     let row = terminal_row(pool, user_id, kind, key)
         .await?
         .ok_or_else(|| AppError::not_found(format!("reference {kind}/{key}")))?;
-    to_view(row)
+    let id = row.id;
+    let mut view = to_view(row)?;
+    // Which row this one replaced is a conclusion, so it is read back from the
+    // derived edge rather than from a column on the raw row.
+    view.supersedes = sqlx::query_scalar(
+        "SELECT record_id FROM derived_superseded WHERE superseded_by = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(view)
 }
 
 /// The terminal state_object raw row for (user, kind, key): the one not
@@ -129,12 +140,9 @@ async fn terminal_row(
         SELECT {COLS} FROM raw_records
         WHERE type = 'state_object'
           AND user_id = $1
-          AND state_kind = $2
-          AND state_key = $3
-          AND id NOT IN (
-              SELECT supersedes FROM raw_records
-              WHERE supersedes IS NOT NULL AND user_id = $1
-          )
+          AND payload->>'kind' = $2
+          AND payload->>'key'  = $3
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = raw_records.id)
         ORDER BY event_time DESC
         LIMIT 1
         "#
@@ -174,12 +182,9 @@ pub(crate) async fn list_kind_inner(
         SELECT {COLS} FROM raw_records
         WHERE type = 'state_object'
           AND user_id = $1
-          AND state_kind = $2
-          AND id NOT IN (
-              SELECT supersedes FROM raw_records
-              WHERE supersedes IS NOT NULL AND user_id = $1
-          )
-        ORDER BY state_key ASC, event_time DESC
+          AND payload->>'kind' = $2
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = raw_records.id)
+        ORDER BY payload->>'key' ASC, event_time DESC
         "#
     );
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
@@ -199,11 +204,9 @@ pub struct PutValueRequest {
     /// The COMPLETE new current value (never a delta).
     pub data: Value,
     #[serde(default)]
-    pub project_id: Option<String>,
+    pub topic_id: Option<String>,
     #[serde(default)]
-    pub container_id: Option<String>,
-    #[serde(default)]
-    pub importance: Option<f32>,
+    pub thread_id: Option<String>,
 }
 
 async fn put_value(
@@ -244,36 +247,43 @@ pub(crate) async fn put_value_inner(
     }
 
     let prior = terminal_row(pool, user_id, kind, key).await?;
-    let supersedes = prior.as_ref().map(|r| r.id);
     // Inherit scope from the prior terminal when the writer doesn't override it,
     // so a reference stays in its bucket across updates.
-    let project_id = req
-        .project_id
-        .or_else(|| prior.as_ref().and_then(|r| r.project_id.clone()));
-    let container_id = req
-        .container_id
-        .or_else(|| prior.as_ref().and_then(|r| r.container_id.clone()));
+    let topic_id = req
+        .topic_id
+        .or_else(|| prior.as_ref().and_then(|r| r.topic_id.clone()));
+    let thread_id = req
+        .thread_id
+        .or_else(|| prior.as_ref().and_then(|r| r.thread_id.clone()));
 
-    // The payload carries the reference convention {kind, key, data}; the DB
-    // trigger promotes kind/key onto the indexed columns at insert. `content` is
-    // a deterministic rendering so the value stays in embeddings + BM25.
+    // The payload carries the reference convention {kind, key, data} and is the
+    // only home for that identity — an expression index makes it queryable
+    // without copying it onto columns. `content` is a deterministic rendering so
+    // the value stays in embeddings + BM25.
     let payload = json!({ "kind": kind, "key": key, "data": req.data });
     let content = render_reference(kind, key, &req.data);
 
     let ingest = IngestRecordRequest {
+        prev_source_ref: None,
         r#type: "state_object".to_string(),
         content,
         event_time: None,
         source: REF_SOURCE.to_string(),
         source_ref: None,
-        project_id,
-        container_id,
+        topic_id,
+        thread_id,
         mode: None,
-        importance: req.importance,
-        supersedes,
+        // NOT set here. "A newer value for this key exists" is something the
+        // server worked out, not something the writer claimed — so it is derived
+        // and a rebuild is free to redo it.
+        supersedes: None,
         payload: Some(payload),
     };
     let out = ingest_record(pool, nlp, user_id, ingest).await?;
+
+    if let Some(p) = prior.as_ref() {
+        crate::routes::records::derive_superseded(pool, p.id, user_id, out.id, "inferred").await?;
+    }
 
     get_current_inner(pool, user_id, kind, key)
         .await
@@ -326,8 +336,8 @@ pub(crate) async fn history_inner(
         SELECT {COLS} FROM raw_records
         WHERE type = 'state_object'
           AND user_id = $1
-          AND state_kind = $2
-          AND state_key = $3
+          AND payload->>'kind' = $2
+          AND payload->>'key'  = $3
         ORDER BY event_time ASC, ingest_time ASC
         "#
     );
@@ -342,17 +352,22 @@ pub(crate) async fn history_inner(
         return Err(AppError::not_found(format!("reference {kind}/{key}")));
     }
 
-    let terminal = rows
-        .iter()
-        .find(|r| {
-            // Terminal = not superseded by any sibling in the chain.
-            !rows.iter().any(|o| o.supersedes == Some(r.id))
-        })
-        .map(|r| r.id);
+    // Ordered oldest→newest above, and a (kind, key) chain is linear, so the
+    // last row is the current value and each row replaced the one before it.
+    // The supersede edge itself is derived — the server working out that a newer
+    // value exists is a conclusion, so it is not on the raw row.
+    let terminal = rows.last().map(|r| r.id);
     let length = rows.len();
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
     let chain: Vec<ReferenceView> = rows
         .into_iter()
-        .map(to_view)
+        .enumerate()
+        .map(|(i, r)| {
+            to_view(r).map(|mut v| {
+                v.supersedes = if i > 0 { Some(ids[i - 1]) } else { None };
+                v
+            })
+        })
         .collect::<AppResult<Vec<_>>>()?;
 
     Ok(json!({
@@ -410,16 +425,15 @@ mod tests {
     fn put(data: Value) -> PutValueRequest {
         PutValueRequest {
             data,
-            project_id: None,
-            container_id: None,
-            importance: None,
+            topic_id: None,
+            thread_id: None,
         }
     }
 
     async fn count_state_rows(pool: &PgPool, user_id: &str, key: &str) -> i64 {
         sqlx::query_scalar(
             "SELECT COUNT(*) FROM raw_records \
-             WHERE type = 'state_object' AND user_id = $1 AND state_key = $2",
+             WHERE type = 'state_object' AND user_id = $1 AND payload->>'key' = $2",
         )
         .bind(user_id)
         .bind(key)
@@ -464,12 +478,13 @@ mod tests {
         assert_eq!(count_state_rows(&pool, "alice", "today").await, 2);
 
         // The promoted columns were populated by the trigger on both rows.
-        let ident: (String, String) =
-            sqlx::query_as("SELECT state_kind, state_key FROM raw_records WHERE id = $1")
-                .bind(v2.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let ident: (String, String) = sqlx::query_as(
+            "SELECT payload->>'kind', payload->>'key' FROM raw_records WHERE id = $1",
+        )
+        .bind(v2.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(ident, ("todo_list".to_string(), "today".to_string()));
 
         // v1's row is byte-for-byte unchanged (append-only).

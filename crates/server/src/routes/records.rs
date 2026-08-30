@@ -17,7 +17,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -31,16 +31,166 @@ use crate::{
     AppState,
 };
 
+/// Record which register a record landed in. A conclusion, so it lives beside
+/// raw rather than on it — and re-deciding it is an UPSERT here instead of an
+/// impossible UPDATE on an append-only row.
+pub(crate) async fn derive_record_mode(
+    pool: &PgPool,
+    record_id: Uuid,
+    user_id: &str,
+    event_time: DateTime<Utc>,
+    mode: Option<&crate::modes::Mode>,
+    origin: &str,
+) -> AppResult<()> {
+    let Some(m) = mode else { return Ok(()) };
+    sqlx::query(
+        r#"
+        INSERT INTO derived_record_mode
+            (record_id, user_id, mode, embedder, event_time, origin, decided_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT (record_id) DO UPDATE SET
+            mode = EXCLUDED.mode, embedder = EXCLUDED.embedder,
+            origin = EXCLUDED.origin, decided_by = EXCLUDED.decided_by,
+            decided_at = NOW()
+        "#,
+    )
+    .bind(record_id)
+    .bind(user_id)
+    .bind(&m.name)
+    .bind(&m.embedder)
+    .bind(event_time)
+    .bind(origin)
+    .bind("ingest-v1")
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Resolve the writer's claim about what preceded this record. Unresolvable is
+/// not an error and not permanent: the claim stays on the raw row, and a rebuild
+/// re-runs this, so a parent that arrives late gets linked then.
+pub(crate) async fn derive_link(
+    pool: &PgPool,
+    record_id: Uuid,
+    user_id: &str,
+    prev_source_ref: Option<&str>,
+) -> AppResult<()> {
+    let Some(sref) = prev_source_ref else {
+        return Ok(());
+    };
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM raw_records WHERE user_id = $1 AND source_ref = $2 AND id <> $3",
+    )
+    .bind(user_id)
+    .bind(sref)
+    .bind(record_id)
+    .fetch_all(pool)
+    .await?;
+    if ids.len() != 1 {
+        tracing::debug!(prev_source_ref = %sref, matches = ids.len(), "prev unresolved for now");
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO derived_link (record_id, user_id, prev_id) VALUES ($1,$2,$3)
+         ON CONFLICT (record_id) DO UPDATE SET prev_id = EXCLUDED.prev_id, resolved_at = NOW()",
+    )
+    .bind(record_id)
+    .bind(user_id)
+    .bind(ids[0])
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mark a record as no longer current. `origin` separates the writer saying so
+/// from the server working it out, so a rebuild can redo one without the other.
+pub(crate) async fn derive_superseded(
+    pool: &PgPool,
+    record_id: Uuid,
+    user_id: &str,
+    superseded_by: Uuid,
+    origin: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO derived_superseded (record_id, user_id, superseded_by, origin)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT (record_id) DO UPDATE SET
+             superseded_by = EXCLUDED.superseded_by, origin = EXCLUDED.origin,
+             decided_at = NOW()",
+    )
+    .bind(record_id)
+    .bind(user_id)
+    .bind(superseded_by)
+    .bind(origin)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn nul_free(s: &str) -> Option<String> {
+    s.contains('\0').then(|| s.replace('\0', "\u{FFFD}"))
+}
+
+fn nul_free_json(v: &Value) -> Option<Value> {
+    match v {
+        Value::String(s) => nul_free(s).map(Value::String),
+        Value::Array(a) => {
+            let mut changed = false;
+            let out: Vec<Value> = a
+                .iter()
+                .map(|x| match nul_free_json(x) {
+                    Some(n) => {
+                        changed = true;
+                        n
+                    }
+                    None => x.clone(),
+                })
+                .collect();
+            changed.then_some(Value::Array(out))
+        }
+        Value::Object(o) => {
+            let mut changed = false;
+            let mut out = serde_json::Map::new();
+            for (k, val) in o {
+                let nk = match nul_free(k) {
+                    Some(n) => {
+                        changed = true;
+                        n
+                    }
+                    None => k.clone(),
+                };
+                let nv = match nul_free_json(val) {
+                    Some(n) => {
+                        changed = true;
+                        n
+                    }
+                    None => val.clone(),
+                };
+                out.insert(nk, nv);
+            }
+            changed.then_some(Value::Object(out))
+        }
+        _ => None,
+    }
+}
+
 /// Columns of raw_records in RawRecordRow field order. `content_tsv` is a
 /// generated tsvector and is deliberately NOT selected (not on the struct).
 /// `state_kind`/`state_key` are promoted state_object columns (010) — read via
 /// the payload on the struct, so also not selected here.
 pub(crate) const COLS: &str = "id, type, content, content_hash, event_time, ingest_time, \
-    source, source_ref, user_id, project_id, container_id, mode, importance, \
-    supersedes, payload";
+    source, source_ref, user_id, topic_id, thread_id, \
+    supersedes, prev_source_ref, seq, record_hash, \
+    (content_raw IS NOT NULL) AS sanitized, payload";
 const COLS_R: &str = "r.id, r.type, r.content, r.content_hash, r.event_time, r.ingest_time, \
-    r.source, r.source_ref, r.user_id, r.project_id, r.container_id, r.mode, r.importance, \
-    r.supersedes, r.payload";
+    r.source, r.source_ref, r.user_id, r.topic_id, r.thread_id, \
+    r.supersedes, r.prev_source_ref, r.seq, r.record_hash, \
+    (r.content_raw IS NOT NULL) AS sanitized, r.payload";
+/// The OUTPUT names of the two lists above — for re-selecting from a subquery
+/// that already projected them, where `content_raw` no longer exists.
+const COLS_OUT: &str = "id, type, content, content_hash, event_time, ingest_time, \
+    source, source_ref, user_id, topic_id, thread_id, \
+    supersedes, prev_source_ref, seq, record_hash, sanitized, payload";
 
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
@@ -50,6 +200,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/context", post(assemble))
         .route("/summaries", get(summaries))
         .route("/rebuild", post(rebuild_curation))
+        .route("/verify", get(verify_chain))
         // The raw-native reference surface (state_object records).
         .nest("/state", crate::references::router(state.clone()))
         .route("/{id}", get(get_record))
@@ -70,17 +221,24 @@ pub struct RawRecordRow {
     pub source: String,
     pub source_ref: Option<String>,
     pub user_id: String,
-    pub project_id: Option<String>,
-    pub container_id: Option<String>,
-    pub mode: Option<String>,
-    pub importance: Option<f32>,
+    pub topic_id: Option<String>,
+    pub thread_id: Option<String>,
     pub supersedes: Option<Uuid>,
+    /// What the writer claimed preceded this, its arrival position, and the
+    /// chain hash — returned so a client can verify without trusting us.
+    pub prev_source_ref: Option<String>,
+    pub seq: i64,
+    pub record_hash: Option<String>,
+    /// True when `content` differs from the bytes that arrived — Postgres cannot
+    /// store NUL, so those were replaced and the originals kept in `content_raw`.
+    /// Without this the substitution would be invisible and look like the source.
+    pub sanitized: bool,
     pub payload: Option<Value>,
 }
 
 impl RawRecordRow {
     /// The reference kind for a state_object row, from the `{kind,...}` payload
-    /// convention (the same value the 010 trigger promotes onto `state_kind`).
+    /// convention (the same value the 004 trigger promotes onto `state_kind`).
     pub(crate) fn state_kind_of(&self, payload: &Value) -> AppResult<String> {
         payload
             .get("kind")
@@ -103,7 +261,7 @@ impl RawRecordRow {
 /// it is about — a writer says what arrived, curation says what it became. Only
 /// types with a real processing rule are accepted: an accepted-but-unread type
 /// is a silent data hole. Kept in lockstep with the CHECK in
-/// `003_raw_records.sql`; add a value here only alongside its extractor.
+/// `004_raw_records.sql`; add a value here only alongside its extractor.
 fn validate_type(t: &str) -> AppResult<()> {
     match t {
         "conversation" | "document" | "state_object" => Ok(()),
@@ -126,16 +284,22 @@ pub struct IngestRecordRequest {
     #[serde(default)]
     pub source_ref: Option<String>,
     #[serde(default)]
-    pub project_id: Option<String>,
+    pub topic_id: Option<String>,
     #[serde(default)]
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
+    /// The register the writer asks for. A claim, so it is honoured — but it is
+    /// recorded in `derived_record_mode`, not on the row, because a register can
+    /// be re-decided and an immutable row cannot.
     #[serde(default)]
     pub mode: Option<String>,
-    #[serde(default)]
-    pub importance: Option<f32>,
     /// id this record supersedes (forward pointer; the old row is never mutated).
     #[serde(default)]
     pub supersedes: Option<Uuid>,
+    /// What preceded this, in the WRITER's id space. Resolved into
+    /// `derived_link`, which re-resolves on rebuild — so a parent that arrives
+    /// late gets linked instead of leaving a permanent gap.
+    #[serde(default)]
+    pub prev_source_ref: Option<String>,
     /// Metadata the SOURCE handed us, verbatim — the exporting model, a
     /// conversation title, the folder a file was dropped in. Never normalised on
     /// the way in: normalising is interpreting, and interpreting is deriving.
@@ -165,7 +329,10 @@ pub(crate) async fn ingest_record(
     req: IngestRecordRequest,
 ) -> AppResult<IngestRecordResponse> {
     validate_type(&req.r#type)?;
-    if req.content.trim().is_empty() {
+    // Empty text is only empty if nothing else arrived either. An image-only
+    // turn carries its substance in `payload`, and rejecting it would lose a
+    // record that genuinely happened — and break the chain of every turn after.
+    if req.content.trim().is_empty() && req.payload.is_none() {
         return Err(AppError::bad_request("content must not be empty"));
     }
 
@@ -187,39 +354,52 @@ pub(crate) async fn ingest_record(
     }
 
     let id = Uuid::new_v4();
+
     let event_time = req.event_time.unwrap_or_else(Utc::now);
-    let importance = req.importance.map(|i| i.clamp(0.0, 1.0));
 
     // Resolve the mode by precedence: caller override → LLM auto-classify →
-    // project default → general. The LLM classification only fires for an
-    // LLM-capable provider (the heuristic returns `None`, so no extra work on
-    // the no-LLM path); a resolve failure never blocks ingest.
+    // project default → general. The answer is a conclusion, so it is written to
+    // derived_record_mode below rather than onto the row.
     let mode = resolve_ingest_mode(pool, nlp, user_id, req.mode.as_deref(), &req.content).await;
+    let mode_origin = if req.mode.is_some() { "writer" } else { "llm" };
+
+    let cleaned = nul_free(&req.content);
+    let content_raw: Option<Vec<u8>> = cleaned.as_ref().map(|_| req.content.as_bytes().to_vec());
+    let ingest_content: &str = cleaned.as_deref().unwrap_or(&req.content);
+    let cleaned_payload = req.payload.as_ref().and_then(nul_free_json);
+    let ingest_payload = cleaned_payload.as_ref().or(req.payload.as_ref());
 
     // content_hash + content_tsv + ingest_time are generated/defaulted by the DB.
     sqlx::query(
         r#"
         INSERT INTO raw_records
             (id, type, content, event_time, source, source_ref,
-             user_id, project_id, container_id, mode, importance, supersedes, payload)
+             user_id, topic_id, thread_id, supersedes, payload,
+             content_raw, prev_source_ref)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         "#,
     )
     .bind(id)
     .bind(&req.r#type)
-    .bind(&req.content)
+    .bind(ingest_content)
     .bind(event_time)
     .bind(&req.source)
     .bind(&req.source_ref)
     .bind(user_id)
-    .bind(&req.project_id)
-    .bind(&req.container_id)
-    .bind(mode.as_ref().map(|m| m.name.as_str()))
-    .bind(importance)
+    .bind(&req.topic_id)
+    .bind(&req.thread_id)
     .bind(req.supersedes)
-    .bind(&req.payload)
+    .bind(ingest_payload)
+    .bind(content_raw)
+    .bind(&req.prev_source_ref)
     .execute(pool)
     .await?;
+
+    derive_record_mode(pool, id, user_id, event_time, mode.as_ref(), mode_origin).await?;
+    derive_link(pool, id, user_id, req.prev_source_ref.as_deref()).await?;
+    if let Some(sid) = req.supersedes {
+        derive_superseded(pool, sid, user_id, id, "writer").await?;
+    }
 
     // Derived embedding — best-effort, in the resolved mode's geometry. Raw is
     // the source of truth; if the embedder is down a backfill job can fill the
@@ -338,17 +518,15 @@ pub struct ImportRecord {
     #[serde(default)]
     pub source_ref: Option<String>,
     #[serde(default)]
-    pub project_id: Option<String>,
+    pub topic_id: Option<String>,
     #[serde(default)]
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
-    pub importance: Option<f32>,
+    pub prev_source_ref: Option<String>,
     /// Metadata the source handed us, verbatim. `conversation_title` here is
-    /// what episode formation prefers when naming a conversation. An export's
-    /// own grouping (a ChatGPT "project") belongs here too, NOT in `project_id`
-    /// — `project_id` partitions and would fragment the curated layer.
+    /// what episode formation prefers when naming a conversation.
     #[serde(default)]
     pub payload: Option<Value>,
 }
@@ -391,15 +569,15 @@ pub(crate) async fn import_records_inner(
 
     let mut tx = pool.begin().await?;
     for r in req.records {
-        if validate_type(&r.r#type).is_err() || r.content.trim().is_empty() {
+        if validate_type(&r.r#type).is_err() || (r.content.trim().is_empty() && r.payload.is_none())
+        {
             continue;
         }
         let id = Uuid::new_v4();
         let event_time = r.event_time.unwrap_or_else(Utc::now);
-        let importance = r.importance.map(|i| i.clamp(0.0, 1.0));
-        // Bulk import resolves mode by caller override → project default (no
-        // per-record LLM classification — a corpus load stays cheap; the
-        // background curation pass can re-derive later).
+        // Bulk import resolves mode by caller override → project default, with
+        // no per-record LLM classification: a corpus load stays cheap, and the
+        // register is derived so a later pass can decide it properly.
         let mode = crate::modes::resolve_mode(pool, user_id, r.mode.as_deref(), None)
             .await
             .ok();
@@ -407,11 +585,16 @@ pub(crate) async fn import_records_inner(
             .as_ref()
             .map(|m| m.embedder.clone())
             .unwrap_or_else(|| nlp.embedder_model_name().to_string());
+        let cleaned = nul_free(&r.content);
+        let content_raw: Option<Vec<u8>> = cleaned.as_ref().map(|_| r.content.as_bytes().to_vec());
+        let import_content: String = cleaned.unwrap_or_else(|| r.content.clone());
+        let cleaned_payload = r.payload.as_ref().and_then(nul_free_json);
+        let import_payload = cleaned_payload.as_ref().or(r.payload.as_ref());
         let new_id: Option<Uuid> = sqlx::query_scalar(
             r#"
             INSERT INTO raw_records
                 (id, type, content, event_time, source, source_ref,
-                 user_id, project_id, container_id, mode, importance, payload)
+                 user_id, topic_id, thread_id, payload, content_raw, prev_source_ref)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
             ON CONFLICT (user_id, source, source_ref) WHERE source_ref IS NOT NULL
             DO NOTHING
@@ -420,20 +603,39 @@ pub(crate) async fn import_records_inner(
         )
         .bind(id)
         .bind(&r.r#type)
-        .bind(&r.content)
+        .bind(&import_content)
         .bind(event_time)
         .bind(&r.source)
         .bind(&r.source_ref)
         .bind(user_id)
-        .bind(&r.project_id)
-        .bind(&r.container_id)
-        .bind(mode.as_ref().map(|m| m.name.as_str()))
-        .bind(importance)
-        .bind(&r.payload)
+        .bind(&r.topic_id)
+        .bind(&r.thread_id)
+        .bind(import_payload)
+        .bind(content_raw)
+        .bind(&r.prev_source_ref)
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(nid) = new_id {
-            inserted.push((nid, r.content, embedder_key));
+            if let Some(m) = mode.as_ref() {
+                sqlx::query(
+                    "INSERT INTO derived_record_mode
+                        (record_id, user_id, mode, embedder, event_time, origin, decided_by)
+                     VALUES ($1,$2,$3,$4,$5,$6,'import-v1')",
+                )
+                .bind(nid)
+                .bind(user_id)
+                .bind(&m.name)
+                .bind(&m.embedder)
+                .bind(event_time)
+                .bind(if r.mode.is_some() {
+                    "writer"
+                } else {
+                    "default"
+                })
+                .execute(&mut *tx)
+                .await?;
+            }
+            inserted.push((nid, import_content, embedder_key));
         }
     }
     tx.commit().await?;
@@ -478,9 +680,9 @@ pub(crate) async fn import_records_inner(
 #[derive(Debug, Deserialize)]
 pub struct QueryRecordsRequest {
     #[serde(default)]
-    pub project_id: Option<String>,
+    pub topic_id: Option<String>,
     #[serde(default)]
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -514,13 +716,13 @@ pub(crate) async fn query_records_inner(
         r#"
         SELECT {COLS} FROM raw_records
         WHERE user_id = $1
-          AND ($2::text IS NULL OR project_id = $2)
-          AND ($3::text IS NULL OR container_id = $3)
-          AND ($4::text IS NULL OR mode = $4)
+          AND ($2::text IS NULL OR topic_id = $2)
+          AND ($3::text IS NULL OR thread_id = $3)
+          AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM derived_record_mode dm WHERE dm.record_id = raw_records.id AND dm.mode = $4))
           AND ($5::text IS NULL OR type = $5)
           AND ($6::timestamptz IS NULL OR event_time >= $6)
           AND ($7::timestamptz IS NULL OR event_time <= $7)
-          AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = raw_records.id)
         ORDER BY event_time DESC
         LIMIT $8
         "#
@@ -528,8 +730,8 @@ pub(crate) async fn query_records_inner(
     // sql is built only from trusted column constants (COLS) + $-params.
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(user_id)
-        .bind(&req.project_id)
-        .bind(&req.container_id)
+        .bind(&req.topic_id)
+        .bind(&req.thread_id)
         .bind(&req.mode)
         .bind(&req.r#type)
         .bind(req.since)
@@ -568,15 +770,9 @@ const REC_S_HOURS: f64 = 30.0 * 24.0;
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssembleRequest {
     #[serde(default)]
-    pub project_id: Option<String>,
-    /// Include the playground sandbox scope in an UNSCOPED request. Off by
-    /// default so hosts never retrieve sandbox chatter as memory; the
-    /// playground sets it so its own prior test conversations stay
-    /// recallable beside the real store. An explicit `project_id` ignores it.
+    pub topic_id: Option<String>,
     #[serde(default)]
-    pub include_sandbox: bool,
-    #[serde(default)]
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
     /// The cognitive register to search. A single mode name uses that mode's
     /// vector geometry. `"all"` (or `modes` = `["all"]`) is a cross-mode
     /// request that can't compare cosine across mismatched dims, so it degrades
@@ -596,7 +792,7 @@ pub struct AssembleRequest {
     /// — it crowds out the cross-conversation memory this endpoint exists for,
     /// and a query's nearest neighbour is otherwise its own previous turn.
     #[serde(default)]
-    pub exclude_container_id: Option<String>,
+    pub exclude_thread_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -634,12 +830,6 @@ pub struct SynthesisItem {
 /// Synthesis items served per assembly, and drill ids carried per item.
 const SYNTHESIS_MAX: usize = 5;
 const SYNTHESIS_DRILL_IDS: i64 = 5;
-
-/// The project scope every playground write lands in. Same pipeline, separate
-/// data space: sandbox records promote, cluster and distill inside their own
-/// per-project curation bucket, and an unscoped context assembly excludes them
-/// unless the caller opts in via `include_sandbox`.
-pub(crate) const SANDBOX_PROJECT: &str = "playground";
 
 async fn assemble(
     State(state): State<AppState>,
@@ -706,8 +896,6 @@ pub(crate) async fn assemble_inner(
 ) -> AppResult<AssembleResponse> {
     let limit = req.limit.unwrap_or(50).clamp(1, 200);
     let query = req.query.clone().unwrap_or_default();
-    // SQL literal for the sandbox opt-in — a compile-time-safe constant, not user input.
-    let sandbox_gate = if req.include_sandbox { "TRUE" } else { "FALSE" };
 
     // A cross-mode request can't compare cosine across mismatched dims. When the
     // caller asks for `all` (or names more than one distinct mode) we degrade to
@@ -744,23 +932,22 @@ pub(crate) async fn assemble_inner(
             r#"
             SELECT {COLS} FROM raw_records
             WHERE user_id = $1
-              AND ($2::text IS NULL OR project_id = $2)
-              AND ($2::text IS NOT NULL OR {sandbox_gate} OR project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
-              AND ($3::text IS NULL OR container_id = $3)
-              AND ($4::text IS NULL OR mode = $4)
-              AND ($6::text IS NULL OR container_id IS DISTINCT FROM $6)
-              AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
+              AND ($2::text IS NULL OR topic_id = $2)
+              AND ($3::text IS NULL OR thread_id = $3)
+              AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM derived_record_mode dm WHERE dm.record_id = raw_records.id AND dm.mode = $4))
+              AND ($6::text IS NULL OR thread_id IS DISTINCT FROM $6)
+              AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = raw_records.id)
             ORDER BY event_time DESC
             LIMIT $5
             "#
         );
         let mut records = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
             .bind(user_id)
-            .bind(&req.project_id)
-            .bind(&req.container_id)
+            .bind(&req.topic_id)
+            .bind(&req.thread_id)
             .bind(&scope_mode)
             .bind(limit)
-            .bind(&req.exclude_container_id)
+            .bind(&req.exclude_thread_id)
             .fetch_all(pool)
             .await?;
         let clip = clamp_assembled(&mut records, limit, 0);
@@ -814,13 +1001,17 @@ pub(crate) async fn assemble_inner(
             LEFT JOIN curated_embeddings ce ON ce.node_id = n.id AND ce.model = $1
             LEFT JOIN ref_weights rw ON rw.ref_id = n.id
             WHERE n.user_id = $2
-              AND ($3::text IS NULL OR n.project_id = $3)
-              AND ($3::text IS NOT NULL OR {sandbox_gate} OR n.project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
+              AND ($3::text IS NULL OR EXISTS (
+                  SELECT 1 FROM curated_edges de
+                  JOIN raw_records dr ON dr.id = de.to_id
+                  WHERE de.from_id = n.id AND de.kind = 'derived_from'
+                    AND dr.topic_id = $3
+              ))
               AND n.mode IS NOT DISTINCT FROM $4
               AND NOT EXISTS (
                   SELECT 1 FROM curated_edges s WHERE s.to_id = n.id AND s.kind = 'supersedes'
               )
-              AND ($14::text IS NULL OR n.meta->>'container_id' IS DISTINCT FROM $14)
+              AND ($14::text IS NULL OR n.meta->>'thread_id' IS DISTINCT FROM $14)
             ORDER BY (
                   $5 * COALESCE(NULLIF(1 - (ce.{emb_col} <=> $6), 'NaN'::float8), 0)
                 + $7 * ts_rank(to_tsvector('english', n.content), plainto_tsquery('english', $8))
@@ -844,7 +1035,7 @@ pub(crate) async fn assemble_inner(
         sqlx::query_as::<_, (Uuid, i32, String, String, Option<DateTime<Utc>>)>(AssertSqlSafe(sql))
             .bind(&model)
             .bind(user_id)
-            .bind(&req.project_id)
+            .bind(&req.topic_id)
             .bind(&scope_mode)
             .bind(W_SEM)
             .bind(Vector::from(qvec.clone()))
@@ -855,7 +1046,7 @@ pub(crate) async fn assemble_inner(
             .bind(W_IMP)
             .bind(W_DECAY)
             .bind(limit)
-            .bind(&req.exclude_container_id)
+            .bind(&req.exclude_thread_id)
             .fetch_all(pool)
             .await?
     };
@@ -876,12 +1067,12 @@ pub(crate) async fn assemble_inner(
         if synthesis.len() >= SYNTHESIS_MAX {
             break;
         }
-        // The container exclusion must hold HERE too: facts and summaries
-        // carry no container of their own, but their lineage can reach the
+        // The thread exclusion must hold HERE too: facts and summaries
+        // carry no thread of their own, but their lineage can reach the
         // live conversation — serving that distillate back into the same
         // conversation is the echo the exclusion exists to prevent.
-        if let Some(excl) = req.exclude_container_id.as_deref() {
-            if node_touches_container(pool, *node_id, excl).await? {
+        if let Some(excl) = req.exclude_thread_id.as_deref() {
+            if node_touches_thread(pool, *node_id, excl).await? {
                 continue;
             }
         }
@@ -919,7 +1110,7 @@ pub(crate) async fn assemble_inner(
         pool,
         user_id,
         &ordered_raw_ids,
-        req.exclude_container_id.as_deref(),
+        req.exclude_thread_id.as_deref(),
     )
     .await?;
 
@@ -1017,8 +1208,6 @@ async fn cross_mode_degraded(
     limit: i64,
 ) -> AppResult<Vec<RawRecordRow>> {
     let entities = nlp.extract_entities(query);
-    // SQL literal for the sandbox opt-in — a compile-time-safe constant, not user input.
-    let sandbox_gate = if req.include_sandbox { "TRUE" } else { "FALSE" };
     let sql = format!(
         r#"
         SELECT {COLS_R} FROM raw_records r
@@ -1029,11 +1218,10 @@ async fn cross_mode_degraded(
             GROUP BY record_id
         ) ent ON ent.record_id = r.id
         WHERE r.user_id = $2
-          AND ($3::text IS NULL OR r.project_id = $3)
-          AND ($3::text IS NOT NULL OR {sandbox_gate} OR r.project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
-          AND ($4::text IS NULL OR r.container_id = $4)
-          AND ($7::text IS NULL OR r.container_id IS DISTINCT FROM $7)
-          AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
+          AND ($3::text IS NULL OR r.topic_id = $3)
+          AND ($4::text IS NULL OR r.thread_id = $4)
+          AND ($7::text IS NULL OR r.thread_id IS DISTINCT FROM $7)
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
         ORDER BY (
             0.5 * ts_rank(r.content_tsv, plainto_tsquery('english', $1))
           + 0.3 * LEAST(COALESCE(ent.hits, 0) / 3.0, 1.0)
@@ -1045,11 +1233,11 @@ async fn cross_mode_degraded(
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(query)
         .bind(user_id)
-        .bind(&req.project_id)
-        .bind(&req.container_id)
+        .bind(&req.topic_id)
+        .bind(&req.thread_id)
         .bind(&entities)
         .bind(limit)
-        .bind(&req.exclude_container_id)
+        .bind(&req.exclude_thread_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -1105,20 +1293,17 @@ async fn reference_hits(
     limit: i64,
 ) -> AppResult<Vec<RawRecordRow>> {
     // emb_col is a trusted constant from embedding_col_for_dim; all values bound.
-    // SQL literal for the sandbox opt-in — a compile-time-safe constant, not user input.
-    let sandbox_gate = if req.include_sandbox { "TRUE" } else { "FALSE" };
     let sql = format!(
         r#"
         SELECT {COLS_R} FROM raw_records r
         LEFT JOIN raw_embeddings e ON e.record_id = r.id AND e.model = $1
         WHERE r.user_id = $2
           AND r.type = 'state_object'
-          AND ($3::text IS NULL OR r.project_id = $3)
-          AND ($3::text IS NOT NULL OR {sandbox_gate} OR r.project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
-          AND ($4::text IS NULL OR r.container_id = $4)
-          AND ($10::text IS NULL OR r.container_id IS DISTINCT FROM $10)
-          AND r.mode IS NOT DISTINCT FROM $5
-          AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
+          AND ($3::text IS NULL OR r.topic_id = $3)
+          AND ($4::text IS NULL OR r.thread_id = $4)
+          AND ($10::text IS NULL OR r.thread_id IS DISTINCT FROM $10)
+          AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $5
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
         ORDER BY (
             $9
             + 0.7 * COALESCE(NULLIF(1 - (e.{emb_col} <=> $6), 'NaN'::float8), 0)
@@ -1130,23 +1315,23 @@ async fn reference_hits(
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(model)
         .bind(user_id)
-        .bind(&req.project_id)
-        .bind(&req.container_id)
+        .bind(&req.topic_id)
+        .bind(&req.thread_id)
         .bind(scope_mode)
         .bind(Vector::from(qvec.to_vec()))
         .bind(query)
         .bind(limit)
         .bind(W_REF_BIAS)
-        .bind(&req.exclude_container_id)
+        .bind(&req.exclude_thread_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
 }
 
 /// True when any raw record in this curated node's evidence lineage lives in
-/// `container`. Summaries span containers and carry none of their own, so
+/// `thread`. Summaries span threads and carry none of their own, so
 /// the check walks the summary tree down to raw.
-async fn node_touches_container(pool: &PgPool, node_id: Uuid, container: &str) -> AppResult<bool> {
+async fn node_touches_thread(pool: &PgPool, node_id: Uuid, thread: &str) -> AppResult<bool> {
     let hit: bool = sqlx::query_scalar(
         r#"
         SELECT EXISTS (
@@ -1160,12 +1345,12 @@ async fn node_touches_container(pool: &PgPool, node_id: Uuid, container: &str) -
             FROM tree t
             JOIN curated_edges df ON df.from_id = t.id AND df.kind = 'derived_from'
             JOIN raw_records r ON r.id = df.to_id
-            WHERE r.container_id = $2
+            WHERE r.thread_id = $2
         )
         "#,
     )
     .bind(node_id)
-    .bind(container)
+    .bind(thread)
     .fetch_one(pool)
     .await?;
     Ok(hit)
@@ -1217,27 +1402,27 @@ async fn fetch_raw_in_order(
     pool: &PgPool,
     user_id: &str,
     ids: &[Uuid],
-    exclude_container: Option<&str>,
+    exclude_thread: Option<&str>,
 ) -> AppResult<Vec<RawRecordRow>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    // The container exclusion is enforced HERE, at the last fetch, not only at
-    // node selection — a summary node spans containers and carries no container
+    // The thread exclusion is enforced HERE, at the last fetch, not only at
+    // node selection — a summary node spans threads and carries no thread
     // of its own, so its raw ids can smuggle the live conversation back in.
     let sql = format!(
         r#"
         SELECT {COLS} FROM raw_records
         WHERE user_id = $1
           AND id = ANY($2)
-          AND ($3::text IS NULL OR container_id IS DISTINCT FROM $3)
-          AND id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $1)
+          AND ($3::text IS NULL OR thread_id IS DISTINCT FROM $3)
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = raw_records.id)
         "#
     );
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(user_id)
         .bind(ids)
-        .bind(exclude_container)
+        .bind(exclude_thread)
         .fetch_all(pool)
         .await?;
     // Re-order to the curated rank (SQL doesn't preserve ANY() order).
@@ -1263,20 +1448,17 @@ async fn raw_hybrid(
     limit: i64,
     exclude: &[Uuid],
 ) -> AppResult<Vec<RawRecordRow>> {
-    // SQL literal for the sandbox opt-in — a compile-time-safe constant, not user input.
-    let sandbox_gate = if req.include_sandbox { "TRUE" } else { "FALSE" };
     // emb_col is a trusted constant from embedding_col_for_dim; all values bound.
     let sql = format!(
         r#"
         SELECT {COLS_R} FROM raw_records r
         LEFT JOIN raw_embeddings e ON e.record_id = r.id AND e.model = $1
         WHERE r.user_id = $2
-          AND ($3::text IS NULL OR r.project_id = $3)
-          AND ($3::text IS NOT NULL OR {sandbox_gate} OR r.project_id IS DISTINCT FROM '{SANDBOX_PROJECT}')
-          AND ($4::text IS NULL OR r.container_id = $4)
-          AND ($10::text IS NULL OR r.container_id IS DISTINCT FROM $10)
-          AND r.mode IS NOT DISTINCT FROM $5
-          AND r.id NOT IN (SELECT supersedes FROM raw_records WHERE supersedes IS NOT NULL AND user_id = $2)
+          AND ($3::text IS NULL OR r.topic_id = $3)
+          AND ($4::text IS NULL OR r.thread_id = $4)
+          AND ($10::text IS NULL OR r.thread_id IS DISTINCT FROM $10)
+          AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $5
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
           AND NOT (r.id = ANY($9))
         ORDER BY (
             0.7 * COALESCE(NULLIF(1 - (e.{emb_col} <=> $6), 'NaN'::float8), 0)
@@ -1288,14 +1470,14 @@ async fn raw_hybrid(
     let rows = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
         .bind(model)
         .bind(user_id)
-        .bind(&req.project_id)
-        .bind(&req.container_id)
+        .bind(&req.topic_id)
+        .bind(&req.thread_id)
         .bind(scope_mode)
         .bind(Vector::from(qvec.to_vec()))
         .bind(query)
         .bind(limit)
         .bind(exclude)
-        .bind(&req.exclude_container_id)
+        .bind(&req.exclude_thread_id)
         .fetch_all(pool)
         .await?;
     Ok(rows)
@@ -1311,8 +1493,8 @@ async fn raw_hybrid(
 pub struct SummariesQuery {
     #[serde(default)]
     pub level: Option<i32>,
-    #[serde(default)]
-    pub project: Option<String>,
+    #[serde(default, alias = "project")]
+    pub topic_id: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
 }
@@ -1324,7 +1506,6 @@ pub struct SummaryNodeRow {
     pub content: String,
     pub level: i32,
     pub user_id: String,
-    pub project_id: Option<String>,
     pub mode: Option<String>,
     pub importance: Option<f32>,
     pub event_time: Option<DateTime<Utc>>,
@@ -1352,7 +1533,7 @@ pub(crate) async fn summaries_inner(
     // each with its `summarizes` children folded into an array. `level=0`
     // returns none (level 0 is episodic/semantic, not summaries).
     let sql = r#"
-        SELECT n.id, n.kind, n.content, n.level, n.user_id, n.project_id, n.mode,
+        SELECT n.id, n.kind, n.content, n.level, n.user_id, n.mode,
                n.importance, n.event_time, n.created_at,
                COALESCE(
                    (SELECT array_agg(e.to_id)
@@ -1364,14 +1545,19 @@ pub(crate) async fn summaries_inner(
         WHERE n.kind = 'summary'
           AND n.user_id = $1
           AND ($2::int  IS NULL OR n.level = $2)
-          AND ($3::text IS NULL OR n.project_id = $3)
+          AND ($3::text IS NULL OR EXISTS (
+              SELECT 1 FROM curated_edges de
+              JOIN raw_records dr ON dr.id = de.to_id
+              WHERE de.from_id = n.id AND de.kind = 'derived_from'
+                AND dr.topic_id = $3
+          ))
           AND ($4::text IS NULL OR n.mode = $4)
         ORDER BY n.level DESC, n.created_at ASC
     "#;
     let rows = sqlx::query_as::<_, SummaryNodeRow>(sql)
         .bind(user_id)
         .bind(q.level)
-        .bind(&q.project)
+        .bind(&q.topic_id)
         .bind(&q.mode)
         .fetch_all(pool)
         .await?;
@@ -1444,8 +1630,8 @@ pub(crate) async fn lineage_inner(
             UNION ALL
             SELECT {COLS_R} FROM raw_records r JOIN fwd f ON r.supersedes = f.id AND r.user_id = $2
         )
-        SELECT {COLS} FROM (
-            SELECT {COLS} FROM back UNION SELECT {COLS} FROM fwd
+        SELECT {COLS_OUT} FROM (
+            SELECT {COLS_OUT} FROM back UNION SELECT {COLS_OUT} FROM fwd
         ) u
         ORDER BY ingest_time ASC
         "#
@@ -1503,6 +1689,42 @@ async fn rebuild_curation(
         distill_skipped: stats.skipped_distill,
         summarized: stats.summarized,
         max_level: stats.max_level,
+    }))
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct ChainCheckRow {
+    pub record_id: Uuid,
+    pub stored_hash: Option<String>,
+    pub computed_hash: Option<String>,
+    pub ok: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyResponse {
+    pub checked: usize,
+    pub broken: usize,
+    /// Only the failures — a clean chain returns an empty list, not every row.
+    pub failures: Vec<ChainCheckRow>,
+}
+
+/// Recompute every chain from its root and report records whose stored hash no
+/// longer matches. A record edited behind the append-only trigger shows up here
+/// along with everything derived after it.
+async fn verify_chain(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> AppResult<Json<VerifyResponse>> {
+    let rows: Vec<ChainCheckRow> = sqlx::query_as("SELECT * FROM raw_records_verify_chain($1)")
+        .bind(&auth_user.user_id)
+        .fetch_all(&state.pool)
+        .await?;
+    let checked = rows.len();
+    let failures: Vec<ChainCheckRow> = rows.into_iter().filter(|r| r.ok != Some(true)).collect();
+    Ok(Json(VerifyResponse {
+        checked,
+        broken: failures.len(),
+        failures,
     }))
 }
 
@@ -1607,114 +1829,25 @@ mod tests {
             event_time: None,
             source: "test".into(),
             source_ref: None,
-            project_id: Some("health".into()),
-            container_id: None,
+            topic_id: Some("health".into()),
+            thread_id: None,
             mode: None,
-            importance: None,
             supersedes: None,
+            prev_source_ref: None,
             payload: None,
         }
     }
 
     fn q() -> QueryRecordsRequest {
         QueryRecordsRequest {
-            project_id: None,
-            container_id: None,
+            topic_id: None,
+            thread_id: None,
             mode: None,
             r#type: None,
             since: None,
             until: None,
             limit: None,
         }
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn sandbox_scope_never_reaches_an_unscoped_assembly(pool: PgPool) {
-        // One real record, one sandbox record, same topic; curate so the
-        // exclusion is exercised through the curated layer too, not just raw.
-        ingest_record(
-            &pool,
-            &ModeAwareStub,
-            "leslie",
-            IngestRecordRequest {
-                project_id: None,
-                ..req("the deploy target for the pgvector service is staging")
-            },
-        )
-        .await
-        .unwrap();
-        ingest_record(
-            &pool,
-            &ModeAwareStub,
-            "leslie",
-            IngestRecordRequest {
-                project_id: Some(SANDBOX_PROJECT.into()),
-                ..req("sandbox chatter: the deploy target for the pgvector service is bananas")
-            },
-        )
-        .await
-        .unwrap();
-        crate::curation::rebuild(&pool, &ModeAwareStub, "leslie")
-            .await
-            .unwrap();
-
-        let base = AssembleRequest {
-            include_sandbox: false,
-            project_id: None,
-            container_id: None,
-            mode: None,
-            modes: None,
-            exclude_container_id: None,
-            query: Some("deploy target".into()),
-            limit: Some(10),
-        };
-
-        // Unscoped: the sandbox is invisible — a host never retrieves it.
-        let out = assemble_inner(&pool, &ModeAwareStub, "leslie", base.clone())
-            .await
-            .unwrap();
-        assert!(!out.records.is_empty());
-        assert!(
-            out.records
-                .iter()
-                .all(|r| r.project_id.as_deref() != Some(SANDBOX_PROJECT)),
-            "sandbox record leaked into an unscoped assembly"
-        );
-
-        // Opt-in: the playground sees both spaces.
-        let out = assemble_inner(
-            &pool,
-            &ModeAwareStub,
-            "leslie",
-            AssembleRequest {
-                include_sandbox: true,
-                ..base.clone()
-            },
-        )
-        .await
-        .unwrap();
-        assert!(out
-            .records
-            .iter()
-            .any(|r| r.project_id.as_deref() == Some(SANDBOX_PROJECT)));
-
-        // Explicit sandbox scope: only the sandbox.
-        let out = assemble_inner(
-            &pool,
-            &ModeAwareStub,
-            "leslie",
-            AssembleRequest {
-                project_id: Some(SANDBOX_PROJECT.into()),
-                ..base
-            },
-        )
-        .await
-        .unwrap();
-        assert!(!out.records.is_empty());
-        assert!(out
-            .records
-            .iter()
-            .all(|r| r.project_id.as_deref() == Some(SANDBOX_PROJECT)));
     }
 
     #[sqlx::test(migrations = "../../migrations")]
@@ -1767,7 +1900,7 @@ mod tests {
                 &Distilling,
                 "leslie",
                 IngestRecordRequest {
-                    project_id: None,
+                    topic_id: None,
                     ..req(&format!(
                         "note {i}: the deploy target for the pgvector service is staging"
                     ))
@@ -1785,12 +1918,11 @@ mod tests {
             &Distilling,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
                 modes: None,
-                exclude_container_id: None,
+                exclude_thread_id: None,
                 query: Some("deploy target".into()),
                 limit: Some(10),
             },
@@ -1812,7 +1944,7 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn synthesis_honors_the_container_exclusion(pool: PgPool) {
+    async fn synthesis_honors_the_thread_exclusion(pool: PgPool) {
         use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
         struct Distilling;
         #[async_trait]
@@ -1853,15 +1985,15 @@ mod tests {
                 }])
             }
         }
-        // Two same-topic documents, all evidence inside container "live".
+        // Two same-topic documents, all evidence inside thread "live".
         for i in 0..2 {
             ingest_record(
                 &pool,
                 &Distilling,
                 "leslie",
                 IngestRecordRequest {
-                    project_id: None,
-                    container_id: Some("live".into()),
+                    topic_id: None,
+                    thread_id: Some("live".into()),
                     ..req(&format!(
                         "note {i}: the deploy target for the pgvector service is staging"
                     ))
@@ -1875,12 +2007,11 @@ mod tests {
             .unwrap();
 
         let base = AssembleRequest {
-            include_sandbox: false,
-            project_id: None,
-            container_id: None,
+            topic_id: None,
+            thread_id: None,
             mode: None,
             modes: None,
-            exclude_container_id: None,
+            exclude_thread_id: None,
             query: Some("deploy target".into()),
             limit: Some(10),
         };
@@ -1895,7 +2026,7 @@ mod tests {
             &Distilling,
             "leslie",
             AssembleRequest {
-                exclude_container_id: Some("live".into()),
+                exclude_thread_id: Some("live".into()),
                 ..base
             },
         )
@@ -1920,7 +2051,7 @@ mod tests {
                 &ModeAwareStub,
                 "leslie",
                 IngestRecordRequest {
-                    project_id: None,
+                    topic_id: None,
                     ..req(&format!(
                         "note {i}: the deploy target for the pgvector service is staging"
                     ))
@@ -1945,12 +2076,11 @@ mod tests {
             &ModeAwareStub,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
                 modes: None,
-                exclude_container_id: None,
+                exclude_thread_id: None,
                 query: Some("deploy target".into()),
                 limit: Some(3),
             },
@@ -1979,12 +2109,11 @@ mod tests {
             &ModeAwareStub,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: Some("health".into()),
-                container_id: None,
+                topic_id: Some("health".into()),
+                thread_id: None,
                 mode: None,
                 modes: None,
-                exclude_container_id: None,
+                exclude_thread_id: None,
                 query: Some("filler document".into()),
                 limit: Some(10),
             },
@@ -1999,6 +2128,217 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn a_first_turn_is_a_root_not_a_gap(pool: PgPool) {
+        // Three states that must stay distinguishable. Every conversation starts
+        // in the first one, so it has to be the silent, ordinary case.
+        //
+        //   claimed nothing      -> prev_id NULL, prev_source_ref NULL  (root)
+        //   claimed and resolved -> prev_id set                          (link)
+        //   claimed, unresolved  -> prev_id NULL, prev_source_ref kept   (gap)
+
+        let mut first = req("hello, this is a brand new conversation");
+        first.source_ref = Some("chat:1".into());
+        // No prev_source_ref at all — exactly what a first turn looks like.
+        let root = ingest_record(&pool, &StubNlp, "leslie", first)
+            .await
+            .unwrap();
+
+        let (pid, claim): (Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT (SELECT prev_id FROM derived_link l WHERE l.record_id = r.id), r.prev_source_ref FROM raw_records r WHERE r.id = $1")
+                .bind(root.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pid, None, "a first turn has no parent");
+        assert_eq!(claim, None, "and claimed none — this is a root, not a gap");
+
+        let mut second = req("the reply");
+        second.source_ref = Some("chat:2".into());
+        second.prev_source_ref = Some("chat:1".into());
+        let linked = ingest_record(&pool, &StubNlp, "leslie", second)
+            .await
+            .unwrap();
+        let (pid2, claim2): (Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT (SELECT prev_id FROM derived_link l WHERE l.record_id = r.id), r.prev_source_ref FROM raw_records r WHERE r.id = $1")
+                .bind(linked.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pid2, Some(root.id));
+        assert_eq!(claim2.as_deref(), Some("chat:1"));
+
+        let mut orphan = req("a turn whose parent never landed");
+        orphan.source_ref = Some("chat:3".into());
+        orphan.prev_source_ref = Some("chat:missing".into());
+        let gap = ingest_record(&pool, &StubNlp, "leslie", orphan)
+            .await
+            .unwrap();
+        let (pid3, claim3): (Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT (SELECT prev_id FROM derived_link l WHERE l.record_id = r.id), r.prev_source_ref FROM raw_records r WHERE r.id = $1")
+                .bind(gap.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pid3, None);
+        assert_eq!(
+            claim3.as_deref(),
+            Some("chat:missing"),
+            "a gap must be distinguishable from a genuine root"
+        );
+
+        // All three verify: a root is valid, and so is a record after a gap.
+        let all_ok: Vec<bool> = sqlx::query_scalar("SELECT ok FROM raw_records_verify_chain($1)")
+            .bind("leslie")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(all_ok.len(), 3, "every record is reachable from some root");
+        assert!(all_ok.iter().all(|o| *o), "roots and gaps both verify");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_chain_catches_tampering_and_cascades(pool: PgPool) {
+        let mut ids = Vec::new();
+        let mut prev: Option<String> = None;
+        for i in 1..=4 {
+            let mut r = req(&format!("turn {i}"));
+            r.source_ref = Some(format!("t:{i}"));
+            r.prev_source_ref = prev.clone();
+            ids.push(
+                ingest_record(&pool, &StubNlp, "leslie", r)
+                    .await
+                    .unwrap()
+                    .id,
+            );
+            prev = Some(format!("t:{i}"));
+        }
+
+        let clean: Vec<bool> = sqlx::query_scalar("SELECT ok FROM raw_records_verify_chain($1)")
+            .bind("leslie")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(clean.len(), 4);
+        assert!(clean.iter().all(|o| *o), "an untouched chain must verify");
+
+        // Tamper the way someone with database access would: disable the guard.
+        sqlx::query("ALTER TABLE raw_records DISABLE TRIGGER raw_records_no_mutate")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE raw_records SET content = 'I never said this' WHERE id = $1")
+            .bind(ids[1])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE raw_records ENABLE TRIGGER raw_records_no_mutate")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let checked: Vec<(Uuid, bool)> =
+            sqlx::query_as("SELECT record_id, ok FROM raw_records_verify_chain($1)")
+                .bind("leslie")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let broken: Vec<Uuid> = checked
+            .iter()
+            .filter(|(_, ok)| !ok)
+            .map(|(i, _)| *i)
+            .collect();
+        assert!(broken.contains(&ids[1]), "the edited record must fail");
+        assert!(broken.contains(&ids[2]), "and every descendant with it");
+        assert!(broken.contains(&ids[3]));
+        assert!(
+            !broken.contains(&ids[0]),
+            "records before the edit stay valid"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn custody_cannot_be_forged_across_field_boundaries(pool: PgPool) {
+        // Length-prefixing means these two rows cannot collide: without it,
+        // topic_id='ali' + user_id='ce' hashes the same as user_id='alice'.
+        let a: String = sqlx::query_scalar(
+            "SELECT encode(sha256(convert_to(
+                 raw_records_hash_field(NULL) || raw_records_hash_field('alice'), 'UTF8')), 'hex')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let b: String = sqlx::query_scalar(
+            "SELECT encode(sha256(convert_to(
+                 raw_records_hash_field('ali') || raw_records_hash_field('ce'), 'UTF8')), 'hex')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_ne!(a, b, "field boundaries must not be forgeable");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn prev_source_ref_links_the_chain(pool: PgPool) {
+        let mut a = req("first turn");
+        a.source_ref = Some("ritsu:conv1:1".into());
+        let first = ingest_record(&pool, &StubNlp, "leslie", a).await.unwrap();
+
+        let mut b = req("second turn");
+        b.source_ref = Some("ritsu:conv1:2".into());
+        b.prev_source_ref = Some("ritsu:conv1:1".into());
+        let second = ingest_record(&pool, &StubNlp, "leslie", b).await.unwrap();
+
+        let linked: Option<Uuid> =
+            sqlx::query_scalar("SELECT prev_id FROM derived_link WHERE record_id = $1")
+                .bind(second.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, Some(first.id));
+
+        let chained: Option<String> =
+            sqlx::query_scalar("SELECT record_hash FROM raw_records WHERE id = $1")
+                .bind(second.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(chained.is_some_and(|h| h.len() == 64));
+
+        // An unresolvable parent is a gap, not a rejection: the record is kept,
+        // prev_id is null, and the unmet claim is stored so the gap is visible.
+        let mut c = req("orphan");
+        c.source_ref = Some("ritsu:conv1:3".into());
+        c.prev_source_ref = Some("ritsu:conv1:999".into());
+        let orphan = ingest_record(&pool, &StubNlp, "leslie", c).await.unwrap();
+
+        let (linked, claimed): (Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT (SELECT prev_id FROM derived_link l WHERE l.record_id = r.id), r.prev_source_ref FROM raw_records r WHERE r.id = $1")
+                .bind(orphan.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(linked, None, "an unresolved parent must not invent a link");
+        assert_eq!(
+            claimed.as_deref(),
+            Some("ritsu:conv1:999"),
+            "the claim is kept"
+        );
+
+        // A later turn still chains normally — one gap must not poison the rest.
+        let mut d = req("after the gap");
+        d.source_ref = Some("ritsu:conv1:4".into());
+        d.prev_source_ref = Some("ritsu:conv1:3".into());
+        let after = ingest_record(&pool, &StubNlp, "leslie", d).await.unwrap();
+        let relinked: Option<Uuid> =
+            sqlx::query_scalar("SELECT prev_id FROM derived_link WHERE record_id = $1")
+                .bind(after.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(relinked, Some(orphan.id), "the chain resumes after a gap");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn ingest_and_query_roundtrip(pool: PgPool) {
         let out = ingest_record(&pool, &StubNlp, "leslie", req("took 5mg lisinopril"))
             .await
@@ -2007,7 +2347,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, out.id);
         assert_eq!(rows[0].content, "took 5mg lisinopril");
-        assert_eq!(rows[0].content_hash.len(), 32); // md5 hex
+        assert_eq!(rows[0].content_hash.len(), 64);
 
         // The derived embedding landed in the separate table.
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_embeddings WHERE record_id = $1")
@@ -2115,14 +2455,13 @@ mod tests {
             &StubNlp,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
                 modes: None,
                 query: Some("lisinopril".into()),
                 limit: None,
-                exclude_container_id: None,
+                exclude_thread_id: None,
             },
         )
         .await
@@ -2143,14 +2482,13 @@ mod tests {
             &StubNlp,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
                 modes: None,
                 query: None,
                 limit: None,
-                exclude_container_id: None,
+                exclude_thread_id: None,
             },
         )
         .await
@@ -2183,15 +2521,15 @@ mod tests {
 
     fn imp(content: &str, source_ref: Option<&str>) -> ImportRecord {
         ImportRecord {
+            prev_source_ref: None,
             r#type: "conversation".into(),
             content: content.into(),
             event_time: None,
             source: "chatgpt".into(),
             source_ref: source_ref.map(|s| s.into()),
-            project_id: None,
-            container_id: None,
+            topic_id: None,
+            thread_id: None,
             mode: None,
-            importance: None,
             payload: None,
         }
     }
@@ -2279,14 +2617,13 @@ mod tests {
             &StubNlp,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
                 modes: None,
                 query: Some("lisinopril".into()),
                 limit: None,
-                exclude_container_id: None,
+                exclude_thread_id: None,
             },
         )
         .await
@@ -2342,9 +2679,9 @@ mod tests {
     /// "memory" — the host already has the live thread in its window, and a
     /// query's nearest neighbour is otherwise its own previous turn.
     #[sqlx::test(migrations = "../../migrations")]
-    async fn assemble_excludes_the_callers_own_container(pool: PgPool) {
+    async fn assemble_excludes_the_callers_own_thread(pool: PgPool) {
         let nlp = StubNlp;
-        for (container, text) in [
+        for (thread, text) in [
             ("conv-live", "what is on the release checklist right now"),
             ("conv-old", "the release needs the changelog written first"),
         ] {
@@ -2353,15 +2690,15 @@ mod tests {
                 &nlp,
                 "alice",
                 IngestRecordRequest {
+                    prev_source_ref: None,
                     r#type: "conversation".into(),
                     content: text.into(),
                     event_time: None,
                     source: "test".into(),
                     source_ref: None,
-                    project_id: None,
-                    container_id: Some(container.into()),
+                    topic_id: None,
+                    thread_id: Some(thread.into()),
                     mode: None,
-                    importance: None,
                     supersedes: None,
                     payload: None,
                 },
@@ -2371,35 +2708,34 @@ mod tests {
         }
 
         // Once curated, a summary node spans BOTH conversations and carries no
-        // container of its own — the exclusion must hold through that path too,
+        // thread of its own — the exclusion must hold through that path too,
         // not just on direct raw hits.
         crate::curation::rebuild(&pool, &nlp, "alice")
             .await
             .unwrap();
 
         let mut req = ctx_req("release checklist");
-        req.exclude_container_id = Some("conv-live".into());
+        req.exclude_thread_id = Some("conv-live".into());
         let out = assemble_inner(&pool, &nlp, "alice", req).await.unwrap();
 
         assert!(!out.records.is_empty(), "the other conversation should hit");
         assert!(
             out.records
                 .iter()
-                .all(|r| r.container_id.as_deref() != Some("conv-live")),
-            "own-container rows must never come back as memory"
+                .all(|r| r.thread_id.as_deref() != Some("conv-live")),
+            "own-thread rows must never come back as memory"
         );
     }
 
     fn ctx_req(query: &str) -> AssembleRequest {
         AssembleRequest {
-            include_sandbox: false,
-            project_id: None,
-            container_id: None,
+            topic_id: None,
+            thread_id: None,
             mode: None,
             modes: None,
             query: Some(query.into()),
             limit: None,
-            exclude_container_id: None,
+            exclude_thread_id: None,
         }
     }
 
@@ -2602,7 +2938,7 @@ mod tests {
             "leslie",
             SummariesQuery {
                 level: None,
-                project: None,
+                topic_id: None,
                 mode: None,
             },
         )
@@ -2619,7 +2955,7 @@ mod tests {
             "leslie",
             SummariesQuery {
                 level: Some(0),
-                project: None,
+                topic_id: None,
                 mode: None,
             },
         )
@@ -2633,7 +2969,7 @@ mod tests {
             "bob",
             SummariesQuery {
                 level: None,
-                project: None,
+                topic_id: None,
                 mode: None,
             },
         )
@@ -2675,9 +3011,8 @@ mod tests {
             "deploy_pipeline",
             crate::references::PutValueRequest {
                 data: serde_json::json!({ "items": [{ "text": "finish the deploy pipeline" }] }),
-                project_id: Some("health".into()),
-                container_id: None,
-                importance: None,
+                topic_id: Some("health".into()),
+                thread_id: None,
             },
         )
         .await
@@ -2710,9 +3045,8 @@ mod tests {
             "deploy_pipeline",
             crate::references::PutValueRequest {
                 data: serde_json::json!({ "items": [] }),
-                project_id: Some("health".into()),
-                container_id: None,
-                importance: None,
+                topic_id: Some("health".into()),
+                thread_id: None,
             },
         )
         .await
@@ -2758,15 +3092,15 @@ mod tests {
     /// the only scoping axis under test).
     fn req_in_mode(content: &str, mode: &str) -> IngestRecordRequest {
         IngestRecordRequest {
+            prev_source_ref: None,
             r#type: "document".into(),
             content: content.into(),
             event_time: None,
             source: "test".into(),
             source_ref: None,
-            project_id: None,
-            container_id: None,
+            topic_id: None,
+            thread_id: None,
             mode: Some(mode.into()),
-            importance: None,
             supersedes: None,
             payload: None,
         }
@@ -2774,14 +3108,13 @@ mod tests {
 
     fn ctx_mode(query: &str, mode: &str) -> AssembleRequest {
         AssembleRequest {
-            include_sandbox: false,
-            project_id: None,
-            container_id: None,
+            topic_id: None,
+            thread_id: None,
             mode: Some(mode.into()),
             modes: None,
             query: Some(query.into()),
             limit: None,
-            exclude_container_id: None,
+            exclude_thread_id: None,
         }
     }
 
@@ -2814,11 +3147,12 @@ mod tests {
             (Some(0), Some(1), Some(0)),
             "code record uses embedding_768"
         );
-        let mode: Option<String> = sqlx::query_scalar("SELECT mode FROM raw_records WHERE id = $1")
-            .bind(coded.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let mode: Option<String> =
+            sqlx::query_scalar("SELECT mode FROM derived_record_mode WHERE record_id = $1")
+                .bind(coded.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(mode.as_deref(), Some("code"));
 
         // A code-scoped query finds it (same 768 geometry, same mode scope).
@@ -2879,14 +3213,13 @@ mod tests {
             &ModeAwareStub,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: Some("all".into()),
                 modes: None,
                 query: Some("deploy".into()),
                 limit: None,
-                exclude_container_id: None,
+                exclude_thread_id: None,
             },
         )
         .await
@@ -2917,14 +3250,13 @@ mod tests {
             &ModeAwareStub,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
                 modes: Some(vec!["code".into(), "journal".into()]),
                 query: Some("x".into()),
                 limit: None,
-                exclude_container_id: None,
+                exclude_thread_id: None,
             },
         )
         .await
@@ -3012,14 +3344,13 @@ mod tests {
             &StubNlp,
             "leslie",
             AssembleRequest {
-                include_sandbox: false,
-                project_id: None,
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
                 modes: None,
                 query: Some("deploy".into()),
                 limit: Some(10_000_000),
-                exclude_container_id: None,
+                exclude_thread_id: None,
             },
         )
         .await

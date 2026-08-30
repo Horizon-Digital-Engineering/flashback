@@ -240,8 +240,8 @@ pub fn dashboard(user_id: &str, stats: DashboardStats, recent: &[RawAdminRow]) -
 #[derive(Default)]
 pub struct RecordsFilter {
     pub r#type: Option<String>,
-    pub project_id: Option<String>,
-    pub container_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub thread_id: Option<String>,
     /// Cognitive register (mode) filter — a NATIVE `raw_records.mode` predicate.
     pub mode: Option<String>,
     pub include_superseded: bool,
@@ -276,14 +276,14 @@ pub fn records_list(
             .join("\n"),
     ));
     filter_form.push_str(&format!(
-        r#"<div><label class="muted">Project</label><br />
-            <input type="text" name="project_id" value="{}" placeholder="any" style="min-width:160px" /></div>"#,
-        esc(filter.project_id.as_deref().unwrap_or(""))
+        r#"<div><label class="muted">Topic</label><br />
+            <input type="text" name="topic_id" value="{}" placeholder="any" style="min-width:160px" /></div>"#,
+        esc(filter.topic_id.as_deref().unwrap_or(""))
     ));
     filter_form.push_str(&format!(
-        r#"<div><label class="muted">Session</label><br />
-            <input type="text" name="container_id" value="{}" placeholder="any" style="min-width:160px" /></div>"#,
-        esc(filter.container_id.as_deref().unwrap_or(""))
+        r#"<div><label class="muted">Thread</label><br />
+            <input type="text" name="thread_id" value="{}" placeholder="any" style="min-width:160px" /></div>"#,
+        esc(filter.thread_id.as_deref().unwrap_or(""))
     ));
     filter_form.push_str(&format!(
         r#"<div><label class="muted">Mode</label><br />
@@ -409,11 +409,11 @@ fn build_query_string(f: &RecordsFilter) -> String {
     if let Some(t) = &f.r#type {
         parts.push(format!("type={}", t));
     }
-    if let Some(p) = &f.project_id {
-        parts.push(format!("project_id={}", p));
+    if let Some(p) = &f.topic_id {
+        parts.push(format!("topic_id={}", p));
     }
-    if let Some(s) = &f.container_id {
-        parts.push(format!("container_id={}", s));
+    if let Some(s) = &f.thread_id {
+        parts.push(format!("thread_id={}", s));
     }
     if let Some(m) = &f.mode {
         parts.push(format!("mode={}", m));
@@ -466,12 +466,12 @@ pub fn record_detail(user_id: &str, r: &RawAdminRow, chain: &[RawAdminRow]) -> S
     <h2 style="margin-top:0">Content</h2>
     <pre class="json">{content}</pre>
     <p class="muted" style="margin-top:12px;font-size:12px">
-      event {when} · source <code>{source}</code>{imp}{mode}{sup}
+      event {when} · source <code>{source}</code>{mode}{sup}
     </p>
     <div style="margin-top:16px">
       <span class="muted">entities:</span> {ents}
     </div>
-    {project}
+    {topic}
     {session}
   </div>
   <div class="card">
@@ -489,10 +489,6 @@ pub fn record_detail(user_id: &str, r: &RawAdminRow, chain: &[RawAdminRow]) -> S
         content = esc(&r.content),
         when = format_when(r.event_time),
         source = esc(&r.source),
-        imp = r
-            .importance
-            .map(|i| format!(" · importance {i:.2}"))
-            .unwrap_or_default(),
         mode = r
             .mode
             .as_deref()
@@ -504,16 +500,16 @@ pub fn record_detail(user_id: &str, r: &RawAdminRow, chain: &[RawAdminRow]) -> S
             String::new()
         },
         ents = entities_html,
-        project = r
-            .project_id
+        topic = r
+            .topic_id
             .as_deref()
             .map(|p| format!(
-                r#"<p class="muted" style="margin-top:6px">project: <code>{}</code></p>"#,
+                r#"<p class="muted" style="margin-top:6px">topic: <code>{}</code></p>"#,
                 esc(p)
             ))
             .unwrap_or_default(),
         session = r
-            .container_id
+            .thread_id
             .as_deref()
             .map(|s| format!(r#"<p class="muted">session: <code>{}</code></p>"#, esc(s)))
             .unwrap_or_default(),
@@ -1685,7 +1681,7 @@ pub fn playground_view(
 <p class="muted" style="margin-top:0;font-size:13px">
   Retrieval and the write use the same seams ritsu does — what happens here is what a real host gets.
   Sandboxed by default: reads and writes stay in the <code>playground</code> scope. Tick
-  <em>include real memories</em> to also probe the real store — writes never leave the sandbox either way.
+  <em>include real memories</em> to retrieve from the real store instead of the sandbox — writes never leave the sandbox either way.
 </p>
 {warn_banner}
 
@@ -1725,7 +1721,7 @@ pub fn playground_view(
 <div class="row" style="align-items:stretch;gap:16px;margin-top:16px">
   <div class="card" style="flex:1.15;min-width:340px;display:flex;flex-direction:column">
     <div class="muted" style="font-size:12px;margin-bottom:8px">
-      <code id="pg-container"></code> · <a href="#" id="pg-new">new conversation</a>
+      <code id="pg-thread"></code> · <a href="#" id="pg-new">new conversation</a>
     </div>
     <div id="pg-log" style="flex:1;min-height:46vh;max-height:60vh;overflow:auto;padding-right:4px"></div>
     <div style="margin-top:10px">
@@ -1808,15 +1804,15 @@ $('pg-save').addEventListener('click', async e => {{
   }}
 }});
 
-const newContainer = () => 'playground:' + Math.random().toString(36).slice(2, 10);
-let container = sessionStorage.getItem('fb_pg_container') || newContainer();
-sessionStorage.setItem('fb_pg_container', container);
-$('pg-container').textContent = container;
+const newThread = () => 'playground:' + Math.random().toString(36).slice(2, 10);
+let thread = sessionStorage.getItem('fb_pg_thread') || newThread();
+sessionStorage.setItem('fb_pg_thread', thread);
+$('pg-thread').textContent = thread;
 $('pg-new').addEventListener('click', e => {{
   e.preventDefault();
-  container = newContainer();
-  sessionStorage.setItem('fb_pg_container', container);
-  $('pg-container').textContent = container;
+  thread = newThread();
+  sessionStorage.setItem('fb_pg_thread', thread);
+  $('pg-thread').textContent = thread;
   $('pg-log').innerHTML = '';
   $('pg-trace').innerHTML = '<p class="muted">New conversation. Nothing retrieved yet.</p>';
 }});
@@ -1933,7 +1929,7 @@ $('pg-trace').addEventListener('click', async e => {{
   try {{
     const res = await fetch('/admin/api/playground/distill', {{
       method: 'POST', headers: {{ 'content-type': 'application/json' }},
-      body: JSON.stringify({{ container_id: container }}),
+      body: JSON.stringify({{ thread_id: thread }}),
     }});
     if (!res.ok) throw new Error((await res.text()).slice(0, 300));
     const d = await res.json();
@@ -1994,7 +1990,7 @@ async function send() {{
   try {{
     const res = await fetch('/admin/api/playground/turn', {{
       method: 'POST', headers: {{ 'content-type': 'application/json' }},
-      body: JSON.stringify({{ message: msg, container_id: container, api_key: $('pg-key').value || null, include_real: $('pg-real').checked }}),
+      body: JSON.stringify({{ message: msg, thread_id: thread, api_key: $('pg-key').value || null, include_real: $('pg-real').checked }}),
     }});
     if (!res.ok) throw new Error((await res.text()).slice(0, 300));
 

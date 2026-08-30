@@ -1,6 +1,11 @@
 # Tenancy & multi-user — exploratory design
 
-*Status: **exploratory**. Captures the design conversation about how Flashback should model multiple users, shared/private memories, and what changes between self-hosted and SaaS deployments. Not built. Captured so the architecture has a frame the day we commit.*
+*Status: **schema landed 2026-08-30, deliberately unenforced.** `principals`,
+`grants` and `classifications` exist in `003_access.sql`; nothing reads them yet.
+The split is intentional — the dimensions they record cannot be backfilled, so
+they are captured from the first record onward, while enforcement waits until
+there is a second person to enforce against. This document is the design frame;
+what follows describes the model those tables were shaped for.*
 
 ---
 
@@ -11,8 +16,26 @@ Flashback is already multi-tenant at the **data layer**: every memory, every tok
 What it lacks is:
 
 - **No tenant boundary.** All `user_id`s share one global namespace. No notion of "this group of users belongs together."
-- **No visibility scoping.** A memory belongs to exactly one user. Memories can't be shared without copying.
+- **No enforcement.** `grants` can express "this principal may read this target
+  until this date", and `classifications` can express how sensitive a record is,
+  but no query path consults either yet. Access today is still "one `user_id`
+  owns it".
+- **Ownership and readership are still one field.** `raw_records.user_id` means
+  creator *and* owner *and* the only reader. Splitting it is the next real step,
+  and the honest shape is provenance immutable on raw, readership mutable in
+  `grants` — which is why raw needs no change to get there.
 - **No real auth flow.** Tokens are minted via CLI by the operator. No signup, no password reset, no per-user provisioning.
+
+Two things the schema already decided, worth not re-litigating:
+
+- **Agents are principals.** `principals.kind` is `('person','agent','service')`,
+  so "the finance agent may read the tax agent's memory" is a grant, not a new
+  mechanism. Sharing *files* between agents is a separate axis — filesystem
+  permissions — and conflating the two puts access control in two places.
+- **Grants are pinned or ongoing.** A grant on a single record is a frozen set; a
+  grant on a topic or thread keeps including whatever arrives next. That is
+  usually what you want and occasionally a leak, which is why grants carry a
+  validity window rather than just an on/off.
 
 What it *does* have is a role split, walled in both directions:
 
