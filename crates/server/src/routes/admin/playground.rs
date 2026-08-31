@@ -65,9 +65,9 @@ pub struct LlmSettings {
 #[derive(Debug, Deserialize)]
 pub struct TurnRequest {
     pub message: String,
-    /// The conversation this turn belongs to. Episodes form per container, so
+    /// The conversation this turn belongs to. Episodes form per thread, so
     /// keeping one id across turns is what makes them cohere into an episode.
-    pub container_id: String,
+    pub thread_id: String,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -83,17 +83,15 @@ pub struct TurnRequest {
     pub include_real: bool,
 }
 
-/// The retrieval scope a turn runs with: sandbox-only by default, sandbox plus
-/// the real store when the operator asks. `(project_id, include_sandbox)` in
-/// `AssembleRequest` terms.
-fn turn_scope(include_real: bool) -> (Option<String>, bool) {
+/// Which store this turn READS from. Scratch writes always land in the
+/// playground schema; `include_real` points the read at real memory instead —
+/// it replaces the sandbox rather than adding to it, because the two live in
+/// separate schemas and one assemble cannot span both.
+fn read_pool(state: &AppState, include_real: bool) -> &sqlx::PgPool {
     if include_real {
-        (None, true)
+        &state.pool
     } else {
-        (
-            Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
-            false,
-        )
+        &state.playground
     }
 }
 
@@ -111,22 +109,22 @@ pub struct RetrievedItem {
     pub source: String,
     pub content: String,
     pub event_time: String,
-    pub container_id: Option<String>,
-    /// True when the record lives in the sandbox scope — the diagnostics tag
-    /// each memory so a mixed retrieval says which store it came from.
+    pub thread_id: Option<String>,
+    /// Which store this came from. The two schemas are queried separately, so
+    /// it is a property of the read, not of the row.
     pub sandbox: bool,
 }
 
-impl From<&RawRecordRow> for RetrievedItem {
-    fn from(r: &RawRecordRow) -> Self {
+impl RetrievedItem {
+    fn from_row(r: &RawRecordRow, sandbox: bool) -> Self {
         Self {
             id: r.id,
             r#type: r.r#type.clone(),
             source: r.source.clone(),
             content: r.content.clone(),
             event_time: r.event_time.to_rfc3339(),
-            container_id: r.container_id.clone(),
-            sandbox: r.project_id.as_deref() == Some(crate::routes::records::SANDBOX_PROJECT),
+            thread_id: r.thread_id.clone(),
+            sandbox,
         }
     }
 }
@@ -368,21 +366,18 @@ async fn run_turn(
     let settings = load_settings(&state.pool, &user_id)
         .await
         .unwrap_or_default();
-    let (scope_project, scope_include_sandbox) = turn_scope(req.include_real);
-
     // 1) Retrieval — the same call a host makes.
     let assembled = match assemble_inner(
-        &state.pool,
+        read_pool(&state, req.include_real),
         &*state.nlp,
         &user_id,
         AssembleRequest {
-            project_id: scope_project.clone(),
-            include_sandbox: scope_include_sandbox,
-            container_id: None,
+            topic_id: None,
+            thread_id: None,
             mode: req.mode.clone(),
             modes: None,
             // The live thread is already on screen; memory means OTHER conversations.
-            exclude_container_id: Some(req.container_id.clone()),
+            exclude_thread_id: Some(req.thread_id.clone()),
             query: Some(req.message.clone()),
             limit: Some(
                 req.limit
@@ -399,7 +394,11 @@ async fn run_turn(
             return;
         }
     };
-    let retrieved: Vec<RetrievedItem> = assembled.records.iter().map(RetrievedItem::from).collect();
+    let retrieved: Vec<RetrievedItem> = assembled
+        .records
+        .iter()
+        .map(|r| RetrievedItem::from_row(r, !req.include_real))
+        .collect();
     let synthesis = assembled.synthesis.clone();
 
     // 2) The prompt a host would send.
@@ -442,7 +441,7 @@ async fn run_turn(
     // any of this was worth.
     let mut written = Vec::new();
     match ingest_record(
-        &state.pool,
+        &state.playground,
         &*state.nlp,
         &user_id,
         IngestRecordRequest {
@@ -451,11 +450,11 @@ async fn run_turn(
             event_time: None,
             source: SOURCE_USER.into(),
             source_ref: None,
-            project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
-            container_id: Some(req.container_id.clone()),
+            topic_id: None,
+            thread_id: Some(req.thread_id.clone()),
             mode: req.mode.clone(),
-            importance: None,
             supersedes: None,
+            prev_source_ref: None,
             payload: Some(json!({ "origin": "playground" })),
         },
     )
@@ -525,7 +524,7 @@ async fn run_turn(
 
     if let Some(text) = response.as_deref() {
         ingest_record(
-            &state.pool,
+            &state.playground,
             &*state.nlp,
             &user_id,
             IngestRecordRequest {
@@ -534,11 +533,11 @@ async fn run_turn(
                 event_time: None,
                 source: SOURCE_ASSISTANT.into(),
                 source_ref: None,
-                project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
-                container_id: Some(req.container_id.clone()),
+                topic_id: None,
+                thread_id: Some(req.thread_id.clone()),
                 mode: req.mode.clone(),
-                importance: None,
                 supersedes: None,
+                prev_source_ref: None,
                 payload: Some(json!({
                     "origin": "playground",
                     "model": cfg.model,
@@ -572,7 +571,7 @@ mod tests {
             source: "host:helper:user".into(),
             content: "  the quarterly report is due friday  ".into(),
             event_time: "2026-07-26T12:00:00+00:00".into(),
-            container_id: Some("conv-9".into()),
+            thread_id: Some("conv-9".into()),
             sandbox: false,
         }];
         let block = render_context_block(&items);
@@ -584,16 +583,6 @@ mod tests {
     #[test]
     fn empty_retrieval_still_renders_a_header() {
         assert!(render_context_block(&[]).starts_with("Relevant memories"));
-    }
-
-    #[test]
-    fn turn_scope_is_sandbox_only_unless_real_is_asked_for() {
-        let (project, include_sandbox) = turn_scope(false);
-        assert_eq!(project.as_deref(), Some("playground"));
-        assert!(!include_sandbox);
-        let (project, include_sandbox) = turn_scope(true);
-        assert!(project.is_none());
-        assert!(include_sandbox);
     }
 
     #[test]
@@ -659,7 +648,7 @@ mod tests {
         assert_eq!(n, 2, "blank lines are skipped, not seeded");
 
         let rows: Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-            "SELECT content, project_id, event_time FROM raw_records \
+            "SELECT content, topic_id, event_time FROM raw_records \
              WHERE user_id = 'alice' ORDER BY content",
         )
         .fetch_all(&pool)
@@ -667,8 +656,8 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(
-            rows.iter().all(|r| r.1.as_deref() == Some("playground")),
-            "every seed lands in the sandbox scope"
+            rows.iter().all(|r| r.1.is_none()),
+            "seeds carry no topic — isolation is the schema, not a marker"
         );
         let dated = rows.iter().find(|r| r.0.contains("backup")).unwrap();
         assert_eq!(dated.2.to_rfc3339(), "2025-11-02T12:00:00+00:00");
@@ -718,16 +707,16 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
-    async fn facts_for_container_scopes_to_the_conversation(pool: PgPool) {
+    async fn facts_for_thread_scopes_to_the_conversation(pool: PgPool) {
         let raw_here = Uuid::new_v4();
         let raw_other = Uuid::new_v4();
-        for (id, container) in [(raw_here, "here"), (raw_other, "elsewhere")] {
+        for (id, thread) in [(raw_here, "here"), (raw_other, "elsewhere")] {
             sqlx::query(
-                "INSERT INTO raw_records (id, type, content, event_time, source, user_id, container_id) \
+                "INSERT INTO raw_records (id, type, content, event_time, source, user_id, thread_id) \
                  VALUES ($1, 'conversation', 'x', NOW(), 'test', 'alice', $2)",
             )
             .bind(id)
-            .bind(container)
+            .bind(thread)
             .execute(&pool)
             .await
             .unwrap();
@@ -755,10 +744,10 @@ mod tests {
             .unwrap();
         }
 
-        let facts = facts_for_container(&pool, "alice", "here").await.unwrap();
+        let facts = facts_for_thread(&pool, "alice", "here").await.unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].content, "learned from here");
-        assert!(facts_for_container(&pool, "bob", "here")
+        assert!(facts_for_thread(&pool, "bob", "here")
             .await
             .unwrap()
             .is_empty());
@@ -791,7 +780,7 @@ pub async fn seed(
             "seeding needs a concrete user_id; sign in as a non-wildcard operator",
         ));
     }
-    let seeded = seed_lines(&state.pool, &*state.nlp, &user_id, &req.text).await?;
+    let seeded = seed_lines(&state.playground, &*state.nlp, &user_id, &req.text).await?;
     Ok(Json(json!({ "seeded": seeded })))
 }
 
@@ -830,11 +819,11 @@ pub(crate) async fn seed_lines(
                 event_time,
                 source: "playground:seed".into(),
                 source_ref: None,
-                project_id: Some(crate::routes::records::SANDBOX_PROJECT.to_string()),
-                container_id: None,
+                topic_id: None,
+                thread_id: None,
                 mode: None,
-                importance: None,
                 supersedes: None,
+                prev_source_ref: None,
                 payload: Some(json!({ "origin": "playground-seed" })),
             },
         )
@@ -850,7 +839,7 @@ pub(crate) async fn seed_lines(
 
 #[derive(Debug, Deserialize)]
 pub struct DistillNowRequest {
-    pub container_id: String,
+    pub thread_id: String,
 }
 
 /// Run one REAL incremental curation pass — the same one the scheduler runs,
@@ -867,8 +856,8 @@ pub async fn distill_now(
             "distillation needs a concrete user_id; sign in as a non-wildcard operator",
         ));
     }
-    let stats = crate::curation::curate(&state.pool, &*state.nlp, &user_id).await?;
-    let facts = facts_for_container(&state.pool, &user_id, &req.container_id).await?;
+    let stats = crate::curation::curate(&state.playground, &*state.nlp, &user_id).await?;
+    let facts = facts_for_thread(&state.playground, &user_id, &req.thread_id).await?;
     Ok(Json(json!({
         "locked_out": stats.locked_out,
         "promoted": stats.promoted,
@@ -889,10 +878,10 @@ pub struct ContainerFact {
 
 /// Semantic facts whose `derived_from` lineage includes any raw record of this
 /// conversation — what the store has learned from it, newest evidence first.
-pub(crate) async fn facts_for_container(
+pub(crate) async fn facts_for_thread(
     pool: &PgPool,
     user_id: &str,
-    container_id: &str,
+    thread_id: &str,
 ) -> AppResult<Vec<ContainerFact>> {
     let rows = sqlx::query_as::<_, ContainerFact>(
         r#"
@@ -902,12 +891,12 @@ pub(crate) async fn facts_for_container(
         JOIN raw_records r ON r.id = e.to_id
         WHERE n.kind = 'semantic'
           AND n.user_id = $1
-          AND r.container_id = $2
+          AND r.thread_id = $2
         ORDER BY n.event_time DESC NULLS LAST, n.id
         "#,
     )
     .bind(user_id)
-    .bind(container_id)
+    .bind(thread_id)
     .fetch_all(pool)
     .await?;
     Ok(rows)

@@ -10,14 +10,14 @@
 //! arrived, this module says what that arrival became. Tier vocabulary
 //! (`episodic`, `semantic`, `summary`) exists only in `curated_nodes.kind`.
 //!
-//! Two derivations, both scoped to a single (user, project, mode) tuple and
+//! Two derivations, both scoped to a single (user, mode) tuple and
 //! never crossing it:
 //!
 //!   - `promote_raw_to_episodic`: turns the promotable raw types into
 //!     `curated_nodes` rows `kind='episodic'`, each with
 //!     `curated_edges('derived_from')` back to every raw id it covers. A
 //!     `conversation` turn is not an episode on its own — the episode is the
-//!     whole conversation — so those group by `container_id` into one node per
+//!     whole conversation — so those group by `thread_id` into one node per
 //!     session, carrying a transcript and a derived title in `meta`.
 //!     `document` rows stand alone, one node each.
 //!     Idempotent: a session that already has an episode is skipped, and a
@@ -124,13 +124,11 @@ pub struct CurationStats {
 // Scope
 // ---------------------------------------------------------------------------
 
-/// The (user, project, mode) tuple every curation pass is scoped to. `None`
-/// on project/mode matches raw records whose column is NULL (IS NOT DISTINCT
-/// FROM semantics) — the same "unscoped bucket" the records door uses.
+/// The (user, mode) tuple every curation pass is scoped to. Topics do not
+/// partition — health can feed taxes. Mode does: vector dimensions differ.
 #[derive(Debug, Clone)]
 pub struct Scope {
     pub user_id: String,
-    pub project_id: Option<String>,
     pub mode: Option<String>,
 }
 
@@ -138,14 +136,8 @@ impl Scope {
     pub fn new(user_id: impl Into<String>) -> Self {
         Self {
             user_id: user_id.into(),
-            project_id: None,
             mode: None,
         }
-    }
-
-    pub fn with_project(mut self, project_id: Option<String>) -> Self {
-        self.project_id = project_id;
-        self
     }
 
     pub fn with_mode(mut self, mode: Option<String>) -> Self {
@@ -178,7 +170,6 @@ struct PromotableRaw {
     id: Uuid,
     content: String,
     event_time: DateTime<Utc>,
-    importance: Option<f32>,
     source: String,
     payload: Option<serde_json::Value>,
 }
@@ -255,28 +246,23 @@ fn derive_title(turns: &[PromotableRaw]) -> String {
 async fn load_session_turns(
     pool: &PgPool,
     scope: &Scope,
-    container_id: &str,
+    thread_id: &str,
 ) -> AppResult<Vec<PromotableRaw>> {
     let turns = sqlx::query_as::<_, PromotableRaw>(
         r#"
-        SELECT r.id, r.content, r.event_time, r.importance, r.source, r.payload
+        SELECT r.id, r.content, r.event_time, r.source, r.payload
         FROM raw_records r
         WHERE r.type = 'conversation'
           AND r.user_id = $1
-          AND r.project_id IS NOT DISTINCT FROM $2
-          AND r.mode IS NOT DISTINCT FROM $3
-          AND r.container_id = $4
-          AND r.id NOT IN (
-              SELECT supersedes FROM raw_records
-              WHERE supersedes IS NOT NULL AND user_id = $1
-          )
+          AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $2
+          AND r.thread_id = $3
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
         ORDER BY r.event_time ASC, r.ingest_time ASC
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
-    .bind(container_id)
+    .bind(thread_id)
     .fetch_all(pool)
     .await?;
     Ok(turns)
@@ -293,7 +279,7 @@ async fn write_session_episode(
     nlp: &dyn NlpService,
     scope: &Scope,
     node_id: Uuid,
-    container_id: &str,
+    thread_id: &str,
     turns: &[PromotableRaw],
     refresh: bool,
 ) -> AppResult<()> {
@@ -301,12 +287,10 @@ async fn write_session_episode(
     let title = derive_title(turns);
     let started = turns[0].event_time;
     let ended = turns[turns.len() - 1].event_time;
-    // An episode inherits the weight of its most-weighted turn; a
-    // conversation matters as much as the most important thing said in it.
-    let importance = turns
-        .iter()
-        .filter_map(|t| t.importance)
-        .fold(None, |acc, i| Some(acc.map_or(i, |a: f32| a.max(i))));
+    // No importance is inherited any more: it used to come from a number the
+    // writer put on the raw row, which meant a rebuild could never disagree with
+    // it. Curation should decide this itself; until it does, it stays unset.
+    let importance: Option<f32> = None;
 
     if refresh {
         sqlx::query(
@@ -345,7 +329,7 @@ async fn write_session_episode(
         pool,
         node_id,
         serde_json::json!({
-            "container_id": container_id,
+            "thread_id": thread_id,
             "title": title,
             "turns": turns.len(),
             "started_at": started,
@@ -372,7 +356,7 @@ async fn write_session_episode(
 ///
 /// A `conversation` turn is not an episode on its own — an episode is the whole
 /// conversation, the block of time the turns share. So conversation rows group
-/// by `container_id` and yield **one** node per session, carrying the transcript,
+/// by `thread_id` and yield **one** node per session, carrying the transcript,
 /// a derived title, and `derived_from` edges to every turn it covers. Rows with
 /// no container (and `document` rows) stand alone, one node each.
 ///
@@ -391,43 +375,37 @@ pub async fn promote_raw_to_episodic(
     // Active = not superseded by a newer row, and not expired.
     let sessions: Vec<String> = sqlx::query_scalar(
         r#"
-        SELECT DISTINCT r.container_id
+        SELECT DISTINCT r.thread_id
         FROM raw_records r
         WHERE r.type = 'conversation'
-          AND r.container_id IS NOT NULL
+          AND r.thread_id IS NOT NULL
           AND r.user_id = $1
-          AND r.project_id IS NOT DISTINCT FROM $2
-          AND r.mode IS NOT DISTINCT FROM $3
-          AND r.id NOT IN (
-              SELECT supersedes FROM raw_records
-              WHERE supersedes IS NOT NULL AND user_id = $1
-          )
+          AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $2
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
           AND NOT EXISTS (
               SELECT 1 FROM curated_nodes n
               WHERE n.kind = 'episodic'
                 AND n.user_id = $1
-                AND n.project_id IS NOT DISTINCT FROM $2
-                AND n.mode IS NOT DISTINCT FROM $3
-                AND n.meta->>'container_id' = r.container_id
+                AND n.mode IS NOT DISTINCT FROM $2
+                AND n.meta->>'thread_id' = r.thread_id
           )
-        ORDER BY r.container_id
-        LIMIT $4
+        ORDER BY r.thread_id
+        LIMIT $3
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .bind(curation_batch_cap())
     .fetch_all(pool)
     .await?;
 
-    for container_id in sessions {
-        let turns = load_session_turns(pool, scope, &container_id).await?;
+    for thread_id in sessions {
+        let turns = load_session_turns(pool, scope, &thread_id).await?;
         if turns.is_empty() {
             continue;
         }
         let node_id = Uuid::new_v4();
-        write_session_episode(pool, nlp, scope, node_id, &container_id, &turns, false).await?;
+        write_session_episode(pool, nlp, scope, node_id, &thread_id, &turns, false).await?;
         stats.promoted += 1;
     }
 
@@ -439,71 +417,60 @@ pub async fn promote_raw_to_episodic(
     // `distilled_at`, making the episode eligible for distillation again.
     let grown: Vec<(Uuid, String)> = sqlx::query_as(
         r#"
-        SELECT n.id, n.meta->>'container_id' AS container_id
+        SELECT n.id, n.meta->>'thread_id' AS thread_id
         FROM curated_nodes n
         WHERE n.kind = 'episodic'
           AND n.user_id = $1
-          AND n.project_id IS NOT DISTINCT FROM $2
-          AND n.mode IS NOT DISTINCT FROM $3
-          AND n.meta->>'container_id' IS NOT NULL
+          AND n.mode IS NOT DISTINCT FROM $2
+          AND n.meta->>'thread_id' IS NOT NULL
           AND (n.meta->>'turns')::bigint <> (
               SELECT COUNT(*)
               FROM raw_records r
               WHERE r.type = 'conversation'
                 AND r.user_id = $1
-                AND r.project_id IS NOT DISTINCT FROM $2
-                AND r.mode IS NOT DISTINCT FROM $3
-                AND r.container_id = n.meta->>'container_id'
-                AND r.id NOT IN (
-                    SELECT supersedes FROM raw_records
-                    WHERE supersedes IS NOT NULL AND user_id = $1
-                )
+                AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $2
+                AND r.thread_id = n.meta->>'thread_id'
+                AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
           )
         ORDER BY n.id
-        LIMIT $4
+        LIMIT $3
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .bind(curation_batch_cap())
     .fetch_all(pool)
     .await?;
 
-    for (node_id, container_id) in grown {
-        let turns = load_session_turns(pool, scope, &container_id).await?;
+    for (node_id, thread_id) in grown {
+        let turns = load_session_turns(pool, scope, &thread_id).await?;
         if turns.is_empty() {
             continue;
         }
-        write_session_episode(pool, nlp, scope, node_id, &container_id, &turns, true).await?;
+        write_session_episode(pool, nlp, scope, node_id, &thread_id, &turns, true).await?;
         stats.refreshed += 1;
     }
 
     // --- standalone rows: documents, container-less turns -------------------
     let solo = sqlx::query_as::<_, PromotableRaw>(
         r#"
-        SELECT r.id, r.content, r.event_time, r.importance, r.source, r.payload
+        SELECT r.id, r.content, r.event_time, r.source, r.payload
         FROM raw_records r
-        WHERE r.type = ANY($5)
-          AND (r.type <> 'conversation' OR r.container_id IS NULL)
+        WHERE r.type = ANY($4)
+          AND (r.type <> 'conversation' OR r.thread_id IS NULL)
           AND r.user_id = $1
-          AND r.project_id IS NOT DISTINCT FROM $2
-          AND r.mode IS NOT DISTINCT FROM $3
-          AND r.id NOT IN (
-              SELECT supersedes FROM raw_records
-              WHERE supersedes IS NOT NULL AND user_id = $1
-          )
+          AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $2
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
           AND NOT EXISTS (
               SELECT 1 FROM curated_edges e
               JOIN curated_nodes n ON n.id = e.from_id
               WHERE e.to_id = r.id AND e.kind = 'derived_from' AND n.kind = 'episodic'
           )
         ORDER BY r.event_time ASC
-        LIMIT $4
+        LIMIT $3
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .bind(curation_batch_cap())
     .bind(PROMOTABLE_TYPES.as_slice())
@@ -518,7 +485,7 @@ pub async fn promote_raw_to_episodic(
             "episodic",
             &r.content,
             scope,
-            r.importance,
+            None,
             Some(r.event_time),
         )
         .await?;
@@ -589,13 +556,11 @@ async fn entities_for_scope(pool: &PgPool, scope: &Scope) -> AppResult<HashMap<U
         FROM entity_index ei
         JOIN raw_records r ON r.id = ei.record_id
         WHERE ei.user_id = $1
-          AND r.project_id IS NOT DISTINCT FROM $2
-          AND r.mode IS NOT DISTINCT FROM $3
-        LIMIT $4
+          AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $2
+        LIMIT $3
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .bind(cap)
     .fetch_all(pool)
@@ -689,8 +654,7 @@ pub async fn distill_semantic(
         FROM curated_nodes n
         WHERE n.kind = 'episodic'
           AND n.user_id = $1
-          AND n.project_id IS NOT DISTINCT FROM $2
-          AND n.mode IS NOT DISTINCT FROM $3
+          AND n.mode IS NOT DISTINCT FROM $2
           AND (n.meta->>'distilled_at') IS NULL
           AND NOT EXISTS (
               SELECT 1 FROM curated_edges s
@@ -698,11 +662,10 @@ pub async fn distill_semantic(
           )
         ORDER BY COALESCE((n.meta->>'distill_attempts')::int, 0) ASC,
                  n.event_time ASC NULLS LAST, n.id ASC
-        LIMIT $4
+        LIMIT $3
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .bind(curation_batch_cap())
     .fetch_all(pool)
@@ -729,19 +692,17 @@ pub async fn distill_semantic(
         FROM curated_nodes n
         WHERE n.kind = 'episodic'
           AND n.user_id = $1
-          AND n.project_id IS NOT DISTINCT FROM $2
-          AND n.mode IS NOT DISTINCT FROM $3
+          AND n.mode IS NOT DISTINCT FROM $2
           AND (n.meta->>'distilled_at') IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM curated_edges s
               WHERE s.to_id = n.id AND s.kind = 'supersedes'
           )
         ORDER BY n.event_time DESC NULLS LAST, n.id ASC
-        LIMIT $4
+        LIMIT $3
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .bind(DISTILL_CONTEXT)
     .fetch_all(pool)
@@ -1079,12 +1040,11 @@ async fn curate_inner(
     nlp: &dyn NlpService,
     user_id: &str,
 ) -> AppResult<CurationStats> {
-    let buckets: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+    let buckets: Vec<(Option<String>,)> = sqlx::query_as(
         r#"
-        SELECT DISTINCT project_id, mode
-        FROM raw_records
-        WHERE user_id = $1
-        ORDER BY project_id, mode
+        SELECT DISTINCT dm.mode FROM raw_records r
+        LEFT JOIN derived_record_mode dm ON dm.record_id = r.id
+        WHERE r.user_id = $1 ORDER BY 1
         "#,
     )
     .bind(user_id)
@@ -1092,8 +1052,8 @@ async fn curate_inner(
     .await?;
 
     let mut total = CurationStats::default();
-    for (project_id, mode) in buckets {
-        let scope = Scope::new(user_id).with_project(project_id).with_mode(mode);
+    for (mode,) in buckets {
+        let scope = Scope::new(user_id).with_mode(mode);
         let p = promote_raw_to_episodic(pool, nlp, &scope).await?;
         let d = distill_semantic(pool, nlp, &scope).await?;
         // The summary tree has no incremental maintenance yet: it is derived
@@ -1149,13 +1109,11 @@ async fn pending_undistilled(pool: &PgPool, scope: &Scope) -> AppResult<i64> {
         FROM curated_nodes n
         WHERE n.kind = 'episodic'
           AND n.user_id = $1
-          AND n.project_id IS NOT DISTINCT FROM $2
-          AND n.mode IS NOT DISTINCT FROM $3
+          AND n.mode IS NOT DISTINCT FROM $2
           AND (n.meta->>'distilled_at') IS NULL
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .fetch_one(pool)
     .await?;
@@ -1189,26 +1147,24 @@ async fn wipe_summaries(pool: &PgPool, scope: &Scope) -> AppResult<()> {
         WHERE from_id IN (
             SELECT id FROM curated_nodes
             WHERE kind = 'summary' AND user_id = $1
-              AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3
+               AND mode IS NOT DISTINCT FROM $2
         )
         OR to_id IN (
             SELECT id FROM curated_nodes
             WHERE kind = 'summary' AND user_id = $1
-              AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3
+               AND mode IS NOT DISTINCT FROM $2
         )
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .execute(pool)
     .await?;
     sqlx::query(
         "DELETE FROM curated_nodes WHERE kind = 'summary' AND user_id = $1 \
-         AND project_id IS NOT DISTINCT FROM $2 AND mode IS NOT DISTINCT FROM $3",
+          AND mode IS NOT DISTINCT FROM $2",
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .execute(pool)
     .await?;
@@ -1221,29 +1177,23 @@ async fn wipe_summaries(pool: &PgPool, scope: &Scope) -> AppResult<()> {
 async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64)> {
     let sessions: i64 = sqlx::query_scalar(
         r#"
-        SELECT COUNT(DISTINCT r.container_id)
+        SELECT COUNT(DISTINCT r.thread_id)
         FROM raw_records r
         WHERE r.type = 'conversation'
-          AND r.container_id IS NOT NULL
+          AND r.thread_id IS NOT NULL
           AND r.user_id = $1
-          AND r.project_id IS NOT DISTINCT FROM $2
-          AND r.mode IS NOT DISTINCT FROM $3
-          AND r.id NOT IN (
-              SELECT supersedes FROM raw_records
-              WHERE supersedes IS NOT NULL AND user_id = $1
-          )
+          AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $2
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
           AND NOT EXISTS (
               SELECT 1 FROM curated_nodes n
               WHERE n.kind = 'episodic'
                 AND n.user_id = $1
-                AND n.project_id IS NOT DISTINCT FROM $2
-                AND n.mode IS NOT DISTINCT FROM $3
-                AND n.meta->>'container_id' = r.container_id
+                AND n.mode IS NOT DISTINCT FROM $2
+                AND n.meta->>'thread_id' = r.thread_id
           )
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .fetch_one(pool)
     .await?;
@@ -1251,15 +1201,11 @@ async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64
         r#"
         SELECT COUNT(*)
         FROM raw_records r
-        WHERE r.type = ANY($4)
-          AND (r.type <> 'conversation' OR r.container_id IS NULL)
+        WHERE r.type = ANY($3)
+          AND (r.type <> 'conversation' OR r.thread_id IS NULL)
           AND r.user_id = $1
-          AND r.project_id IS NOT DISTINCT FROM $2
-          AND r.mode IS NOT DISTINCT FROM $3
-          AND r.id NOT IN (
-              SELECT supersedes FROM raw_records
-              WHERE supersedes IS NOT NULL AND user_id = $1
-          )
+          AND (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) IS NOT DISTINCT FROM $2
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id)
           AND NOT EXISTS (
               SELECT 1 FROM curated_edges e
               JOIN curated_nodes n ON n.id = e.from_id
@@ -1268,7 +1214,6 @@ async fn pending_promotable(pool: &PgPool, scope: &Scope) -> AppResult<(i64, i64
         "#,
     )
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .bind(PROMOTABLE_TYPES.as_slice())
     .fetch_one(pool)
@@ -1301,24 +1246,22 @@ async fn supersede_older_facts(
          SELECT $1, n.id, 'supersedes' \
          FROM curated_nodes n \
          JOIN curated_embeddings ce \
-           ON ce.node_id = n.id AND ce.model = $8 AND ce.{col} IS NOT NULL \
+           ON ce.node_id = n.id AND ce.model = $7 AND ce.{col} IS NOT NULL \
          WHERE n.kind = 'semantic' \
            AND n.user_id = $2 \
-           AND n.project_id IS NOT DISTINCT FROM $3 \
-           AND n.mode IS NOT DISTINCT FROM $4 \
+           AND n.mode IS NOT DISTINCT FROM $3 \
            AND n.id <> $1 \
-           AND (n.event_time IS NULL OR n.event_time < $5) \
+           AND (n.event_time IS NULL OR n.event_time < $4) \
            AND NOT EXISTS ( \
                SELECT 1 FROM curated_edges s \
                WHERE s.to_id = n.id AND s.kind = 'supersedes' \
            ) \
-           AND 1 - (ce.{col} <=> $6) >= $7 \
+           AND 1 - (ce.{col} <=> $5) >= $6 \
          ON CONFLICT (from_id, to_id, kind) DO NOTHING"
     );
     let res = sqlx::query(sqlx::AssertSqlSafe(sql))
         .bind(new_id)
         .bind(&scope.user_id)
-        .bind(&scope.project_id)
         .bind(&scope.mode)
         .bind(new_time)
         .bind(Vector::from(emb.to_vec()))
@@ -1389,14 +1332,12 @@ async fn rebuild_inner(
         .await?;
     tx.commit().await?;
 
-    // Re-derive across every (project, mode) bucket this user's raw records fall
-    // into, so a plain rebuild(user) reproduces the full derived set.
-    let buckets: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+    // Re-derive across every mode bucket so a rebuild reproduces the full set.
+    let buckets: Vec<(Option<String>,)> = sqlx::query_as(
         r#"
-        SELECT DISTINCT project_id, mode
-        FROM raw_records
-        WHERE user_id = $1
-        ORDER BY project_id, mode
+        SELECT DISTINCT dm.mode FROM raw_records r
+        LEFT JOIN derived_record_mode dm ON dm.record_id = r.id
+        WHERE r.user_id = $1 ORDER BY 1
         "#,
     )
     .bind(user_id)
@@ -1404,8 +1345,8 @@ async fn rebuild_inner(
     .await?;
 
     let mut total = CurationStats::default();
-    for (project_id, mode) in buckets {
-        let scope = Scope::new(user_id).with_project(project_id).with_mode(mode);
+    for (mode,) in buckets {
+        let scope = Scope::new(user_id).with_mode(mode);
         let p = promote_raw_to_episodic(pool, nlp, &scope).await?;
         let d = distill_semantic(pool, nlp, &scope).await?;
         // Build the RAPTOR summary tree over the level-0 nodes just derived for
@@ -1425,27 +1366,6 @@ async fn rebuild_inner(
     Ok(total)
 }
 
-/// Rebuild the curated layer for every user with raw records. The background
-/// scheduler uses this; it lists users straight from `raw_records`.
-pub async fn rebuild_all_users(
-    pool: &PgPool,
-    nlp: &dyn NlpService,
-) -> Vec<(String, CurationStats)> {
-    let users: Vec<String> =
-        sqlx::query_scalar("SELECT DISTINCT user_id FROM raw_records ORDER BY user_id")
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-    let mut out = Vec::new();
-    for u in users {
-        match rebuild(pool, nlp, &u).await {
-            Ok(stats) => out.push((u, stats)),
-            Err(e) => tracing::warn!(user = %u, "curation rebuild failed: {e}"),
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // Derivations (glass-box read): curated nodes derived from a raw id.
 // ---------------------------------------------------------------------------
@@ -1457,7 +1377,6 @@ pub struct DerivationRow {
     pub content: String,
     pub level: i32,
     pub user_id: String,
-    pub project_id: Option<String>,
     pub mode: Option<String>,
     pub importance: Option<f32>,
     pub event_time: Option<DateTime<Utc>>,
@@ -1474,7 +1393,7 @@ pub async fn derivations_of(
 ) -> AppResult<Vec<DerivationRow>> {
     let rows = sqlx::query_as::<_, DerivationRow>(
         r#"
-        SELECT n.id, n.kind, n.content, n.level, n.user_id, n.project_id, n.mode,
+        SELECT n.id, n.kind, n.content, n.level, n.user_id, n.mode,
                n.importance, n.event_time, n.created_at
         FROM curated_nodes n
         JOIN curated_edges e ON e.from_id = n.id AND e.kind = 'derived_from'
@@ -1532,8 +1451,8 @@ pub(crate) mod edges {
         sqlx::query(
             r#"
             INSERT INTO curated_nodes
-                (id, kind, content, level, user_id, project_id, mode, importance, event_time)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                (id, kind, content, level, user_id, mode, importance, event_time)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
         .bind(id)
@@ -1541,7 +1460,6 @@ pub(crate) mod edges {
         .bind(content)
         .bind(level)
         .bind(&scope.user_id)
-        .bind(&scope.project_id)
         .bind(&scope.mode)
         .bind(importance)
         .bind(event_time)
@@ -1998,24 +1916,38 @@ mod tests {
     async fn insert_document_raw(
         pool: &PgPool,
         user_id: &str,
-        project_id: Option<&str>,
+        topic_id: Option<&str>,
         mode: Option<&str>,
         content: &str,
     ) -> Uuid {
         let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO raw_records
-               (id, type, content, event_time, source, user_id, project_id, mode)
-               VALUES ($1, 'document', $2, NOW(), 'test', $3, $4, $5)"#,
+               (id, type, content, event_time, source, user_id, topic_id)
+               VALUES ($1, 'document', $2, NOW(), 'test', $3, $4)"#,
         )
         .bind(id)
         .bind(content)
         .bind(user_id)
-        .bind(project_id)
-        .bind(mode)
+        .bind(topic_id)
         .execute(pool)
         .await
         .unwrap();
+        if let Some(m) = mode {
+            crate::modes::ensure_builtin_modes(pool, user_id).await.ok();
+            sqlx::query(
+                "INSERT INTO derived_record_mode
+                    (record_id, user_id, mode, embedder, event_time, origin, decided_by)
+                 SELECT $1, $2, $3, m.embedder, NOW(), 'writer', 'test'
+                 FROM modes m WHERE m.user_id = $2 AND m.name = $3",
+            )
+            .bind(id)
+            .bind(user_id)
+            .bind(m)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
         id
     }
 
@@ -2047,7 +1979,7 @@ mod tests {
     async fn insert_turn(
         pool: &PgPool,
         user_id: &str,
-        container_id: &str,
+        thread_id: &str,
         source: &str,
         content: &str,
         offset_secs: i64,
@@ -2055,7 +1987,7 @@ mod tests {
         let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO raw_records
-               (id, type, content, event_time, source, user_id, container_id)
+               (id, type, content, event_time, source, user_id, thread_id)
                VALUES ($1, 'conversation', $2, NOW() + ($3 || ' seconds')::interval, $4, $5, $6)"#,
         )
         .bind(id)
@@ -2063,7 +1995,7 @@ mod tests {
         .bind(offset_secs.to_string())
         .bind(source)
         .bind(user_id)
-        .bind(container_id)
+        .bind(thread_id)
         .execute(pool)
         .await
         .unwrap();
@@ -2200,7 +2132,7 @@ mod tests {
         assert_eq!(edges, 4);
 
         let meta = node_meta(&pool, "alice").await;
-        assert_eq!(meta["container_id"], "conv-1");
+        assert_eq!(meta["thread_id"], "conv-1");
         assert_eq!(meta["turns"], 4);
         assert_eq!(meta["title"], "what's due friday");
 
@@ -2263,7 +2195,7 @@ mod tests {
     async fn imported_title_wins_over_the_opening_turn(pool: PgPool) {
         sqlx::query(
             r#"INSERT INTO raw_records
-               (id, type, content, event_time, source, user_id, container_id, payload)
+               (id, type, content, event_time, source, user_id, thread_id, payload)
                VALUES ($1,'conversation','hey can you help',NOW(),'chatgpt','alice','conv-9',$2)"#,
         )
         .bind(Uuid::new_v4())
@@ -2954,10 +2886,111 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn a_topic_scoped_node_is_found_through_the_evidence_it_cites(pool: PgPool) {
+        // A curated node spans topics, so it carries none of its own. Scoping by
+        // topic must therefore ask "does this node cite evidence from there" —
+        // filtering the node's own (always null) topic silently returns nothing.
+        insert_document_raw(
+            &pool,
+            "alice",
+            Some("health"),
+            None,
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_document_raw(
+            &pool,
+            "alice",
+            Some("taxes"),
+            None,
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+        rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
+
+        let scoped: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes n
+             WHERE n.user_id = 'alice' AND EXISTS (
+                 SELECT 1 FROM curated_edges de
+                 JOIN raw_records dr ON dr.id = de.to_id
+                 WHERE de.from_id = n.id AND de.kind = 'derived_from' AND dr.topic_id = $1
+             )",
+        )
+        .bind("taxes")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            scoped > 0,
+            "a topic-scoped request must still reach curated facts"
+        );
+
+        let absent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes n
+             WHERE n.user_id = 'alice' AND EXISTS (
+                 SELECT 1 FROM curated_edges de
+                 JOIN raw_records dr ON dr.id = de.to_id
+                 WHERE de.from_id = n.id AND de.kind = 'derived_from' AND dr.topic_id = $1
+             )",
+        )
+        .bind("gardening")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(absent, 0, "an unrelated topic must still narrow");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn curation_crosses_topics(pool: PgPool) {
+        // Same shape as the mode test, but split by topic instead. Topics do not
+        // partition, so these MUST merge.
+        insert_document_raw(
+            &pool,
+            "alice",
+            Some("health"),
+            None,
+            "the deploy target for the pgvector service is staging",
+        )
+        .await;
+        insert_document_raw(
+            &pool,
+            "alice",
+            Some("taxes"),
+            None,
+            "the deploy target for the pgvector service moved to production",
+        )
+        .await;
+
+        rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
+
+        let semantic: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_nodes WHERE user_id='alice' AND kind='semantic'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            semantic, 1,
+            "records in different topics must still cluster"
+        );
+
+        let sources: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM curated_edges e \
+             JOIN curated_nodes n ON n.id = e.from_id \
+             WHERE n.user_id='alice' AND n.kind='semantic' AND e.kind='derived_from'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sources, 2,
+            "the semantic fact must cite both topics' records"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn curation_never_crosses_a_mode_boundary(pool: PgPool) {
-        // Two records with an IDENTICAL entity set (jaccard 1.0) that would
-        // cluster into one semantic fact — except they live in different modes.
-        // Curation is scoped per (user, project, mode), so they must NOT merge.
+        // Identical entity sets that would cluster — except different modes.
         insert_document_raw(
             &pool,
             "alice",
@@ -2975,7 +3008,7 @@ mod tests {
         )
         .await;
 
-        // A full rebuild processes every (project, mode) bucket separately.
+        // A rebuild processes each mode bucket separately.
         rebuild(&pool, &DistillingNlp, "alice").await.unwrap();
 
         // Each mode promoted its own episodic node...

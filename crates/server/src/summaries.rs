@@ -10,7 +10,7 @@
 //! reads the top summaries first and only descends when the caller wants the
 //! underlying detail.
 //!
-//! Everything is scope-bounded (a summary never mixes user/project/mode) and
+//! Everything is scope-bounded (a summary never mixes user/mode) and
 //! rebuildable — `curation::rebuild` re-derives the whole tree after re-deriving
 //! level 0, and produces the same shape.
 //!
@@ -91,7 +91,7 @@ struct LevelNode {
 /// Build the RAPTOR summary tree for a scope on top of its existing level-0
 /// curated nodes. Idempotent within a rebuild: callers wipe curated nodes
 /// first, so this always builds from a clean level 0. Scope-bounded — never
-/// crosses user/project/mode.
+/// crosses user/mode.
 pub async fn build_summaries(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -185,19 +185,17 @@ async fn load_level(
         FROM curated_nodes n
         WHERE n.level = $1
           AND ($2 = '*' OR n.user_id = $2)
-          AND n.project_id IS NOT DISTINCT FROM $3
-          AND n.mode IS NOT DISTINCT FROM $4
+          AND n.mode IS NOT DISTINCT FROM $3
           AND NOT EXISTS (
               SELECT 1 FROM curated_edges s
               WHERE s.to_id = n.id AND s.kind = 'supersedes'
           )
         ORDER BY n.created_at ASC
-        LIMIT $5
+        LIMIT $4
         "#,
     )
     .bind(level)
     .bind(&scope.user_id)
-    .bind(&scope.project_id)
     .bind(&scope.mode)
     .bind(crate::curation::curation_batch_cap())
     .fetch_all(pool)

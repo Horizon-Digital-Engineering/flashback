@@ -40,10 +40,9 @@ pub(crate) struct RawAdminRow {
     pub r#type: String,
     pub content: String,
     pub source: String,
-    pub project_id: Option<String>,
-    pub container_id: Option<String>,
+    pub topic_id: Option<String>,
+    pub thread_id: Option<String>,
     pub mode: Option<String>,
-    pub importance: Option<f32>,
     pub superseded: bool,
     pub state_kind: Option<String>,
     pub state_key: Option<String>,
@@ -62,10 +61,9 @@ struct RawRecordDbRow {
     // in-query (WHERE user_id = $), so nothing reads this after mapping.
     #[allow(dead_code)]
     user_id: String,
-    project_id: Option<String>,
-    container_id: Option<String>,
+    topic_id: Option<String>,
+    thread_id: Option<String>,
     mode: Option<String>,
-    importance: Option<f32>,
     superseded: bool,
     state_kind: Option<String>,
     state_key: Option<String>,
@@ -80,10 +78,9 @@ impl RawRecordDbRow {
             r#type: self.r#type,
             content: self.content,
             source: self.source,
-            project_id: self.project_id,
-            container_id: self.container_id,
+            topic_id: self.topic_id,
+            thread_id: self.thread_id,
             mode: self.mode,
-            importance: self.importance,
             superseded: self.superseded,
             state_kind: self.state_kind,
             state_key: self.state_key,
@@ -306,9 +303,9 @@ pub struct RecordQuery {
     #[serde(default)]
     pub r#type: Option<String>,
     #[serde(default)]
-    pub project_id: Option<String>,
+    pub topic_id: Option<String>,
     #[serde(default)]
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
@@ -325,8 +322,8 @@ impl RecordQuery {
     fn clean(&self) -> Self {
         Self {
             r#type: self.r#type.as_deref().and_then(empty_to_none),
-            project_id: self.project_id.as_deref().and_then(empty_to_none),
-            container_id: self.container_id.as_deref().and_then(empty_to_none),
+            topic_id: self.topic_id.as_deref().and_then(empty_to_none),
+            thread_id: self.thread_id.as_deref().and_then(empty_to_none),
             mode: self.mode.as_deref().and_then(empty_to_none),
             include_superseded: if self.include_super() {
                 Some("1".to_string())
@@ -363,8 +360,8 @@ pub async fn records_list(
 
     let filter = views::RecordsFilter {
         r#type: q.r#type.clone(),
-        project_id: q.project_id.clone(),
-        container_id: q.container_id.clone(),
+        topic_id: q.topic_id.clone(),
+        thread_id: q.thread_id.clone(),
         mode: q.mode.clone(),
         include_superseded: q.include_super(),
     };
@@ -420,19 +417,19 @@ async fn fetch_records(
 ) -> Result<Vec<RawAdminRow>, sqlx::Error> {
     let rows = sqlx::query_as::<_, RawRecordDbRow>(
         r#"
-        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.container_id,
-               r.mode, r.importance, r.state_kind, r.state_key, r.payload,
+        SELECT r.id, r.type, r.content, r.source, r.user_id, r.topic_id, r.thread_id,
+               (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) AS mode,
+               r.payload->>'kind' AS state_kind, r.payload->>'key' AS state_key, r.payload,
                r.event_time,
                EXISTS (
-                   SELECT 1 FROM raw_records n
-                   WHERE n.supersedes = r.id AND n.user_id = r.user_id
+                   SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id
                ) AS superseded
         FROM raw_records r
         WHERE ($1 = '*' OR r.user_id = $1)
           AND ($2::TEXT IS NULL OR r.type = $2)
-          AND ($3::TEXT IS NULL OR r.project_id = $3)
-          AND ($4::TEXT IS NULL OR r.container_id = $4)
-          AND ($5::TEXT IS NULL OR r.mode = $5)
+          AND ($3::TEXT IS NULL OR r.topic_id = $3)
+          AND ($4::TEXT IS NULL OR r.thread_id = $4)
+          AND ($5::TEXT IS NULL OR EXISTS (SELECT 1 FROM derived_record_mode dm WHERE dm.record_id = r.id AND dm.mode = $5))
           AND ($6::BOOLEAN OR NOT EXISTS (
               SELECT 1 FROM raw_records n
               WHERE n.supersedes = r.id AND n.user_id = r.user_id
@@ -443,8 +440,8 @@ async fn fetch_records(
     )
     .bind(user_id)
     .bind(&q.r#type)
-    .bind(&q.project_id)
-    .bind(&q.container_id)
+    .bind(&q.topic_id)
+    .bind(&q.thread_id)
     .bind(&q.mode)
     .bind(q.include_super())
     .bind(limit)
@@ -470,9 +467,9 @@ async fn count_records(
         SELECT COUNT(*) FROM raw_records r
         WHERE ($1 = '*' OR r.user_id = $1)
           AND ($2::TEXT IS NULL OR r.type = $2)
-          AND ($3::TEXT IS NULL OR r.project_id = $3)
-          AND ($4::TEXT IS NULL OR r.container_id = $4)
-          AND ($5::TEXT IS NULL OR r.mode = $5)
+          AND ($3::TEXT IS NULL OR r.topic_id = $3)
+          AND ($4::TEXT IS NULL OR r.thread_id = $4)
+          AND ($5::TEXT IS NULL OR EXISTS (SELECT 1 FROM derived_record_mode dm WHERE dm.record_id = r.id AND dm.mode = $5))
           AND ($6::BOOLEAN OR NOT EXISTS (
               SELECT 1 FROM raw_records n
               WHERE n.supersedes = r.id AND n.user_id = r.user_id
@@ -481,8 +478,8 @@ async fn count_records(
     )
     .bind(user_id)
     .bind(&q.r#type)
-    .bind(&q.project_id)
-    .bind(&q.container_id)
+    .bind(&q.topic_id)
+    .bind(&q.thread_id)
     .bind(&q.mode)
     .bind(q.include_super())
     .fetch_one(pool)
@@ -536,12 +533,12 @@ pub(crate) async fn load_record_detail(
         chain AS (
             SELECT id FROM back UNION SELECT id FROM forward
         )
-        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.container_id,
-               r.mode, r.importance, r.state_kind, r.state_key, r.payload,
+        SELECT r.id, r.type, r.content, r.source, r.user_id, r.topic_id, r.thread_id,
+               (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) AS mode,
+               r.payload->>'kind' AS state_kind, r.payload->>'key' AS state_key, r.payload,
                r.event_time,
                EXISTS (
-                   SELECT 1 FROM raw_records n
-                   WHERE n.supersedes = r.id AND n.user_id = r.user_id
+                   SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id
                ) AS superseded
         FROM raw_records r
         WHERE r.id IN (SELECT id FROM chain) AND ($2 = '*' OR r.user_id = $2)
@@ -570,12 +567,12 @@ async fn fetch_one_record(
 ) -> Result<Option<RawRecordDbRow>, sqlx::Error> {
     sqlx::query_as::<_, RawRecordDbRow>(
         r#"
-        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.container_id,
-               r.mode, r.importance, r.state_kind, r.state_key, r.payload,
+        SELECT r.id, r.type, r.content, r.source, r.user_id, r.topic_id, r.thread_id,
+               (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) AS mode,
+               r.payload->>'kind' AS state_kind, r.payload->>'key' AS state_key, r.payload,
                r.event_time,
                EXISTS (
-                   SELECT 1 FROM raw_records n
-                   WHERE n.supersedes = r.id AND n.user_id = r.user_id
+                   SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id
                ) AS superseded
         FROM raw_records r
         WHERE r.id = $1 AND ($2 = '*' OR r.user_id = $2)
@@ -606,8 +603,9 @@ pub(crate) async fn list_state_objects_for(
 ) -> Result<Vec<RawAdminRow>, sqlx::Error> {
     let rows = sqlx::query_as::<_, RawRecordDbRow>(
         r#"
-        SELECT r.id, r.type, r.content, r.source, r.user_id, r.project_id, r.container_id,
-               r.mode, r.importance, r.state_kind, r.state_key, r.payload,
+        SELECT r.id, r.type, r.content, r.source, r.user_id, r.topic_id, r.thread_id,
+               (SELECT dm.mode FROM derived_record_mode dm WHERE dm.record_id = r.id) AS mode,
+               r.payload->>'kind' AS state_kind, r.payload->>'key' AS state_key, r.payload,
                r.event_time, FALSE AS superseded
         FROM raw_records r
         WHERE ($1 = '*' OR r.user_id = $1) AND r.type = 'state_object'
@@ -957,7 +955,7 @@ struct GraphRow {
     content: String,
     importance: f32,
     superseded: bool,
-    container_id: Option<String>,
+    thread_id: Option<String>,
     supersedes: Option<Uuid>,
     state_key: Option<String>,
     embedding: Option<Vector>,
@@ -988,7 +986,7 @@ async fn compute_graph_with_layout(
             id: r.id,
             embedding: r.embedding.as_ref().map(|v| v.to_vec()).unwrap_or_default(),
             entities: r.entities.clone(),
-            container_id: r.container_id.clone(),
+            thread_id: r.thread_id.clone(),
             supersedes: r.supersedes,
         })
         .collect();
@@ -1035,17 +1033,16 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
         content: String,
         importance: Option<f32>,
         superseded: bool,
-        container_id: Option<String>,
+        thread_id: Option<String>,
         supersedes: Option<Uuid>,
         state_key: Option<String>,
         embedding: Option<Vector>,
     }
     let rows = sqlx::query_as::<_, Row>(
         r#"
-        SELECT r.id, r.type, r.content, r.importance, r.container_id, r.supersedes, r.state_key,
+        SELECT r.id, r.type, r.content, r.importance, r.thread_id, r.supersedes, r.state_key,
                EXISTS (
-                   SELECT 1 FROM raw_records n
-                   WHERE n.supersedes = r.id AND n.user_id = r.user_id
+                   SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id
                ) AS superseded,
                e.embedding AS embedding
         FROM raw_records r
@@ -1068,7 +1065,7 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
             content: r.content,
             importance: r.importance.unwrap_or(0.5),
             superseded: r.superseded,
-            container_id: r.container_id,
+            thread_id: r.thread_id,
             supersedes: r.supersedes,
             state_key: r.state_key,
             embedding: r.embedding,
@@ -1126,8 +1123,8 @@ mod tests {
     ) -> Uuid {
         sqlx::query_scalar(
             r#"
-            INSERT INTO raw_records (type, content, event_time, source, user_id, importance, supersedes)
-            VALUES ($1, $2, NOW(), 'admin-test', $3, 0.5, $4)
+            INSERT INTO raw_records (type, content, event_time, source, user_id, supersedes)
+            VALUES ($1, $2, NOW(), 'admin-test', $3, $4)
             RETURNING id
             "#,
         )
@@ -1221,20 +1218,30 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn fetch_records_native_mode_filter(pool: PgPool) {
-        sqlx::query(
-            "INSERT INTO raw_records (type, content, event_time, source, user_id, mode)
-             VALUES ('document', 'code note', NOW(), 't', 'alice', 'code')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO raw_records (type, content, event_time, source, user_id, mode)
-             VALUES ('document', 'journal note', NOW(), 't', 'alice', 'journal')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        crate::modes::ensure_builtin_modes(&pool, "alice")
+            .await
+            .unwrap();
+        for (content, mode) in [("code note", "code"), ("journal note", "journal")] {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO raw_records (type, content, event_time, source, user_id)
+                 VALUES ('document', $1, NOW(), 't', 'alice') RETURNING id",
+            )
+            .bind(content)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO derived_record_mode
+                    (record_id, user_id, mode, embedder, event_time, origin, decided_by)
+                 SELECT $1, 'alice', $2, m.embedder, NOW(), 'writer', 'test'
+                 FROM modes m WHERE m.user_id = 'alice' AND m.name = $2",
+            )
+            .bind(id)
+            .bind(mode)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
         let q = RecordQuery {
             mode: Some("code".to_string()),

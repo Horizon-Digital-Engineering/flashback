@@ -48,7 +48,7 @@ The decision on this page is about the embedder. The AiProvider decision is in [
 
 A higher-dimensional embedding can theoretically separate fine-grained semantic differences better — more "axes of meaning" to spread concepts along. In practice it's a story of diminishing returns with real costs:
 
-| Dim  | Bytes/memory | Cosine compare | IVFFlat index @ 100k rows |
+| Dim  | Bytes/record | Cosine compare | HNSW index @ 100k rows |
 |------|--------------|----------------|----------------------------|
 | 384  | 1.5 KB       | ~25 µs         | ~600 MB                    |
 | 768  | 3.0 KB       | ~50 µs         | ~1.2 GB                    |
@@ -98,7 +98,7 @@ model: EmbeddingModel::JinaEmbeddingsV2BaseCode,
 
 ```sql
 -- migrations/005_embedding_768.sql (or whatever the bump is)
-ALTER TABLE memories ALTER COLUMN embedding TYPE vector(768);
+ALTER TABLE raw_embeddings ALTER COLUMN embedding TYPE vector(768);
 ```
 
 Why: `jina-embeddings-v2-base-code` is trained on Stack Overflow / GitHub / docs in addition to general text. It treats `Arc<Mutex<HashMap<K,V>>>` as a meaningful symbol cluster, not a bag of characters. It handles `useState` and `fastembed` and `pgvector` as concepts. Same training corpus has actual English explanations of code, so "talk about code" works as well as "code about code."
@@ -167,10 +167,11 @@ model: EmbeddingModel::JinaEmbeddingsV2BaseCode,  // or whatever you picked
 
 ```sql
 -- migrations/005_embedding_768.sql (or 1024, depending on your pick)
-ALTER TABLE memories ALTER COLUMN embedding TYPE vector(768);
+ALTER TABLE raw_embeddings ALTER COLUMN embedding TYPE vector(768);
 DROP INDEX IF EXISTS memories_embedding_idx;
 CREATE INDEX memories_embedding_idx
-    ON memories USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+    ON raw_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
 ```
 
 ### 3. Backfill existing rows

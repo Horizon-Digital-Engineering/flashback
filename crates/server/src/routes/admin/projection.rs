@@ -9,7 +9,7 @@
 //!   2. Emit edges in three kinds:
 //!         - `supersede`  : explicit chain links (strong)
 //!         - `entity`     : Jaccard ≥ 0.4 on entities (medium)
-//!         - `session`    : same container_id (weak)
+//!         - `session`    : same thread_id (weak)
 //!
 //! The client picks rendering weights per kind.
 
@@ -21,7 +21,7 @@ pub struct GraphInput {
     pub id: Uuid,
     pub embedding: Vec<f32>,
     pub entities: Vec<String>,
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
     pub supersedes: Option<Uuid>,
 }
 
@@ -556,7 +556,7 @@ fn build_edges(items: &[GraphInput]) -> Vec<GraphEdge> {
     //    Bucket by session, sort by id (stable), connect i→i+1.
     let mut by_session: HashMap<&str, Vec<&GraphInput>> = HashMap::new();
     for it in items {
-        if let Some(s) = it.container_id.as_deref() {
+        if let Some(s) = it.thread_id.as_deref() {
             by_session.entry(s).or_default().push(it);
         }
     }

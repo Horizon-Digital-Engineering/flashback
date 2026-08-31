@@ -62,9 +62,9 @@ pub struct StateSetArgs {
     #[schemars(schema_with = "any_json_schema")]
     pub data: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    pub topic_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub importance: Option<f32>,
 }
@@ -96,21 +96,28 @@ pub struct Flashback {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct RecordArgs {
-    /// episodic | semantic | working | document | procedural | state_object
+    /// conversation | document | state_object — how the record must be
+    /// PROCESSED, not what it is about. Tier names (episodic, semantic,
+    /// summary) are conclusions the curation pass draws, never inputs.
     pub r#type: String,
     pub content: String,
     /// Origin tag, e.g. "chatgpt", "ritsu:health", "finance-sync".
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    pub topic_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub importance: Option<f32>,
+    /// Your own id for this record, and for the one it followed. The store
+    /// resolves the second to an internal id, so callers never handle ours.
+    /// An unresolvable one is kept as a visible gap, not an error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_hours: Option<i64>,
+    pub source_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_source_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -118,9 +125,9 @@ pub struct RecallArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    pub topic_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_id: Option<String>,
+    pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -181,7 +188,7 @@ impl Flashback {
     #[tool(
         description = "Recall the most relevant raw records for a query via hybrid semantic + \
                        keyword retrieval over the immutable raw layer, scoped by \
-                       project/session/mode. `mode` picks a cognitive register \
+                       topic/thread/mode. `mode` picks a cognitive register \
                        (code/general/journal/research/…) and searches its vector geometry; \
                        `all` searches across registers with keyword-degraded ranking. Call \
                        before answering to ground in memory."
@@ -271,8 +278,8 @@ impl Flashback {
         );
         let body = json!({
             "data":       args.data,
-            "project_id": args.project_id,
-            "container_id": args.container_id,
+            "topic_id": args.topic_id,
+            "thread_id": args.thread_id,
             "importance": args.importance,
         });
         let res = self.post(&path, &bearer, body).await?;

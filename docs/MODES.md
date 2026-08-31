@@ -69,18 +69,18 @@ CREATE TABLE modes (
     PRIMARY KEY (user_id, name)
 );
 
-ALTER TABLE memories ADD COLUMN mode TEXT NOT NULL DEFAULT 'general';
+ALTER TABLE raw_embeddings ADD COLUMN mode TEXT NOT NULL DEFAULT 'general';
 
 -- One nullable column per dimension. A memory writes to exactly one.
-ALTER TABLE memories ADD COLUMN embedding_384  vector(384);
-ALTER TABLE memories ADD COLUMN embedding_768  vector(768);
-ALTER TABLE memories ADD COLUMN embedding_1024 vector(1024);
+ALTER TABLE raw_embeddings ADD COLUMN embedding_384  vector(384);
+ALTER TABLE raw_embeddings ADD COLUMN embedding_768  vector(768);
+ALTER TABLE raw_embeddings ADD COLUMN embedding_1024 vector(1024);
 -- (etc. for any dim we want to support)
 
 -- Per-column indexes, partial so empty columns don't bloat.
-CREATE INDEX memories_emb384_idx  ON memories USING ivfflat (embedding_384  vector_cosine_ops) WHERE embedding_384  IS NOT NULL;
-CREATE INDEX memories_emb768_idx  ON memories USING ivfflat (embedding_768  vector_cosine_ops) WHERE embedding_768  IS NOT NULL;
-CREATE INDEX memories_emb1024_idx ON memories USING ivfflat (embedding_1024 vector_cosine_ops) WHERE embedding_1024 IS NOT NULL;
+CREATE INDEX raw_embeddings_vec_idx     ON raw_embeddings USING hnsw (embedding      vector_cosine_ops) WITH (m = 16, ef_construction = 64) WHERE embedding      IS NOT NULL;
+CREATE INDEX raw_embeddings_vec768_idx  ON raw_embeddings USING hnsw (embedding_768  vector_cosine_ops) WITH (m = 16, ef_construction = 64) WHERE embedding_768  IS NOT NULL;
+CREATE INDEX raw_embeddings_vec1024_idx ON raw_embeddings USING hnsw (embedding_1024 vector_cosine_ops) WITH (m = 16, ef_construction = 64) WHERE embedding_1024 IS NOT NULL;
 ```
 
 Multiple nullable columns rather than one polymorphic "embedding" column because pgvector wants a typed dimension to build an index. A polymorphic JSONB-of-floats column works but loses the index. Parallel typed columns are uglier in the schema but right for the access pattern.
@@ -143,7 +143,7 @@ When the caller explicitly asks `modes=[code, general]` or `modes=all`, retrieva
 
 - **BM25 keyword search** (mode-agnostic — runs against `content_tsv`)
 - **Entity overlap** (mode-agnostic — runs against `entities[]`)
-- **Recency + importance** (mode-agnostic — pure metadata)
+- **Recency + curated weight** (mode-agnostic — no writer-supplied score)
 - **Topic-string match** if extracted topics exist
 
 You lose semantic-similarity recall but keep keyword-level recall. That's the right trade: cross-mode queries are rare, the user is explicitly bridging, and the loss is visible (a warning in the response).
@@ -234,7 +234,7 @@ Long-term, could the system *learn* new modes from clustering patterns? "I notic
 Conditions under which we'd abandon the proposal and stay with the single-register design:
 
 1. **Users only ever have one mode.** If empirically nobody declares more than `general`, the complexity isn't earning its keep — collapse back to one column.
-2. **Auto-classification keeps misclassifying.** If the LLM puts memories in the wrong mode often enough that users have to manually correct, the cognitive load is worse than just having one bucket.
+2. **Auto-classification keeps misclassifying.** If the LLM puts memories in the wrong mode often enough that users have to manually correct, the cognitive load is worse than just having one bucket. This is now survivable rather than fatal: the register lives in `derived_record_mode`, so a wrong answer is re-derived rather than frozen onto an immutable row. It used to be a column on `raw_records`, which made a misclassification permanent — and because the register partitions retrieval, the record was not merely mis-ranked but invisible.
 3. **Cross-mode queries become the common case.** If users mostly want unified retrieval, the mode boundary becomes friction, not feature.
 4. **Embedding-model quality keeps converging.** If a future general-purpose model handles code AND journal AND research equally well, the entire reason for per-mode embedders evaporates.
 
