@@ -1300,6 +1300,110 @@ pub async fn rebuild(
     result
 }
 
+/// Re-derive the edges above raw. Called by every rebuild.
+///
+/// Two of these are pure functions of what writers sent, so they are wiped and
+/// rebuilt from scratch — which is what heals a parent that arrived after its
+/// child, and what gives a bulk import its links at all.
+///
+/// The register is not. Which embedding register a record belongs to was an
+/// answer some model gave; nothing in the row can reproduce it, so existing rows
+/// are left alone and only records with no register at all get the default. A
+/// wipe here would destroy classifications permanently.
+pub async fn rederive_edges(pool: &PgPool, user_id: &str) -> AppResult<()> {
+    let mut tx = pool.begin().await?;
+
+    sqlx::query("DELETE FROM derived_link WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    // Only an unambiguous claim links. Two records sharing a source_ref under
+    // different sources is a legal corpus, and guessing between them would
+    // invent an order the writer never stated.
+    sqlx::query(
+        r#"
+        INSERT INTO derived_link (record_id, user_id, prev_id)
+        SELECT r.id, r.user_id, m.prev_id
+        FROM raw_records r
+        JOIN LATERAL (
+            SELECT (array_agg(q.id))[1] AS prev_id, count(*) AS n
+            FROM raw_records q
+            WHERE q.user_id = r.user_id
+              AND q.source_ref = r.prev_source_ref
+              AND q.id <> r.id
+        ) m ON m.n = 1
+        WHERE r.user_id = $1 AND r.prev_source_ref IS NOT NULL
+        "#,
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query("DELETE FROM derived_superseded WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO derived_superseded (record_id, user_id, superseded_by, origin)
+        SELECT r.supersedes, r.user_id, r.id, 'writer'
+        FROM raw_records r
+        WHERE r.user_id = $1 AND r.supersedes IS NOT NULL
+        ON CONFLICT (record_id) DO NOTHING
+        "#,
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    // A state identity's terminal is whichever row arrived last. Deriving it
+    // here rather than at write time is also what stops two concurrent writers
+    // both believing they are current.
+    sqlx::query(
+        r#"
+        INSERT INTO derived_superseded (record_id, user_id, superseded_by, origin)
+        SELECT prev_id, user_id, next_id, 'inferred'
+        FROM (
+            SELECT r.id AS prev_id, r.user_id,
+                   lead(r.id) OVER (
+                       PARTITION BY r.user_id, r.payload->>'kind', r.payload->>'key'
+                       ORDER BY r.event_time, r.ingest_time, r.seq
+                   ) AS next_id
+            FROM raw_records r
+            WHERE r.user_id = $1
+              AND r.type = 'state_object'
+              AND r.payload->>'kind' IS NOT NULL
+              AND r.payload->>'key' IS NOT NULL
+        ) s
+        WHERE next_id IS NOT NULL
+        ON CONFLICT (record_id) DO NOTHING
+        "#,
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO derived_record_mode
+            (record_id, user_id, mode, embedder, event_time, origin, decided_by)
+        SELECT r.id, r.user_id, m.name, m.embedder, r.event_time, 'default', 'rederive-v1'
+        FROM raw_records r
+        JOIN modes m ON m.user_id = r.user_id AND m.is_default
+        WHERE r.user_id = $1
+          AND NOT EXISTS (
+              SELECT 1 FROM derived_record_mode dm WHERE dm.record_id = r.id
+          )
+        ON CONFLICT (record_id) DO NOTHING
+        "#,
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn rebuild_inner(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -1331,6 +1435,10 @@ async fn rebuild_inner(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+
+    // Heal the edges above raw before re-deriving the curated layer, so a
+    // rebuild sees links and terminals that reflect everything that has arrived.
+    rederive_edges(pool, user_id).await?;
 
     // Re-derive across every mode bucket so a rebuild reproduces the full set.
     let buckets: Vec<(Option<String>,)> = sqlx::query_as(
@@ -2938,6 +3046,110 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(absent, 0, "an unrelated topic must still narrow");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_parent_that_arrives_late_gets_linked_on_rebuild(pool: PgPool) {
+        // The child names a parent that does not exist yet. That is a gap, not a
+        // loss — and the gap has to close when the parent shows up, or moving
+        // resolution out of raw bought nothing.
+        let child: Uuid = sqlx::query_scalar(
+            "INSERT INTO raw_records (type, content, event_time, source, source_ref,
+                                      user_id, prev_source_ref)
+             VALUES ('conversation','the reply',NOW(),'t','ref:2','alice','ref:1')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        rederive_edges(&pool, "alice").await.unwrap();
+        let linked: Option<Uuid> =
+            sqlx::query_scalar("SELECT prev_id FROM derived_link WHERE record_id = $1")
+                .bind(child)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .flatten();
+        assert_eq!(linked, None, "nothing to link to yet");
+
+        let parent: Uuid = sqlx::query_scalar(
+            "INSERT INTO raw_records (type, content, event_time, source, source_ref, user_id)
+             VALUES ('conversation','the question',NOW(),'t','ref:1','alice')
+             RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        rederive_edges(&pool, "alice").await.unwrap();
+        let healed: Option<Uuid> =
+            sqlx::query_scalar("SELECT prev_id FROM derived_link WHERE record_id = $1")
+                .bind(child)
+                .fetch_optional(&pool)
+                .await
+                .unwrap()
+                .flatten();
+        assert_eq!(healed, Some(parent), "the late parent must get linked");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn rederiving_never_destroys_a_register(pool: PgPool) {
+        // The register is the one edge nothing can recompute from the row, so a
+        // rebuild must leave it alone and only fill records that have none.
+        crate::modes::ensure_builtin_modes(&pool, "alice")
+            .await
+            .unwrap();
+        let classified: Uuid = sqlx::query_scalar(
+            "INSERT INTO raw_records (type, content, event_time, source, user_id)
+             VALUES ('document','rust borrow checker',NOW(),'t','alice') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO derived_record_mode
+                (record_id, user_id, mode, embedder, event_time, origin, decided_by)
+             SELECT $1, 'alice', 'code', m.embedder, NOW(), 'llm', 'classifier-v1'
+             FROM modes m WHERE m.user_id = 'alice' AND m.name = 'code'",
+        )
+        .bind(classified)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let bare: Uuid = sqlx::query_scalar(
+            "INSERT INTO raw_records (type, content, event_time, source, user_id)
+             VALUES ('document','no register at all',NOW(),'t','alice') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        rederive_edges(&pool, "alice").await.unwrap();
+
+        let kept: (String, String) =
+            sqlx::query_as("SELECT mode, origin FROM derived_record_mode WHERE record_id = $1")
+                .bind(classified)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kept,
+            ("code".into(), "llm".into()),
+            "a real classification survives"
+        );
+
+        let filled: (String, String) =
+            sqlx::query_as("SELECT mode, origin FROM derived_record_mode WHERE record_id = $1")
+                .bind(bare)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            filled.1, "default",
+            "a record with no register gets the default"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
