@@ -481,7 +481,11 @@ async fn main() -> Result<()> {
     let flashback_url = Arc::new(
         std::env::var("FLASHBACK_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
     );
-    let host = std::env::var("MCP_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    // Loopback unless asked otherwise. A default of 0.0.0.0 means every machine
+    // that never sets MCP_HOST publishes this port to whatever can route to it,
+    // and the ones that most need the default to be right are the ones that
+    // never touch the config.
+    let host = std::env::var("MCP_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port: u16 = std::env::var("MCP_PORT")
         .unwrap_or_else(|_| "8082".to_string())
         .parse()
@@ -519,6 +523,13 @@ async fn main() -> Result<()> {
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    if host == "0.0.0.0" {
+        tracing::warn!(
+            "listening on all interfaces ({addr}) — every host that can route here \
+             reaches this endpoint, and it holds the same memory the API does. \
+             Bind a specific address (MCP_HOST=...) unless that is intended."
+        );
+    }
     tracing::info!("flashback-mcp listening on http://{addr}/mcp");
 
     axum::serve(listener, app).await?;
