@@ -224,7 +224,9 @@ PROVIDER_REMOTE_DISTILL_TIMEOUT_MS=180000"
 
     cat > "$ENV_FILE" <<EOF
 DATABASE_URL=postgres://$DB_ROLE:$GENERATED_DB_PASSWORD@127.0.0.1:5432/$DB_NAME
-HOST=0.0.0.0
+# Loopback. Put a proxy in front for anything a browser touches; widening this
+# publishes the admin UI and the API to whatever can route to the host.
+HOST=127.0.0.1
 PORT=8080
 AUTO_MIGRATE=1
 FLASHBACK_FASTEMBED_CACHE=$INSTALL_DIR/fastembed-cache

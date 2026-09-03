@@ -11,9 +11,13 @@ Group=flashback
 WorkingDirectory=/opt/flashback
 # No secrets needed — the MCP server forwards each client's Bearer upstream.
 Environment=FLASHBACK_URL=http://127.0.0.1:8080
-Environment=MCP_HOST=0.0.0.0
 Environment=MCP_PORT=8082
 Environment=RUST_LOG=flashback_mcp=info
+# After the Environment= lines so the file can override them, and matching
+# flashback.service, which has read this file all along. MCP_HOST is deliberately
+# not set here: the binary binds loopback on its own, and widening it should take
+# an edit somebody makes on purpose rather than a default nobody sees.
+EnvironmentFile=-/opt/flashback/.env
 ExecStart=/opt/flashback/bin/flashback-mcp
 Restart=always
 RestartSec=5

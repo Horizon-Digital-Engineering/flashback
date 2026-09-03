@@ -184,7 +184,10 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         Ok(Config {
             database_url: std::env::var("DATABASE_URL").context("DATABASE_URL must be set")?,
-            host: std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string()),
+            // Loopback unless asked otherwise. Containers must set HOST=0.0.0.0
+            // explicitly — inside one, binding loopback is unreachable from the
+            // host — and docker-compose does.
+            host: std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()
@@ -260,6 +263,19 @@ mod tests {
     }
 
     // ---- listen_addr ------------------------------------------------------
+
+    #[test]
+    fn the_bind_address_defaults_to_loopback() {
+        // Every deployment that never sets HOST inherits this. Defaulting to
+        // 0.0.0.0 meant the ones least likely to notice were the ones exposed.
+        let prev = std::env::var("HOST").ok();
+        std::env::remove_var("HOST");
+        let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+        assert_eq!(host, "127.0.0.1");
+        if let Some(v) = prev {
+            std::env::set_var("HOST", v);
+        }
+    }
 
     #[test]
     fn listen_addr_joins_host_and_port() {

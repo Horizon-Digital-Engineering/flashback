@@ -52,7 +52,7 @@ sudo cp -R migrations /opt/flashback/migrations
 
 ```bash
 DATABASE_URL=postgres://flashback:<password>@127.0.0.1:5432/flashback
-HOST=0.0.0.0
+HOST=127.0.0.1
 PORT=8080
 AUTO_MIGRATE=1
 FLASHBACK_FASTEMBED_CACHE=/opt/flashback/fastembed-cache
