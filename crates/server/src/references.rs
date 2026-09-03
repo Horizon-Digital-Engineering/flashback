@@ -282,7 +282,9 @@ pub(crate) async fn put_value_inner(
     let out = ingest_record(pool, nlp, user_id, ingest).await?;
 
     if let Some(p) = prior.as_ref() {
-        crate::routes::records::derive_superseded(pool, p.id, user_id, out.id, "inferred").await?;
+        let mut conn = pool.acquire().await?;
+        crate::routes::records::derive_superseded(&mut conn, p.id, user_id, out.id, "inferred")
+            .await?;
     }
 
     get_current_inner(pool, user_id, kind, key)

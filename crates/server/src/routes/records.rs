@@ -34,8 +34,12 @@ use crate::{
 /// Record which register a record landed in. A conclusion, so it lives beside
 /// raw rather than on it — and re-deciding it is an UPSERT here instead of an
 /// impossible UPDATE on an append-only row.
+///
+/// Unlike the link and supersede edges, this one is NOT reproducible from raw:
+/// nothing in the row can recompute a model's answer. `rederive_edges` therefore
+/// preserves what is here and only fills records that have no register at all.
 pub(crate) async fn derive_record_mode(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     record_id: Uuid,
     user_id: &str,
     event_time: DateTime<Utc>,
@@ -61,16 +65,17 @@ pub(crate) async fn derive_record_mode(
     .bind(event_time)
     .bind(origin)
     .bind("ingest-v1")
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 /// Resolve the writer's claim about what preceded this record. Unresolvable is
-/// not an error and not permanent: the claim stays on the raw row, and a rebuild
-/// re-runs this, so a parent that arrives late gets linked then.
+/// not an error and not permanent: the claim stays on the raw row, and
+/// `curation::rederive_edges` rebuilds this table from those claims, so a parent
+/// that arrives late gets linked on the next rebuild.
 pub(crate) async fn derive_link(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     record_id: Uuid,
     user_id: &str,
     prev_source_ref: Option<&str>,
@@ -84,7 +89,7 @@ pub(crate) async fn derive_link(
     .bind(user_id)
     .bind(sref)
     .bind(record_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
     if ids.len() != 1 {
         tracing::debug!(prev_source_ref = %sref, matches = ids.len(), "prev unresolved for now");
@@ -97,15 +102,16 @@ pub(crate) async fn derive_link(
     .bind(record_id)
     .bind(user_id)
     .bind(ids[0])
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 /// Mark a record as no longer current. `origin` separates the writer saying so
-/// from the server working it out, so a rebuild can redo one without the other.
+/// from the server working it out; `curation::rederive_edges` rebuilds both from
+/// raw, so a rebuild is free to reach a different answer than ingest did.
 pub(crate) async fn derive_superseded(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     record_id: Uuid,
     user_id: &str,
     superseded_by: Uuid,
@@ -122,7 +128,7 @@ pub(crate) async fn derive_superseded(
     .bind(user_id)
     .bind(superseded_by)
     .bind(origin)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -296,8 +302,8 @@ pub struct IngestRecordRequest {
     #[serde(default)]
     pub supersedes: Option<Uuid>,
     /// What preceded this, in the WRITER's id space. Resolved into
-    /// `derived_link`, which re-resolves on rebuild — so a parent that arrives
-    /// late gets linked instead of leaving a permanent gap.
+    /// `derived_link`, which is rebuilt from these claims on every rebuild — so a
+    /// parent that arrives late gets linked instead of leaving a permanent gap.
     #[serde(default)]
     pub prev_source_ref: Option<String>,
     /// Metadata the SOURCE handed us, verbatim — the exporting model, a
@@ -361,7 +367,14 @@ pub(crate) async fn ingest_record(
     // project default → general. The answer is a conclusion, so it is written to
     // derived_record_mode below rather than onto the row.
     let mode = resolve_ingest_mode(pool, nlp, user_id, req.mode.as_deref(), &req.content).await;
-    let mode_origin = if req.mode.is_some() { "writer" } else { "llm" };
+    // Attribute to whoever actually decided, not to whoever asked. A caller
+    // naming an unknown register falls through to the default, and recording
+    // that as "writer" would credit them with a choice they never made.
+    let mode_origin = match (&req.mode, &mode) {
+        (Some(asked), Some(m)) if asked == &m.name => "writer",
+        (_, Some(_)) if nlp.provider_can_distill() => "llm",
+        _ => "default",
+    };
 
     let cleaned = nul_free(&req.content);
     let content_raw: Option<Vec<u8>> = cleaned.as_ref().map(|_| req.content.as_bytes().to_vec());
@@ -369,14 +382,21 @@ pub(crate) async fn ingest_record(
     let cleaned_payload = req.payload.as_ref().and_then(nul_free_json);
     let ingest_payload = cleaned_payload.as_ref().or(req.payload.as_ref());
 
+    // The raw row and the edges above it land together or not at all. Split
+    // across statements, a crash between them left a record that no mode-scoped
+    // query could ever see and that nothing would ever fix.
+    let mut tx = pool.begin().await?;
+
     // content_hash + content_tsv + ingest_time are generated/defaulted by the DB.
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO raw_records
             (id, type, content, event_time, source, source_ref,
              user_id, topic_id, thread_id, supersedes, payload,
              content_raw, prev_source_ref)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        ON CONFLICT (user_id, source, source_ref) WHERE source_ref IS NOT NULL
+        DO NOTHING
         "#,
     )
     .bind(id)
@@ -392,14 +412,39 @@ pub(crate) async fn ingest_record(
     .bind(ingest_payload)
     .bind(content_raw)
     .bind(&req.prev_source_ref)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    derive_record_mode(pool, id, user_id, event_time, mode.as_ref(), mode_origin).await?;
-    derive_link(pool, id, user_id, req.prev_source_ref.as_deref()).await?;
-    if let Some(sid) = req.supersedes {
-        derive_superseded(pool, sid, user_id, id, "writer").await?;
+    // A writer retrying after a timeout is re-sending, not duplicating. Without
+    // this the retry hit the dedup index and 500'd forever on a record that was
+    // already stored — which the README has always claimed it would not.
+    if inserted.rows_affected() == 0 {
+        tx.rollback().await?;
+        let existing: Uuid = sqlx::query_scalar(
+            "SELECT id FROM raw_records WHERE user_id = $1 AND source = $2 AND source_ref = $3",
+        )
+        .bind(user_id)
+        .bind(&req.source)
+        .bind(&req.source_ref)
+        .fetch_one(pool)
+        .await?;
+        return Ok(IngestRecordResponse { id: existing });
     }
+
+    derive_record_mode(
+        &mut *tx,
+        id,
+        user_id,
+        event_time,
+        mode.as_ref(),
+        mode_origin,
+    )
+    .await?;
+    derive_link(&mut *tx, id, user_id, req.prev_source_ref.as_deref()).await?;
+    if let Some(sid) = req.supersedes {
+        derive_superseded(&mut *tx, sid, user_id, id, "writer").await?;
+    }
+    tx.commit().await?;
 
     // Derived embedding — best-effort, in the resolved mode's geometry. Raw is
     // the source of truth; if the embedder is down a backfill job can fill the
@@ -2194,6 +2239,148 @@ mod tests {
             .unwrap();
         assert_eq!(all_ok.len(), 3, "every record is reachable from some root");
         assert!(all_ok.iter().all(|o| *o), "roots and gaps both verify");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn re_sending_a_record_returns_the_same_id_instead_of_failing(pool: PgPool) {
+        // A writer retrying after a network timeout is re-sending, not
+        // duplicating. This used to hit the dedup index and 500 forever on a
+        // record that was already safely stored.
+        let mut a = req("took 5mg lisinopril");
+        a.source_ref = Some("ritsu:conv:7".into());
+        let first = ingest_record(&pool, &StubNlp, "leslie", a).await.unwrap();
+
+        let mut b = req("took 5mg lisinopril");
+        b.source_ref = Some("ritsu:conv:7".into());
+        let second = ingest_record(&pool, &StubNlp, "leslie", b).await.unwrap();
+
+        assert_eq!(first.id, second.id, "a retry resolves to the stored record");
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM raw_records WHERE user_id = 'leslie'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(n, 1, "and does not duplicate it");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_record_and_its_register_land_together(pool: PgPool) {
+        // Split across statements, a crash between them left a record that no
+        // mode-scoped query could see and nothing would ever repair.
+        let mut r = req("some prose");
+        r.mode = Some("journal".into());
+        let id = ingest_record(&pool, &StubNlp, "leslie", r)
+            .await
+            .unwrap()
+            .id;
+
+        let mode: Option<String> =
+            sqlx::query_scalar("SELECT mode FROM derived_record_mode WHERE record_id = $1")
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(mode.as_deref(), Some("journal"), "committed with the row");
+
+        let orphans: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM raw_records r
+             WHERE r.user_id = 'leslie'
+               AND NOT EXISTS (SELECT 1 FROM derived_record_mode d WHERE d.record_id = r.id)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(orphans, 0, "no record is left without a register");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn deleting_a_row_does_not_hide_the_edits_after_it(pool: PgPool) {
+        // The cheapest attack is to delete rather than edit: a gap used to end
+        // the verifier's walk, so it returned a short all-passing list.
+        let mut ids = Vec::new();
+        for i in 1..=5 {
+            let mut r = req(&format!("turn {i}"));
+            r.source_ref = Some(format!("t:{i}"));
+            ids.push(
+                ingest_record(&pool, &StubNlp, "leslie", r)
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+
+        sqlx::query("ALTER TABLE raw_records DISABLE TRIGGER raw_records_no_mutate")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE raw_records SET content = 'forged' WHERE id = $1")
+            .bind(ids[3])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM raw_records WHERE id = $1")
+            .bind(ids[1])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE raw_records ENABLE TRIGGER raw_records_no_mutate")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rows: Vec<(Uuid, bool)> =
+            sqlx::query_as("SELECT record_id, ok FROM raw_records_verify_chain($1)")
+                .bind("leslie")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(rows.len(), 4, "every surviving row must be accounted for");
+        assert!(
+            rows.iter().any(|(id, ok)| *id == ids[3] && !ok),
+            "the forged row must still be reported after a deletion hid the walk"
+        );
+        assert!(
+            rows.iter().filter(|(_, ok)| !ok).count() >= 3,
+            "rows the walk cannot reach are unverified, not passing"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_payload_cannot_be_forged_by_changing_its_json_type(pool: PgPool) {
+        // `->>` unwraps a JSON string, so an object and a string containing that
+        // object's text used to hash identically — enough to silently revert a
+        // state value while every row still reported clean.
+        let mut r = req("dose");
+        r.payload = Some(serde_json::json!({"kind": "medication", "key": "warfarin"}));
+        let id = ingest_record(&pool, &StubNlp, "leslie", r)
+            .await
+            .unwrap()
+            .id;
+
+        sqlx::query("ALTER TABLE raw_records DISABLE TRIGGER raw_records_no_mutate")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE raw_records SET payload = to_jsonb(payload::text) WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE raw_records ENABLE TRIGGER raw_records_no_mutate")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let ok: bool = sqlx::query_scalar("SELECT ok FROM raw_records_verify_chain($1)")
+            .bind("leslie")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !ok,
+            "flipping payload from object to string must break the hash"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]

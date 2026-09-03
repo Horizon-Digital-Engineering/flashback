@@ -151,6 +151,7 @@ $$ LANGUAGE sql IMMUTABLE;
 CREATE FUNCTION raw_records_preimage(prev_hash TEXT, r JSONB)
 RETURNS TEXT AS $$
     SELECT raw_records_hash_field(COALESCE(prev_hash, ''))
+        || raw_records_hash_field(r->>'content_hash')
         || raw_records_hash_field(r->>'id')
         || raw_records_hash_field(r->>'type')
         || raw_records_hash_field(r->>'content')
@@ -165,7 +166,7 @@ RETURNS TEXT AS $$
         || raw_records_hash_field(r->>'supersedes')
         || raw_records_hash_field(r->>'prev_source_ref')
         || raw_records_hash_field(r->>'seq')
-        || raw_records_hash_field(r->>'payload');
+        || raw_records_hash_field((r->'payload')::text);
 $$ LANGUAGE sql IMMUTABLE;
 
 CREATE FUNCTION raw_records_fill_hash()
@@ -173,8 +174,12 @@ RETURNS TRIGGER AS $$
 DECLARE
     prev_hash TEXT := '';
 BEGIN
-    -- One writer at a time per user, so seq is dense and gapless. The lock is
-    -- held to end of transaction, so a bulk import takes it once, not per row.
+    -- Serialise writers for this user. The UNIQUE index on (user_id, seq) is
+    -- what actually guarantees density — under REPEATABLE READ every waiter
+    -- reads the same MAX from its own snapshot, so the lock alone would hand out
+    -- the same number to all of them and the index is what rejects the clash.
+    -- The lock is here to make that rejection rare, not to replace it.
+    -- Held to end of transaction, so a bulk import takes it once, not per row.
     PERFORM pg_advisory_xact_lock(hashtext(NEW.user_id));
     EXECUTE format(
         'SELECT COALESCE(MAX(seq), 0) + 1 FROM %I.raw_records WHERE user_id = $1',
@@ -199,14 +204,31 @@ BEGIN
         sha256(convert_to(raw_records_preimage(prev_hash, to_jsonb(NEW)), 'UTF8')), 'hex');
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+-- to_jsonb renders timestamps in the session's TimeZone and bytea per
+-- bytea_output, so without these an honest chain written under one setting fails
+-- verification under another — and a real edit becomes indistinguishable from
+-- "someone's connection was on a different clock". search_path is pinned for the
+-- same reason it matters in the verifier: an unqualified preimage call could
+-- otherwise resolve to a shadowing copy.
+SET search_path = public, pg_catalog
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex';
 
 CREATE TRIGGER raw_records_fill_hash BEFORE INSERT ON raw_records
     FOR EACH ROW EXECUTE FUNCTION raw_records_fill_hash();
 
 -- Verification walks arrival order forward from seq 1, recomputing as it goes,
--- so a tampered record invalidates every record that arrived after it. Checking
--- a row against its parent's STORED hash would miss exactly that.
+-- so a tampered record invalidates every record that arrived after it.
+--
+-- Anything the walk cannot REACH is reported as not-ok rather than omitted. That
+-- matters more than it sounds: deleting a row used to end the recursion silently
+-- and return a short, all-passing list, so the cheapest attack on the whole
+-- design was to delete a row rather than edit one.
+--
+-- The settings are pinned for the same reason as on the writer, and search_path
+-- additionally decides WHICH raw_records gets audited — unpinned, this could
+-- audit the sandbox and report the production chain clean.
 CREATE FUNCTION raw_records_verify_chain(p_user_id TEXT)
 RETURNS TABLE (record_id UUID, seq BIGINT, stored_hash TEXT, computed_hash TEXT, ok BOOLEAN) AS $$
     WITH RECURSIVE chain AS (
@@ -223,5 +245,13 @@ RETURNS TABLE (record_id UUID, seq BIGINT, stored_hash TEXT, computed_hash TEXT,
     )
     SELECT id, seq, record_hash, computed, record_hash IS NOT DISTINCT FROM computed
     FROM chain
-    ORDER BY seq;
-$$ LANGUAGE sql STABLE;
+    UNION ALL
+    SELECT r.id, r.seq, r.record_hash, NULL, false
+    FROM raw_records r
+    WHERE r.user_id = p_user_id
+      AND NOT EXISTS (SELECT 1 FROM chain c WHERE c.id = r.id)
+    ORDER BY 2;
+$$ LANGUAGE sql STABLE
+SET search_path = public, pg_catalog
+SET TimeZone = 'UTC'
+SET bytea_output = 'hex';

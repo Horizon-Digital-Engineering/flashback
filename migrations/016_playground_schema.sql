@@ -37,6 +37,10 @@ ALTER TABLE playground.entity_index
 -- reorders real memory.
 CREATE TABLE playground.ref_weights (LIKE public.ref_weights INCLUDING ALL);
 CREATE TABLE playground.modes (LIKE public.modes INCLUDING ALL);
+-- LIKE clones the table, not its rows. Without the template registers the
+-- sandbox has none at all, every resolve fails, and the one surface built to
+-- rehearse mode-scoped behaviour cannot exercise it.
+INSERT INTO playground.modes SELECT * FROM public.modes;
 
 CREATE TABLE playground.derived_record_mode (LIKE public.derived_record_mode INCLUDING ALL);
 ALTER TABLE playground.derived_record_mode
