@@ -451,6 +451,133 @@ async fn probe(url: &str) -> Result<u16> {
 #[cfg(test)]
 mod tests {
 
+    fn url_of(pool: &PgPool) -> String {
+        use sqlx::ConnectOptions;
+        pool.connect_options().to_url_lossy().to_string()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_migrated_database_reports_clean(pool: PgPool) {
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.database_url = url_of(&pool);
+        let out = check_database(&mut r, &cfg).await;
+        assert!(out.is_some());
+        assert_eq!(
+            (r.warnings, r.failures),
+            (0, 0),
+            "a healthy database should give the operator nothing to read"
+        );
+    }
+
+    #[sqlx::test]
+    async fn an_unmigrated_database_fails_unless_it_is_going_to_migrate_itself(pool: PgPool) {
+        let mut cfg = crate::testsupport::test_config();
+        cfg.database_url = url_of(&pool);
+
+        let mut r = Report::new();
+        cfg.auto_migrate = false;
+        check_database(&mut r, &cfg).await;
+        assert_eq!(
+            r.failures, 1,
+            "pending migrations with no plan to apply them"
+        );
+
+        let mut r = Report::new();
+        cfg.auto_migrate = true;
+        check_database(&mut r, &cfg).await;
+        assert_eq!(r.failures, 0);
+        assert!(r.warnings >= 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_heuristic_provider_has_nothing_to_reach(pool: PgPool) {
+        let mut r = Report::new();
+        let cfg = crate::testsupport::test_config();
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+        assert_eq!((r.warnings, r.failures), (0, 0));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_hosted_backend_with_no_key_is_a_failure(pool: PgPool) {
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.kind = ProviderKind::Remote;
+        cfg.provider.remote.api_key = String::new();
+        cfg.provider.remote.api_base = None;
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+        assert!(r.failures >= 1, "no key and a hosted default cannot work");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_reachability_probe_carries_no_credential(pool: PgPool) {
+        // The doctor is run by an operator on a box that may not be the one the
+        // key belongs to; the probe only needs to know something answers.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(true));
+        let captured = seen.clone();
+        let (base, jh) = crate::testsupport::spawn_stub(axum::Router::new().route(
+            "/",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().unwrap() = headers.contains_key("authorization");
+                    "up"
+                }
+            }),
+        ))
+        .await;
+
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.kind = ProviderKind::Remote;
+        cfg.provider.remote.api_key = "a-key".into();
+        cfg.provider.remote.api_base = Some(base);
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+
+        assert_eq!(r.failures, 0, "the endpoint answered");
+        assert!(!*seen.lock().unwrap(), "the probe sent the API key");
+        jh.abort();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unreachable_endpoint_is_a_failure_and_names_the_url(pool: PgPool) {
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.kind = ProviderKind::Remote;
+        cfg.provider.remote.api_key = "a-key".into();
+        cfg.provider.remote.api_base = Some("http://127.0.0.1:1".into());
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+        assert!(r.failures >= 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_doctor_judges_what_the_server_would_actually_run(pool: PgPool) {
+        // Settings saved through the admin page override the environment at
+        // startup. A doctor that read only the environment would report on a
+        // provider nobody is running.
+        crate::settings::save(
+            &pool,
+            &crate::settings::SystemSettings {
+                provider: Some("heuristic".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.kind = ProviderKind::Remote;
+        cfg.provider.remote.api_key = String::new();
+        cfg.provider.remote.api_base = None;
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+
+        assert_eq!(
+            r.failures, 0,
+            "the environment says remote-with-no-key, but the database says heuristic"
+        );
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn check_database_passes_on_a_migrated_database(pool: PgPool) {
         let mut r = Report::new();
