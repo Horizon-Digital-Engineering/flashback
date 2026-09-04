@@ -416,6 +416,9 @@ fn _serialize_unused_to_silence_warnings() -> Result<(), serde_json::Error> {
 }
 
 // Tiny offline tests for the parser — no network.
+
+#[derive(Serialize)]
+struct _DummySerialize;
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +460,3 @@ mod tests {
         assert!(matches!(err, Some(ProviderError::NotConfigured(_))));
     }
 }
-
-#[derive(Serialize)]
-struct _DummySerialize;

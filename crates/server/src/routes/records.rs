@@ -957,7 +957,7 @@ pub(crate) async fn assemble_inner(
         let name = req.mode.as_deref().or_else(|| {
             req.modes
                 .as_ref()
-                .and_then(|m| m.first().map(|s| s.as_str()))
+                .and_then(|m| m.first().map(String::as_str))
         });
         crate::modes::resolve_mode(pool, user_id, name, None)
             .await
@@ -1231,7 +1231,7 @@ fn is_cross_mode(req: &AssembleRequest) -> bool {
         names.push(m);
     }
     if let Some(ms) = &req.modes {
-        names.extend(ms.iter().map(|s| s.as_str()));
+        names.extend(ms.iter().map(String::as_str));
     }
     if names.iter().any(|n| n.eq_ignore_ascii_case("all")) {
         return true;

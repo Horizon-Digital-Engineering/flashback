@@ -142,6 +142,18 @@ fn build_simplicial_edges(knn: &[Vec<(usize, f32)>], m: usize) -> HashMap<(usize
 /// from `neg_samples` random others. Standard UMAP a/b for min_dist=0.1 are
 /// ~1.93 / 0.79; we use slightly looser values (1.8 / 0.8) to keep clusters
 /// visually distinct. Mutates `positions` in place.
+/// The curve shape and step size the layout is running with. Grouped because
+/// they travel together through every force function and mean nothing apart —
+/// passing them as loose floats made the call sites unreadable and let two of
+/// them be swapped without the compiler noticing.
+#[derive(Clone, Copy)]
+struct LayoutParams {
+    a: f32,
+    b: f32,
+    lr: f32,
+    neg_samples: usize,
+}
+
 fn optimize_layout_sgd(edges: &HashMap<(usize, usize), f32>, positions: &mut [[f32; 3]], m: usize) {
     let edge_list: Vec<(usize, usize, f32)> =
         edges.iter().map(|((i, j), w)| (*i, *j, *w)).collect();
@@ -155,10 +167,15 @@ fn optimize_layout_sgd(edges: &HashMap<(usize, usize), f32>, positions: &mut [[f
     let mut rng_state: u64 = 0x9E3779B97F4A7C15;
 
     for epoch in 0..n_epochs {
-        let lr = initial_lr * (1.0 - (epoch as f32 / n_epochs as f32));
+        let p = LayoutParams {
+            a,
+            b,
+            lr: initial_lr * (1.0 - (epoch as f32 / n_epochs as f32)),
+            neg_samples,
+        };
         for &(i, j, weight) in &edge_list {
-            apply_attractive_force(positions, i, j, weight, a, b, lr);
-            apply_negative_sampling(positions, i, m, neg_samples, a, b, lr, &mut rng_state);
+            apply_attractive_force(positions, i, j, weight, p);
+            apply_negative_sampling(positions, i, m, p, &mut rng_state);
         }
     }
 }
@@ -170,10 +187,9 @@ fn apply_attractive_force(
     i: usize,
     j: usize,
     weight: f32,
-    a: f32,
-    b: f32,
-    lr: f32,
+    p: LayoutParams,
 ) {
+    let LayoutParams { a, b, lr, .. } = p;
     let d2 = squared_distance(&positions[i], &positions[j]);
     let grad_coef = (-2.0 * a * b * d2.powf(b - 1.0)) / (1.0 + a * d2.powf(b));
     for k in 0..3 {
@@ -190,12 +206,15 @@ fn apply_negative_sampling(
     positions: &mut [[f32; 3]],
     i: usize,
     m: usize,
-    neg_samples: usize,
-    a: f32,
-    b: f32,
-    lr: f32,
+    p: LayoutParams,
     rng_state: &mut u64,
 ) {
+    let LayoutParams {
+        a,
+        b,
+        lr,
+        neg_samples,
+    } = p;
     for _ in 0..neg_samples {
         let rj = next_rand(rng_state) as usize % m;
         if rj == i {
@@ -516,27 +535,38 @@ fn normalize(v: &mut [f32]) {
 // Edge construction
 // ---------------------------------------------------------------------------
 
+/// Three independent passes over the same items. Kept separate because each
+/// answers a different question about a pair of records, and reading one used
+/// to mean scrolling past the other two.
 fn build_edges(items: &[GraphInput]) -> Vec<GraphEdge> {
-    let mut edges = Vec::new();
+    let mut edges = supersede_edges(items);
+    edges.extend(entity_overlap_edges(items));
+    edges.extend(same_thread_edges(items));
+    edges
+}
 
-    // 1. Supersede edges — strong; always included.
-    for it in items {
-        if let Some(prev) = it.supersedes {
-            edges.push(GraphEdge {
+/// Strong and always included: this record replaced that one.
+fn supersede_edges(items: &[GraphInput]) -> Vec<GraphEdge> {
+    items
+        .iter()
+        .filter_map(|it| {
+            it.supersedes.map(|prev| GraphEdge {
                 source: prev,
                 target: it.id,
                 kind: "supersede",
                 weight: 1.0,
-            });
-        }
-    }
+            })
+        })
+        .collect()
+}
 
-    // 2. Entity-overlap edges — Jaccard ≥ 0.4. O(n²) but bounded by N ≤ 500
-    //    (we cap items in the handler).
+/// Jaccard >= 0.4 over extracted entities. O(n^2), bounded by the handler's cap
+/// of 500 items.
+fn entity_overlap_edges(items: &[GraphInput]) -> Vec<GraphEdge> {
+    let mut edges = Vec::new();
     for i in 0..items.len() {
         for j in (i + 1)..items.len() {
-            let a = &items[i];
-            let b = &items[j];
+            let (a, b) = (&items[i], &items[j]);
             if a.entities.is_empty() || b.entities.is_empty() {
                 continue;
             }
@@ -551,16 +581,20 @@ fn build_edges(items: &[GraphInput]) -> Vec<GraphEdge> {
             }
         }
     }
+    edges
+}
 
-    // 3. Same-session edges — chronological neighbors only (avoid N² per session).
-    //    Bucket by session, sort by id (stable), connect i→i+1.
-    let mut by_session: HashMap<&str, Vec<&GraphInput>> = HashMap::new();
+/// Chronological neighbours within a thread only — connecting every pair would
+/// be quadratic per thread and would say nothing the ordering does not.
+fn same_thread_edges(items: &[GraphInput]) -> Vec<GraphEdge> {
+    let mut by_thread: HashMap<&str, Vec<&GraphInput>> = HashMap::new();
     for it in items {
-        if let Some(s) = it.thread_id.as_deref() {
-            by_session.entry(s).or_default().push(it);
+        if let Some(t) = it.thread_id.as_deref() {
+            by_thread.entry(t).or_default().push(it);
         }
     }
-    for (_s, members) in &mut by_session {
+    let mut edges = Vec::new();
+    for members in by_thread.values_mut() {
         members.sort_by_key(|m| m.id);
         for w in members.windows(2) {
             edges.push(GraphEdge {
@@ -571,13 +605,12 @@ fn build_edges(items: &[GraphInput]) -> Vec<GraphEdge> {
             });
         }
     }
-
     edges
 }
 
 fn jaccard(a: &[String], b: &[String]) -> f32 {
-    let sa: std::collections::HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
-    let sb: std::collections::HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let sa: std::collections::HashSet<&str> = a.iter().map(String::as_str).collect();
+    let sb: std::collections::HashSet<&str> = b.iter().map(String::as_str).collect();
     let inter = sa.intersection(&sb).count() as f32;
     let union = sa.union(&sb).count() as f32;
     if union == 0.0 {

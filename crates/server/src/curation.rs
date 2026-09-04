@@ -1541,7 +1541,10 @@ use edges::embed_node;
 /// insert idioms (trusted `kind` constant, `AssertSqlSafe`-free bound params,
 /// best-effort embed).
 pub(crate) mod edges {
-    use super::*;
+    use super::{AppResult, NlpService, PgPool, Scope};
+    use chrono::{DateTime, Utc};
+    use pgvector::Vector;
+    use uuid::Uuid;
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn insert_node_at_level(
@@ -1757,8 +1760,8 @@ fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
 }
 
 pub(crate) fn jaccard(a: &[String], b: &[String]) -> f32 {
-    let sa: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
-    let sb: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let sa: HashSet<&str> = a.iter().map(String::as_str).collect();
+    let sb: HashSet<&str> = b.iter().map(String::as_str).collect();
     let inter = sa.intersection(&sb).count() as f32;
     let union = sa.union(&sb).count() as f32;
     if union == 0.0 {
