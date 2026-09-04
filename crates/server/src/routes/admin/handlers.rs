@@ -1138,6 +1138,94 @@ pub async fn playground_view(
 }
 #[cfg(test)]
 mod tests {
+
+    /// Two users, one record each, so every scope assertion has something it
+    /// must NOT return as well as something it must.
+    async fn two_users(pool: &PgPool) {
+        for (u, c) in [("alice", "alice private note"), ("bob", "bob private note")] {
+            sqlx::query(
+                "INSERT INTO raw_records (type, content, event_time, source, user_id)
+                 VALUES ('document', $1, NOW(), 'test', $2)",
+            )
+            .bind(c)
+            .bind(u)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_service_scope_never_returns_another_users_records(pool: PgPool) {
+        two_users(&pool).await;
+        let q = RecordQuery::default();
+        let rows = fetch_records(&pool, "alice", &q, 50, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].content.contains("alice"));
+        assert_eq!(count_records(&pool, "alice", &q).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_operator_wildcard_sees_the_whole_estate(pool: PgPool) {
+        two_users(&pool).await;
+        let q = RecordQuery::default();
+        let rows = fetch_records(&pool, crate::auth::ALL_USERS, &q, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "an operator sees both users");
+        assert_eq!(
+            count_records(&pool, crate::auth::ALL_USERS, &q)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_user_id_that_looks_like_the_wildcard_is_still_only_itself(pool: PgPool) {
+        // The scope predicate is `$1 = '*' OR user_id = $1`. Anything that is
+        // not literally the wildcard has to fall through to the equality.
+        two_users(&pool).await;
+        let q = RecordQuery::default();
+        for probe in ["*x", "%", "alice%", "'*'", " * "] {
+            let rows = fetch_records(&pool, probe, &q, 50, 0).await.unwrap();
+            assert!(
+                rows.is_empty(),
+                "{probe:?} matched records it should not have"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn paging_does_not_repeat_or_drop_a_record(pool: PgPool) {
+        for i in 0..7 {
+            sqlx::query(
+                "INSERT INTO raw_records (type, content, event_time, source, user_id)
+                 VALUES ('document', $1, NOW() + ($2 || ' seconds')::interval, 'test', 'alice')",
+            )
+            .bind(format!("row {i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let q = RecordQuery::default();
+        let mut seen: Vec<uuid::Uuid> = Vec::new();
+        for page in 0..3 {
+            let rows = fetch_records(&pool, "alice", &q, 3, page * 3)
+                .await
+                .unwrap();
+            seen.extend(rows.iter().map(|r| r.id));
+        }
+        let total = count_records(&pool, "alice", &q).await.unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(seen.len(), 7, "three pages of three covered every record");
+        let mut uniq = seen.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), seen.len(), "a record appeared on two pages");
+    }
+
     use super::*;
     use sqlx::PgPool;
 
