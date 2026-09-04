@@ -93,24 +93,6 @@ pub async fn models(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::probe_key_allowed;
-
-    #[test]
-    fn key_travels_only_to_the_effective_base() {
-        assert!(probe_key_allowed(
-            Some("http://127.0.0.1:11434/v1"),
-            "http://127.0.0.1:11434/v1/"
-        ));
-        assert!(!probe_key_allowed(
-            Some("http://127.0.0.1:11434/v1"),
-            "https://evil.example/v1"
-        ));
-        assert!(!probe_key_allowed(None, "http://127.0.0.1:11434/v1"));
-    }
-}
-
 /// Run one real extraction through a provider built from the submitted (not
 /// yet saved) settings. Proves the endpoint + model combination works before
 /// the operator commits the pipeline to it.
@@ -187,6 +169,40 @@ pub async fn save(
     let wanted_remote = cfg.kind == ProviderKind::Remote;
     let applied = state.nlp.reconfigure_provider(&cfg).await;
 
+    let warnings = provider_warnings(&cfg, &applied).await;
+
+    Ok(Json(json!({
+        "saved": s,
+        "applied_provider": applied,
+        "applied_models": state.nlp.provider_models(),
+        "can_distill": state.nlp.provider_can_distill(),
+        "warning": (!warnings.is_empty()).then(|| warnings.join(" | ")),
+    })))
+}
+#[cfg(test)]
+mod tests {
+    use super::probe_key_allowed;
+
+    #[test]
+    fn key_travels_only_to_the_effective_base() {
+        assert!(probe_key_allowed(
+            Some("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1/"
+        ));
+        assert!(!probe_key_allowed(
+            Some("http://127.0.0.1:11434/v1"),
+            "https://evil.example/v1"
+        ));
+        assert!(!probe_key_allowed(None, "http://127.0.0.1:11434/v1"));
+    }
+}
+
+/// Everything that saved fine but will not work. Separated from the handler
+/// because it is the only part with real branching, and a caller reading `save`
+/// should see "persist, apply, then report what is wrong" rather than the
+/// model-list walk.
+async fn provider_warnings(cfg: &crate::config::ProviderConfig, applied: &str) -> Vec<String> {
+    let wanted_remote = cfg.kind == ProviderKind::Remote;
     let mut warnings: Vec<String> = Vec::new();
     if wanted_remote && applied == "heuristic" {
         warnings.push(
@@ -224,12 +240,5 @@ pub async fn save(
             }
         }
     }
-
-    Ok(Json(json!({
-        "saved": s,
-        "applied_provider": applied,
-        "applied_models": state.nlp.provider_models(),
-        "can_distill": state.nlp.provider_can_distill(),
-        "warning": (!warnings.is_empty()).then(|| warnings.join(" | ")),
-    })))
+    warnings
 }

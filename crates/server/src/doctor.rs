@@ -85,6 +85,31 @@ pub async fn run() -> Result<()> {
         );
     }
 
+    let pool = check_database(&mut r, &cfg).await;
+    check_embedding_cache(&mut r, &cfg);
+    check_provider(&mut r, &cfg, &pool).await;
+    check_server_port(&mut r, &cfg).await;
+
+    println!();
+    if r.failures > 0 {
+        println!(
+            "{} check(s) failed, {} warning(s). Fix the failures above and re-run.",
+            r.failures, r.warnings
+        );
+        // The report above is the whole message — exit non-zero without the
+        // anyhow error chain a returned Err would print on top of it.
+        std::process::exit(1);
+    } else if r.warnings > 0 {
+        println!("{} warning(s), no failures.", r.warnings);
+    } else {
+        println!("All checks passed.");
+    }
+    Ok(())
+}
+
+/// Connect, then report schema and migration state. Returns the pool so the
+/// provider check reuses it rather than opening a second connection.
+async fn check_database(r: &mut Report, cfg: &Config) -> Option<PgPool> {
     // --- Database ---------------------------------------------------------
     let pool = match connect(&cfg.database_url).await {
         Ok(pool) => {
@@ -131,6 +156,10 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    pool
+}
+
+fn check_embedding_cache(r: &mut Report, cfg: &Config) {
     // --- Embedding model cache --------------------------------------------
     match &cfg.fastembed_cache_dir {
         None => r.line(
@@ -152,7 +181,12 @@ pub async fn run() -> Result<()> {
             ),
         ),
     }
+}
 
+/// The server resolves database-stored settings over the environment at
+/// startup, so this has to judge the same effective config or it reports on a
+/// provider the server is not actually running.
+async fn check_provider(r: &mut Report, cfg: &Config, pool: &Option<PgPool>) {
     // --- AI provider ------------------------------------------------------
     // The server resolves database-stored settings over the environment at
     // startup; the doctor must judge the same effective config, or it reports
@@ -273,7 +307,9 @@ pub async fn run() -> Result<()> {
             }
         }
     }
+}
 
+async fn check_server_port(r: &mut Report, cfg: &Config) {
     // --- Is a server already running on the configured port? --------------
     match probe(&format!("http://127.0.0.1:{}/health", cfg.port)).await {
         Ok(_) => r.line(
@@ -290,22 +326,6 @@ pub async fn run() -> Result<()> {
             ),
         ),
     }
-
-    println!();
-    if r.failures > 0 {
-        println!(
-            "{} check(s) failed, {} warning(s). Fix the failures above and re-run.",
-            r.failures, r.warnings
-        );
-        // The report above is the whole message — exit non-zero without the
-        // anyhow error chain a returned Err would print on top of it.
-        std::process::exit(1);
-    } else if r.warnings > 0 {
-        println!("{} warning(s), no failures.", r.warnings);
-    } else {
-        println!("All checks passed.");
-    }
-    Ok(())
 }
 
 // --- Helpers (pool-only / pure, so they unit-test without AppState) --------

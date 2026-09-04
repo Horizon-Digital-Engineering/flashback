@@ -1091,7 +1091,7 @@ fn node_label(r: &GraphRow) -> String {
 fn preview(s: &str, n: usize) -> String {
     let cleaned: String = s
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join(" · ");
@@ -1108,6 +1108,34 @@ fn preview(s: &str, n: usize) -> String {
 #[allow(dead_code)]
 fn _hdr(_: HeaderMap) {}
 
+/// The playground page. State lives in the browser; the server only serves the
+/// shell and answers `/api/playground/turn`.
+pub async fn playground_view(
+    State(state): State<AppState>,
+    user: AuthUser,
+) -> Result<Html<String>, super::Error> {
+    // Settings are a convenience, not a precondition — a lookup failure should
+    // still render the page (with the "configure me" banner) rather than 500.
+    let settings = super::playground::load_settings(&state.pool, &user.user_id)
+        .await
+        .unwrap_or_default();
+    // What a turn would inherit when the sandbox is blank: the system
+    // provider's distill-role model. Drives the banner — "inherits X" is a
+    // note, "nothing anywhere" is the warning.
+    let (inherited, _) = super::playground::resolve_llm_settings(
+        &state.pool,
+        &state.cfg.provider,
+        &Default::default(),
+        None,
+    )
+    .await;
+    Ok(Html(views::playground_view(
+        user.scope(),
+        state.nlp.provider_can_distill(),
+        &settings,
+        inherited.map(|c| c.model),
+    )))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1439,33 +1467,4 @@ mod tests {
         assert!(p.chars().count() <= 11); // 10 + ellipsis
         assert!(p.ends_with('…'));
     }
-}
-
-/// The playground page. State lives in the browser; the server only serves the
-/// shell and answers `/api/playground/turn`.
-pub async fn playground_view(
-    State(state): State<AppState>,
-    user: AuthUser,
-) -> Result<Html<String>, super::Error> {
-    // Settings are a convenience, not a precondition — a lookup failure should
-    // still render the page (with the "configure me" banner) rather than 500.
-    let settings = super::playground::load_settings(&state.pool, &user.user_id)
-        .await
-        .unwrap_or_default();
-    // What a turn would inherit when the sandbox is blank: the system
-    // provider's distill-role model. Drives the banner — "inherits X" is a
-    // note, "nothing anywhere" is the warning.
-    let (inherited, _) = super::playground::resolve_llm_settings(
-        &state.pool,
-        &state.cfg.provider,
-        &Default::default(),
-        None,
-    )
-    .await;
-    Ok(Html(views::playground_view(
-        user.scope(),
-        state.nlp.provider_can_distill(),
-        &settings,
-        inherited.map(|c| c.model),
-    )))
 }

@@ -847,119 +847,16 @@ pub async fn distill_semantic(
         .iter()
         .filter(|c| c.len() >= 2 && c.iter().any(|&i| !episodes[i].already_distilled))
     {
-        // One EpisodeRef per EPISODE — the transcript, the unioned entities,
-        // and when it happened, so the distiller can weigh recency.
-        let refs: Vec<EpisodeRef> = cluster
-            .iter()
-            .map(|&i| EpisodeRef {
-                id: episodes[i].node_id,
-                content: episodes[i].content.clone(),
-                topic: None,
-                entities: episodes[i].entities.clone(),
-                when: episodes[i].when(),
-            })
-            .collect();
-
-        let facts = match nlp.distill_facts(&refs).await {
-            Ok(f) => f,
-            Err(first) => match nlp.distill_facts(&refs).await {
-                Ok(f) => f,
-                Err(e) => {
-                    // NOT marked as distilled — a failed cluster is retried
-                    // next pass, and the failure is a counted stat, not a
-                    // silently dropped topic.
-                    stats.clusters_failed += 1;
-                    tracing::warn!(
-                        "curation: distillation failed on cluster twice ({first}; then {e})"
-                    );
-                    continue;
-                }
-            },
-        };
-
-        // The provider answered, so this cluster is consumed — including a
-        // legitimate empty answer ("too noisy to distill"). The marker is what
-        // makes incremental passes append-only instead of re-distilling every
-        // episode forever; a session that later grows has its meta rewritten,
-        // which clears it. Singletons never reach here and stay eligible, so a
-        // future related episode can still pull them into a cluster.
-        let cluster_node_ids: Vec<Uuid> = cluster
-            .iter()
-            .filter(|&&i| !episodes[i].already_distilled)
-            .map(|&i| episodes[i].node_id)
-            .collect();
-        sqlx::query(
-            "UPDATE curated_nodes \
-             SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('distilled_at', NOW()) \
-             WHERE id = ANY($1)",
+        distill_one_cluster(
+            pool,
+            nlp,
+            scope,
+            cluster,
+            &episodes,
+            &embedder_key,
+            &mut stats,
         )
-        .bind(&cluster_node_ids)
-        .execute(pool)
         .await?;
-        if facts.is_empty() {
-            continue;
-        }
-
-        let in_cluster: HashMap<Uuid, &EpisodeNode> = cluster
-            .iter()
-            .map(|&i| (episodes[i].node_id, &episodes[i]))
-            .collect();
-
-        for fact in facts {
-            // Evidence-granularity lineage: the distiller cites the episodes a
-            // fact came from, and the fact's edges point at THOSE episodes' raw
-            // rows. A fact citing nothing valid falls back to the whole cluster
-            // rather than dropping lineage.
-            let cited: Vec<&EpisodeNode> = fact
-                .source_episode_ids
-                .iter()
-                .filter_map(|id| in_cluster.get(id).copied())
-                .collect();
-            let evidence: Vec<&EpisodeNode> = if cited.is_empty() {
-                in_cluster.values().copied().collect()
-            } else {
-                cited
-            };
-            let raw_ids: Vec<Uuid> = evidence
-                .iter()
-                .flat_map(|e| e.source_raw_ids.iter().copied())
-                .collect();
-            // A fact is dated by the newest evidence that supports it — never
-            // by the moment curation happened to run, which made every old
-            // fact look freshly minted to recency ranking.
-            let fact_time = evidence.iter().filter_map(|e| e.ended.or(e.started)).max();
-
-            let node_id = Uuid::new_v4();
-            insert_node(
-                pool,
-                node_id,
-                "semantic",
-                &fact.content,
-                scope,
-                None,
-                fact_time,
-            )
-            .await?;
-            for raw_id in &raw_ids {
-                add_edge(pool, node_id, *raw_id, "derived_from").await?;
-            }
-            // Episode-level lineage beside the raw-level edges: which curated
-            // episodes this fact was distilled from, as the distiller cited.
-            for ep in &evidence {
-                add_edge(pool, node_id, ep.node_id, "distilled_from").await?;
-            }
-            let fact_emb = embed_node(pool, nlp, scope, node_id, &fact.content).await;
-            // Temporal invalidation: the newer fact closes the validity window
-            // of any near-same-topic older fact. A closed window, never a
-            // delete — every filter already excludes superseded nodes, and a
-            // rebuild reproduces the same closures from raw.
-            if let (Some(t), Some((fdim, femb))) = (fact_time, fact_emb.as_ref()) {
-                stats.superseded +=
-                    supersede_older_facts(pool, scope, &embedder_key, node_id, t, *fdim, femb)
-                        .await?;
-            }
-            stats.distilled += 1;
-        }
     }
 
     Ok(stats)
@@ -1541,7 +1438,10 @@ use edges::embed_node;
 /// insert idioms (trusted `kind` constant, `AssertSqlSafe`-free bound params,
 /// best-effort embed).
 pub(crate) mod edges {
-    use super::*;
+    use super::{AppResult, NlpService, PgPool, Scope};
+    use chrono::{DateTime, Utc};
+    use pgvector::Vector;
+    use uuid::Uuid;
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn insert_node_at_level(
@@ -1685,6 +1585,136 @@ struct Cluster {
 /// Cluster items by cosine-to-centroid over normalized `embeddings`, falling
 /// back to entity Jaccard against the cluster seed when either side has no
 /// embedding. Returns index groups, each at most `max_size` long.
+
+/// Distil one cluster of episodes into semantic facts. Extracted so the caller
+/// reads as "load episodes, cluster them, distil each" — the loop body is the
+/// only part that talks to the model and writes nodes, and it was burying that
+/// shape under a hundred lines.
+async fn distill_one_cluster(
+    pool: &PgPool,
+    nlp: &dyn NlpService,
+    scope: &Scope,
+    cluster: &[usize],
+    episodes: &[EpisodeNode],
+    embedder_key: &str,
+    stats: &mut CurationStats,
+) -> AppResult<()> {
+    // One EpisodeRef per EPISODE — the transcript, the unioned entities,
+    // and when it happened, so the distiller can weigh recency.
+    let refs: Vec<EpisodeRef> = cluster
+        .iter()
+        .map(|&i| EpisodeRef {
+            id: episodes[i].node_id,
+            content: episodes[i].content.clone(),
+            topic: None,
+            entities: episodes[i].entities.clone(),
+            when: episodes[i].when(),
+        })
+        .collect();
+
+    let facts = match nlp.distill_facts(&refs).await {
+        Ok(f) => f,
+        Err(first) => match nlp.distill_facts(&refs).await {
+            Ok(f) => f,
+            Err(e) => {
+                // NOT marked as distilled — a failed cluster is retried
+                // next pass, and the failure is a counted stat, not a
+                // silently dropped topic.
+                stats.clusters_failed += 1;
+                tracing::warn!(
+                    "curation: distillation failed on cluster twice ({first}; then {e})"
+                );
+                return Ok(());
+            }
+        },
+    };
+
+    // The provider answered, so this cluster is consumed — including a
+    // legitimate empty answer ("too noisy to distill"). The marker is what
+    // makes incremental passes append-only instead of re-distilling every
+    // episode forever; a session that later grows has its meta rewritten,
+    // which clears it. Singletons never reach here and stay eligible, so a
+    // future related episode can still pull them into a cluster.
+    let cluster_node_ids: Vec<Uuid> = cluster
+        .iter()
+        .filter(|&&i| !episodes[i].already_distilled)
+        .map(|&i| episodes[i].node_id)
+        .collect();
+    sqlx::query(
+        "UPDATE curated_nodes \
+         SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object('distilled_at', NOW()) \
+         WHERE id = ANY($1)",
+    )
+    .bind(&cluster_node_ids)
+    .execute(pool)
+    .await?;
+    if facts.is_empty() {
+        return Ok(());
+    }
+
+    let in_cluster: HashMap<Uuid, &EpisodeNode> = cluster
+        .iter()
+        .map(|&i| (episodes[i].node_id, &episodes[i]))
+        .collect();
+
+    for fact in facts {
+        // Evidence-granularity lineage: the distiller cites the episodes a
+        // fact came from, and the fact's edges point at THOSE episodes' raw
+        // rows. A fact citing nothing valid falls back to the whole cluster
+        // rather than dropping lineage.
+        let cited: Vec<&EpisodeNode> = fact
+            .source_episode_ids
+            .iter()
+            .filter_map(|id| in_cluster.get(id).copied())
+            .collect();
+        let evidence: Vec<&EpisodeNode> = if cited.is_empty() {
+            in_cluster.values().copied().collect()
+        } else {
+            cited
+        };
+        let raw_ids: Vec<Uuid> = evidence
+            .iter()
+            .flat_map(|e| e.source_raw_ids.iter().copied())
+            .collect();
+        // A fact is dated by the newest evidence that supports it — never
+        // by the moment curation happened to run, which made every old
+        // fact look freshly minted to recency ranking.
+        let fact_time = evidence.iter().filter_map(|e| e.ended.or(e.started)).max();
+
+        let node_id = Uuid::new_v4();
+        insert_node(
+            pool,
+            node_id,
+            "semantic",
+            &fact.content,
+            scope,
+            None,
+            fact_time,
+        )
+        .await?;
+        for raw_id in &raw_ids {
+            add_edge(pool, node_id, *raw_id, "derived_from").await?;
+        }
+        // Episode-level lineage beside the raw-level edges: which curated
+        // episodes this fact was distilled from, as the distiller cited.
+        for ep in &evidence {
+            add_edge(pool, node_id, ep.node_id, "distilled_from").await?;
+        }
+        let fact_emb = embed_node(pool, nlp, scope, node_id, &fact.content).await;
+        // Temporal invalidation: the newer fact closes the validity window
+        // of any near-same-topic older fact. A closed window, never a
+        // delete — every filter already excludes superseded nodes, and a
+        // rebuild reproduces the same closures from raw.
+        if let (Some(t), Some((fdim, femb))) = (fact_time, fact_emb.as_ref()) {
+            stats.superseded +=
+                supersede_older_facts(pool, scope, embedder_key, node_id, t, *fdim, femb).await?;
+        }
+        stats.distilled += 1;
+    }
+
+    Ok(())
+}
+
 pub(crate) fn cluster_for_distill(
     embeddings: &[Option<Vec<f32>>],
     entity_sets: &[&[String]],
@@ -1694,42 +1724,16 @@ pub(crate) fn cluster_for_distill(
 ) -> Vec<Vec<usize>> {
     let mut clusters: Vec<Cluster> = Vec::new();
     for i in 0..entity_sets.len() {
-        let mut best: Option<(usize, f32)> = None;
-        for (ci, c) in clusters.iter().enumerate() {
-            if c.members.len() >= max_size {
-                continue;
-            }
-            let score = match (&embeddings[i], &c.centroid) {
-                (Some(e), Some(cen)) => l2_normalize(cen)
-                    .map(|n| dot(e, &n))
-                    .filter(|cos| *cos >= cosine_threshold),
-                _ => Some(jaccard(entity_sets[i], entity_sets[c.seed]))
-                    .filter(|j| *j >= jaccard_threshold),
-            };
-            if let Some(sc) = score {
-                if best.is_none_or(|(_, b)| sc > b) {
-                    best = Some((ci, sc));
-                }
-            }
-        }
-        match best {
-            Some((ci, _)) => {
-                let c = &mut clusters[ci];
-                if let Some(e) = &embeddings[i] {
-                    c.centroid = Some(match c.centroid.take() {
-                        Some(mut cen) => {
-                            let k = c.embedded as f32;
-                            for (m, x) in cen.iter_mut().zip(e) {
-                                *m = (*m * k + x) / (k + 1.0);
-                            }
-                            cen
-                        }
-                        None => e.clone(),
-                    });
-                    c.embedded += 1;
-                }
-                c.members.push(i);
-            }
+        match best_cluster_for(
+            i,
+            &clusters,
+            embeddings,
+            entity_sets,
+            cosine_threshold,
+            jaccard_threshold,
+            max_size,
+        ) {
+            Some(ci) => absorb_into_cluster(&mut clusters[ci], i, &embeddings[i]),
             None => clusters.push(Cluster {
                 embedded: usize::from(embeddings[i].is_some()),
                 members: vec![i],
@@ -1739,6 +1743,59 @@ pub(crate) fn cluster_for_distill(
         }
     }
     clusters.into_iter().map(|c| c.members).collect()
+}
+
+/// The best cluster item `i` could join, or None to seed its own. Cosine against
+/// the running centroid when both sides are embedded; entity overlap against the
+/// seed otherwise, so a record whose embedding failed still clusters.
+#[allow(clippy::too_many_arguments)]
+fn best_cluster_for(
+    i: usize,
+    clusters: &[Cluster],
+    embeddings: &[Option<Vec<f32>>],
+    entity_sets: &[&[String]],
+    cosine_threshold: f32,
+    jaccard_threshold: f32,
+    max_size: usize,
+) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (ci, c) in clusters.iter().enumerate() {
+        if c.members.len() >= max_size {
+            continue;
+        }
+        let score = match (&embeddings[i], &c.centroid) {
+            (Some(e), Some(cen)) => l2_normalize(cen)
+                .map(|n| dot(e, &n))
+                .filter(|cos| *cos >= cosine_threshold),
+            _ => Some(jaccard(entity_sets[i], entity_sets[c.seed]))
+                .filter(|j| *j >= jaccard_threshold),
+        };
+        if let Some(sc) = score {
+            if best.is_none_or(|(_, b)| sc > b) {
+                best = Some((ci, sc));
+            }
+        }
+    }
+    best.map(|(ci, _)| ci)
+}
+
+/// Add the item and fold its embedding into the running mean. Only embedded
+/// members move the centroid, so `embedded` counts those rather than all members.
+fn absorb_into_cluster(c: &mut Cluster, i: usize, embedding: &Option<Vec<f32>>) {
+    if let Some(e) = embedding {
+        c.centroid = Some(match c.centroid.take() {
+            Some(mut cen) => {
+                let k = c.embedded as f32;
+                for (m, x) in cen.iter_mut().zip(e) {
+                    *m = (*m * k + x) / (k + 1.0);
+                }
+                cen
+            }
+            None => e.clone(),
+        });
+        c.embedded += 1;
+    }
+    c.members.push(i);
 }
 
 fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
@@ -1757,8 +1814,8 @@ fn cluster_by_entities(episodes: &[EpisodeNode]) -> Vec<Vec<usize>> {
 }
 
 pub(crate) fn jaccard(a: &[String], b: &[String]) -> f32 {
-    let sa: HashSet<&str> = a.iter().map(|s| s.as_str()).collect();
-    let sb: HashSet<&str> = b.iter().map(|s| s.as_str()).collect();
+    let sa: HashSet<&str> = a.iter().map(String::as_str).collect();
+    let sb: HashSet<&str> = b.iter().map(String::as_str).collect();
     let inter = sa.intersection(&sb).count() as f32;
     let union = sa.union(&sb).count() as f32;
     if union == 0.0 {

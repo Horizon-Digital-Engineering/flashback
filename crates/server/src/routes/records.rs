@@ -685,37 +685,43 @@ pub(crate) async fn import_records_inner(
     }
     tx.commit().await?;
 
-    // Embed the freshly imported rows in their mode's geometry (best-effort; a
-    // backfill can retry). Group by embedder so each distinct model batches once.
-    if !inserted.is_empty() {
-        let mut by_embedder: std::collections::HashMap<String, Vec<(Uuid, String)>> =
-            std::collections::HashMap::new();
-        for (rid, content, key) in &inserted {
-            by_embedder
-                .entry(key.clone())
-                .or_default()
-                .push((*rid, content.clone()));
-        }
-        for (embedder_key, rows) in by_embedder {
-            let contents: Vec<String> = rows.iter().map(|(_, c)| c.clone()).collect();
-            // Resolve the dim once for this embedder (unknown → default 384).
-            let dim = flashback_nlp::model_for_key(&embedder_key)
-                .map(|(_, d)| d)
-                .unwrap_or(384);
-            let embs = match embed_batch_with(nlp, &embedder_key, contents).await {
-                Ok(e) if e.len() == rows.len() => e,
-                _ => continue,
-            };
-            for ((rid, _), emb) in rows.iter().zip(embs) {
-                let _ = write_raw_embedding(pool, *rid, &embedder_key, dim, emb).await;
-            }
-        }
-    }
+    embed_imported(pool, nlp, &inserted).await;
 
     Ok(ImportResponse {
         imported: inserted.len(),
         skipped: total - inserted.len(),
     })
+}
+
+/// Embed freshly imported rows in their mode's geometry. Best-effort — raw is
+/// the source of truth and a backfill can retry — and grouped by embedder so
+/// each distinct model batches once instead of once per record.
+async fn embed_imported(pool: &PgPool, nlp: &dyn NlpService, inserted: &[(Uuid, String, String)]) {
+    if inserted.is_empty() {
+        return;
+    }
+    let mut by_embedder: std::collections::HashMap<String, Vec<(Uuid, String)>> =
+        std::collections::HashMap::new();
+    for (rid, content, key) in inserted {
+        by_embedder
+            .entry(key.clone())
+            .or_default()
+            .push((*rid, content.clone()));
+    }
+    for (embedder_key, rows) in by_embedder {
+        let contents: Vec<String> = rows.iter().map(|(_, c)| c.clone()).collect();
+        // Resolve the dim once for this embedder (unknown → default 384).
+        let dim = flashback_nlp::model_for_key(&embedder_key)
+            .map(|(_, d)| d)
+            .unwrap_or(384);
+        let embs = match embed_batch_with(nlp, &embedder_key, contents).await {
+            Ok(e) if e.len() == rows.len() => e,
+            _ => continue,
+        };
+        for ((rid, _), emb) in rows.iter().zip(embs) {
+            let _ = write_raw_embedding(pool, *rid, &embedder_key, dim, emb).await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +939,48 @@ fn merge_warning(existing: Option<String>, clip: Option<String>) -> Option<Strin
     }
 }
 
+/// No query means nothing to score, so this is pure recency over raw — the
+/// backstop feed. Split out because it shares only its scope filters with the
+/// ranked path and returns before any of it.
+async fn recency_only(
+    pool: &PgPool,
+    user_id: &str,
+    req: &AssembleRequest,
+    scope_mode: &Option<String>,
+    limit: i64,
+) -> AppResult<AssembleResponse> {
+    // No query -> pure recency over raw (the backstop feed; nothing to score).
+    let sql = format!(
+        r#"
+        SELECT {COLS} FROM raw_records
+        WHERE user_id = $1
+          AND ($2::text IS NULL OR topic_id = $2)
+          AND ($3::text IS NULL OR thread_id = $3)
+          AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM derived_record_mode dm WHERE dm.record_id = raw_records.id AND dm.mode = $4))
+          AND ($6::text IS NULL OR thread_id IS DISTINCT FROM $6)
+          AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = raw_records.id)
+        ORDER BY event_time DESC
+        LIMIT $5
+        "#
+    );
+    let mut records = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
+        .bind(user_id)
+        .bind(&req.topic_id)
+        .bind(&req.thread_id)
+        .bind(&scope_mode)
+        .bind(limit)
+        .bind(&req.exclude_thread_id)
+        .fetch_all(pool)
+        .await?;
+    let clip = clamp_assembled(&mut records, limit, 0);
+    Ok(AssembleResponse {
+        synthesis: Vec::new(),
+        records,
+        degraded: false,
+        warning: clip,
+    })
+}
+
 pub(crate) async fn assemble_inner(
     pool: &PgPool,
     nlp: &dyn NlpService,
@@ -957,7 +1005,7 @@ pub(crate) async fn assemble_inner(
         let name = req.mode.as_deref().or_else(|| {
             req.modes
                 .as_ref()
-                .and_then(|m| m.first().map(|s| s.as_str()))
+                .and_then(|m| m.first().map(String::as_str))
         });
         crate::modes::resolve_mode(pool, user_id, name, None)
             .await
@@ -972,36 +1020,7 @@ pub(crate) async fn assemble_inner(
         .unwrap_or_else(|| nlp.embedder_model_name().to_string());
 
     if query.trim().is_empty() {
-        // No query -> pure recency over raw (the backstop feed; nothing to score).
-        let sql = format!(
-            r#"
-            SELECT {COLS} FROM raw_records
-            WHERE user_id = $1
-              AND ($2::text IS NULL OR topic_id = $2)
-              AND ($3::text IS NULL OR thread_id = $3)
-              AND ($4::text IS NULL OR EXISTS (SELECT 1 FROM derived_record_mode dm WHERE dm.record_id = raw_records.id AND dm.mode = $4))
-              AND ($6::text IS NULL OR thread_id IS DISTINCT FROM $6)
-              AND NOT EXISTS (SELECT 1 FROM derived_superseded d WHERE d.record_id = raw_records.id)
-            ORDER BY event_time DESC
-            LIMIT $5
-            "#
-        );
-        let mut records = sqlx::query_as::<_, RawRecordRow>(AssertSqlSafe(sql))
-            .bind(user_id)
-            .bind(&req.topic_id)
-            .bind(&req.thread_id)
-            .bind(&scope_mode)
-            .bind(limit)
-            .bind(&req.exclude_thread_id)
-            .fetch_all(pool)
-            .await?;
-        let clip = clamp_assembled(&mut records, limit, 0);
-        return Ok(AssembleResponse {
-            synthesis: Vec::new(),
-            records,
-            degraded: false,
-            warning: clip,
-        });
+        return recency_only(pool, user_id, &req, &scope_mode, limit).await;
     }
 
     // Cross-mode: no shared vector geometry — keyword(BM25) + entity + recency
@@ -1231,7 +1250,7 @@ fn is_cross_mode(req: &AssembleRequest) -> bool {
         names.push(m);
     }
     if let Some(ms) = &req.modes {
-        names.extend(ms.iter().map(|s| s.as_str()));
+        names.extend(ms.iter().map(String::as_str));
     }
     if names.iter().any(|n| n.eq_ignore_ascii_case("all")) {
         return true;

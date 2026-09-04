@@ -240,6 +240,46 @@ fn render_context_block(items: &[RetrievedItem]) -> String {
 /// content deltas as they arrive. Returns the full accumulated text plus stats.
 /// Usage numbers come from the final chunk when the server sends them
 /// (`stream_options.include_usage`); absent is fine — they're display-only.
+/// One `data:` frame from the model's SSE stream. Deltas are appended and
+/// forwarded; a usage object overwrites the token counts. Anything unparseable
+/// is skipped rather than failing the turn — a malformed frame should not lose
+/// the text that already arrived.
+async fn consume_sse_frame(
+    frame: &str,
+    text: &mut String,
+    stats: &mut LlmStats,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+) {
+    for line in frame.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+            if !delta.is_empty() {
+                text.push_str(delta);
+                // Forward as JSON so newlines and quotes survive SSE framing.
+                let _ = tx
+                    .send(
+                        Event::default().event("delta").data(
+                            serde_json::to_string(&json!({ "t": delta })).unwrap_or_default(),
+                        ),
+                    )
+                    .await;
+            }
+        }
+        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+            stats.prompt_tokens = u["prompt_tokens"].as_u64();
+            stats.completion_tokens = u["completion_tokens"].as_u64();
+        }
+    }
+}
+
 async fn call_llm_stream(
     cfg: &LlmSettings,
     messages: &[PromptMessage],
@@ -287,32 +327,7 @@ async fn call_llm_stream(
         while let Some(pos) = buf.find("\n\n") {
             let frame = buf[..pos].to_string();
             buf.drain(..pos + 2);
-            for line in frame.lines() {
-                let Some(data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-                if data.trim() == "[DONE]" {
-                    continue;
-                }
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-                    continue;
-                };
-                if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
-                    if !delta.is_empty() {
-                        text.push_str(delta);
-                        // Forward as JSON so newlines and quotes survive SSE framing.
-                        let _ = tx
-                            .send(Event::default().event("delta").data(
-                                serde_json::to_string(&json!({ "t": delta })).unwrap_or_default(),
-                            ))
-                            .await;
-                    }
-                }
-                if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                    stats.prompt_tokens = u["prompt_tokens"].as_u64();
-                    stats.completion_tokens = u["completion_tokens"].as_u64();
-                }
-            }
+            consume_sse_frame(&frame, &mut text, &mut stats, &tx).await;
         }
     }
     stats.latency_ms = started.elapsed().as_millis() as u64;
@@ -559,201 +574,6 @@ async fn run_turn(
     send("done", serde_json::to_string(&done).unwrap_or_default()).await;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn context_block_is_verbatim_and_numbered() {
-        let items = vec![RetrievedItem {
-            id: Uuid::nil(),
-            r#type: "conversation".into(),
-            source: "host:helper:user".into(),
-            content: "  the quarterly report is due friday  ".into(),
-            event_time: "2026-07-26T12:00:00+00:00".into(),
-            thread_id: Some("conv-9".into()),
-            sandbox: false,
-        }];
-        let block = render_context_block(&items);
-        assert!(block.contains("[1] (conversation, host:helper:user, 2026-07-26T12:00:00+00:00)"));
-        // Trimmed but not reworded — what you read is what the model gets.
-        assert!(block.contains("the quarterly report is due friday"));
-    }
-
-    #[test]
-    fn empty_retrieval_still_renders_a_header() {
-        assert!(render_context_block(&[]).starts_with("Relevant memories"));
-    }
-
-    #[test]
-    fn seed_lines_parse_the_optional_date_prefix() {
-        let (t, c) = parse_seed_line("2025-11-02 | switched the backup drive");
-        assert_eq!(c, "switched the backup drive");
-        assert_eq!(t.unwrap().to_rfc3339(), "2025-11-02T12:00:00+00:00");
-        let (t, c) = parse_seed_line("prefers coffee at 93C");
-        assert!(t.is_none());
-        assert_eq!(c, "prefers coffee at 93C");
-        // A pipe without a date stays content, whole.
-        let (t, c) = parse_seed_line("a | b");
-        assert!(t.is_none());
-        assert_eq!(c, "a | b");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn seeded_memories_are_sandbox_documents_with_their_dates(pool: PgPool) {
-        use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
-        struct SeedStub;
-        #[async_trait::async_trait]
-        impl crate::nlp::NlpService for SeedStub {
-            fn provider_name(&self) -> &'static str {
-                "stub"
-            }
-            fn provider_can_distill(&self) -> bool {
-                false
-            }
-            fn embedder_model_name(&self) -> &str {
-                "stub"
-            }
-            fn embedder_dimension(&self) -> usize {
-                384
-            }
-            async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
-                Ok(vec![0.1; 384])
-            }
-            async fn embed_batch(&self, t: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
-                Ok(t.iter().map(|_| vec![0.1; 384]).collect())
-            }
-            fn extract_entities(&self, _t: &str) -> Vec<String> {
-                Vec::new()
-            }
-            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
-                Ok(Extraction::empty())
-            }
-            async fn distill_facts(
-                &self,
-                _e: &[EpisodeRef],
-            ) -> Result<Vec<DistilledFact>, ProviderError> {
-                Err(ProviderError::NotConfigured("stub".into()))
-            }
-        }
-
-        let n = seed_lines(
-            &pool,
-            &SeedStub,
-            "alice",
-            "2025-11-02 | switched the backup drive\n\nprefers coffee at 93C\n",
-        )
-        .await
-        .unwrap();
-        assert_eq!(n, 2, "blank lines are skipped, not seeded");
-
-        let rows: Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
-            "SELECT content, topic_id, event_time FROM raw_records \
-             WHERE user_id = 'alice' ORDER BY content",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert_eq!(rows.len(), 2);
-        assert!(
-            rows.iter().all(|r| r.1.is_none()),
-            "seeds carry no topic — isolation is the schema, not a marker"
-        );
-        let dated = rows.iter().find(|r| r.0.contains("backup")).unwrap();
-        assert_eq!(dated.2.to_rfc3339(), "2025-11-02T12:00:00+00:00");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn llm_settings_inherit_the_system_provider_when_sandbox_is_blank(pool: PgPool) {
-        let mut env = crate::config::ProviderConfig::from_env();
-        env.kind = crate::config::ProviderKind::Heuristic;
-        env.remote.api_base = None;
-
-        // Nothing anywhere → no model, not inherited.
-        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &Settings::default(), None).await;
-        assert!(cfg.is_none());
-        assert!(!inherited);
-
-        // A system settings row → the distill-role model, marked inherited.
-        crate::settings::save(
-            &pool,
-            &crate::settings::SystemSettings {
-                provider: Some("remote".into()),
-                remote_backend: Some("openai".into()),
-                api_base: Some("http://127.0.0.1:11434/v1".into()),
-                extract_model: Some("small:3b".into()),
-                distill_model: Some("gemma4:12b".into()),
-                extract_timeout_ms: None,
-                distill_timeout_ms: None,
-            },
-        )
-        .await
-        .unwrap();
-        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &Settings::default(), None).await;
-        let cfg = cfg.expect("system provider must be inherited");
-        assert!(inherited);
-        assert_eq!(cfg.model, "gemma4:12b", "the distill role is the probe");
-        assert_eq!(cfg.base_url, "http://127.0.0.1:11434/v1");
-
-        // A sandbox override still wins.
-        let own = Settings {
-            base_url: Some("http://127.0.0.1:1234/v1".into()),
-            model: Some("probe:7b".into()),
-            ..Default::default()
-        };
-        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &own, None).await;
-        assert!(!inherited);
-        assert_eq!(cfg.unwrap().model, "probe:7b");
-    }
-
-    #[sqlx::test(migrations = "../../migrations")]
-    async fn facts_for_thread_scopes_to_the_conversation(pool: PgPool) {
-        let raw_here = Uuid::new_v4();
-        let raw_other = Uuid::new_v4();
-        for (id, thread) in [(raw_here, "here"), (raw_other, "elsewhere")] {
-            sqlx::query(
-                "INSERT INTO raw_records (id, type, content, event_time, source, user_id, thread_id) \
-                 VALUES ($1, 'conversation', 'x', NOW(), 'test', 'alice', $2)",
-            )
-            .bind(id)
-            .bind(thread)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-        for (fact, raw, content) in [
-            (Uuid::new_v4(), raw_here, "learned from here"),
-            (Uuid::new_v4(), raw_other, "learned elsewhere"),
-        ] {
-            sqlx::query(
-                "INSERT INTO curated_nodes (id, kind, content, level, user_id) \
-                 VALUES ($1, 'semantic', $2, 0, 'alice')",
-            )
-            .bind(fact)
-            .bind(content)
-            .execute(&pool)
-            .await
-            .unwrap();
-            sqlx::query(
-                "INSERT INTO curated_edges (from_id, to_id, kind) VALUES ($1, $2, 'derived_from')",
-            )
-            .bind(fact)
-            .bind(raw)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-
-        let facts = facts_for_thread(&pool, "alice", "here").await.unwrap();
-        assert_eq!(facts.len(), 1);
-        assert_eq!(facts[0].content, "learned from here");
-        assert!(facts_for_thread(&pool, "bob", "here")
-            .await
-            .unwrap()
-            .is_empty());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Seed — fill the sandbox with memories to play against.
 // ---------------------------------------------------------------------------
@@ -964,4 +784,198 @@ pub async fn save_settings(
         system_prompt,
         context_limit,
     }))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_block_is_verbatim_and_numbered() {
+        let items = vec![RetrievedItem {
+            id: Uuid::nil(),
+            r#type: "conversation".into(),
+            source: "host:helper:user".into(),
+            content: "  the quarterly report is due friday  ".into(),
+            event_time: "2026-07-26T12:00:00+00:00".into(),
+            thread_id: Some("conv-9".into()),
+            sandbox: false,
+        }];
+        let block = render_context_block(&items);
+        assert!(block.contains("[1] (conversation, host:helper:user, 2026-07-26T12:00:00+00:00)"));
+        // Trimmed but not reworded — what you read is what the model gets.
+        assert!(block.contains("the quarterly report is due friday"));
+    }
+
+    #[test]
+    fn empty_retrieval_still_renders_a_header() {
+        assert!(render_context_block(&[]).starts_with("Relevant memories"));
+    }
+
+    #[test]
+    fn seed_lines_parse_the_optional_date_prefix() {
+        let (t, c) = parse_seed_line("2025-11-02 | switched the backup drive");
+        assert_eq!(c, "switched the backup drive");
+        assert_eq!(t.unwrap().to_rfc3339(), "2025-11-02T12:00:00+00:00");
+        let (t, c) = parse_seed_line("prefers coffee at 93C");
+        assert!(t.is_none());
+        assert_eq!(c, "prefers coffee at 93C");
+        // A pipe without a date stays content, whole.
+        let (t, c) = parse_seed_line("a | b");
+        assert!(t.is_none());
+        assert_eq!(c, "a | b");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn seeded_memories_are_sandbox_documents_with_their_dates(pool: PgPool) {
+        use flashback_nlp::{DistilledFact, EpisodeRef, Extraction, ProviderError};
+        struct SeedStub;
+        #[async_trait::async_trait]
+        impl crate::nlp::NlpService for SeedStub {
+            fn provider_name(&self) -> &'static str {
+                "stub"
+            }
+            fn provider_can_distill(&self) -> bool {
+                false
+            }
+            fn embedder_model_name(&self) -> &str {
+                "stub"
+            }
+            fn embedder_dimension(&self) -> usize {
+                384
+            }
+            async fn embed_one(&self, _t: &str) -> Result<Vec<f32>, AppError> {
+                Ok(vec![0.1; 384])
+            }
+            async fn embed_batch(&self, t: Vec<String>) -> Result<Vec<Vec<f32>>, AppError> {
+                Ok(t.iter().map(|_| vec![0.1; 384]).collect())
+            }
+            fn extract_entities(&self, _t: &str) -> Vec<String> {
+                Vec::new()
+            }
+            async fn extract_full(&self, _t: &str) -> Result<Extraction, AppError> {
+                Ok(Extraction::empty())
+            }
+            async fn distill_facts(
+                &self,
+                _e: &[EpisodeRef],
+            ) -> Result<Vec<DistilledFact>, ProviderError> {
+                Err(ProviderError::NotConfigured("stub".into()))
+            }
+        }
+
+        let n = seed_lines(
+            &pool,
+            &SeedStub,
+            "alice",
+            "2025-11-02 | switched the backup drive\n\nprefers coffee at 93C\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 2, "blank lines are skipped, not seeded");
+
+        let rows: Vec<(String, Option<String>, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            "SELECT content, topic_id, event_time FROM raw_records \
+             WHERE user_id = 'alice' ORDER BY content",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|r| r.1.is_none()),
+            "seeds carry no topic — isolation is the schema, not a marker"
+        );
+        let dated = rows.iter().find(|r| r.0.contains("backup")).unwrap();
+        assert_eq!(dated.2.to_rfc3339(), "2025-11-02T12:00:00+00:00");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn llm_settings_inherit_the_system_provider_when_sandbox_is_blank(pool: PgPool) {
+        let mut env = crate::config::ProviderConfig::from_env();
+        env.kind = crate::config::ProviderKind::Heuristic;
+        env.remote.api_base = None;
+
+        // Nothing anywhere → no model, not inherited.
+        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &Settings::default(), None).await;
+        assert!(cfg.is_none());
+        assert!(!inherited);
+
+        // A system settings row → the distill-role model, marked inherited.
+        crate::settings::save(
+            &pool,
+            &crate::settings::SystemSettings {
+                provider: Some("remote".into()),
+                remote_backend: Some("openai".into()),
+                api_base: Some("http://127.0.0.1:11434/v1".into()),
+                extract_model: Some("small:3b".into()),
+                distill_model: Some("gemma4:12b".into()),
+                extract_timeout_ms: None,
+                distill_timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &Settings::default(), None).await;
+        let cfg = cfg.expect("system provider must be inherited");
+        assert!(inherited);
+        assert_eq!(cfg.model, "gemma4:12b", "the distill role is the probe");
+        assert_eq!(cfg.base_url, "http://127.0.0.1:11434/v1");
+
+        // A sandbox override still wins.
+        let own = Settings {
+            base_url: Some("http://127.0.0.1:1234/v1".into()),
+            model: Some("probe:7b".into()),
+            ..Default::default()
+        };
+        let (cfg, inherited) = resolve_llm_settings(&pool, &env, &own, None).await;
+        assert!(!inherited);
+        assert_eq!(cfg.unwrap().model, "probe:7b");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn facts_for_thread_scopes_to_the_conversation(pool: PgPool) {
+        let raw_here = Uuid::new_v4();
+        let raw_other = Uuid::new_v4();
+        for (id, thread) in [(raw_here, "here"), (raw_other, "elsewhere")] {
+            sqlx::query(
+                "INSERT INTO raw_records (id, type, content, event_time, source, user_id, thread_id) \
+                 VALUES ($1, 'conversation', 'x', NOW(), 'test', 'alice', $2)",
+            )
+            .bind(id)
+            .bind(thread)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (fact, raw, content) in [
+            (Uuid::new_v4(), raw_here, "learned from here"),
+            (Uuid::new_v4(), raw_other, "learned elsewhere"),
+        ] {
+            sqlx::query(
+                "INSERT INTO curated_nodes (id, kind, content, level, user_id) \
+                 VALUES ($1, 'semantic', $2, 0, 'alice')",
+            )
+            .bind(fact)
+            .bind(content)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO curated_edges (from_id, to_id, kind) VALUES ($1, $2, 'derived_from')",
+            )
+            .bind(fact)
+            .bind(raw)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let facts = facts_for_thread(&pool, "alice", "here").await.unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "learned from here");
+        assert!(facts_for_thread(&pool, "bob", "here")
+            .await
+            .unwrap()
+            .is_empty());
+    }
 }

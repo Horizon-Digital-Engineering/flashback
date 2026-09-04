@@ -1366,33 +1366,6 @@ pub fn esc(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A bare wall-clock string is ambiguous: the viewer reads UTC as local and
-    /// is wrong by their offset. The rendered timestamp must carry the instant
-    /// machine-readably AND label the fallback text.
-    #[test]
-    fn format_when_is_machine_readable_and_labelled() {
-        let t = DateTime::parse_from_rfc3339("2026-07-25T18:52:26Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let out = format_when(t);
-
-        assert!(out.contains(r#"datetime="2026-07-25T18:52:26+00:00""#));
-        assert!(out.contains("2026-07-25 18:52 UTC"));
-        assert!(out.contains(r#"class="ts""#));
-    }
-
-    #[test]
-    fn page_ships_the_localiser() {
-        let html = page("records", "alice", "<p>x</p>");
-        assert!(html.contains("time.ts"));
-        assert!(html.contains("toLocaleString"));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Playground — the dynamic-RAG loop, made visible.
 // ---------------------------------------------------------------------------
@@ -2059,4 +2032,30 @@ $('pg-msg').addEventListener('keydown', e => {{ if (e.key === 'Enter' && (e.meta
             .unwrap_or_default(),
     );
     page("playground", user_id, &content)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare wall-clock string is ambiguous: the viewer reads UTC as local and
+    /// is wrong by their offset. The rendered timestamp must carry the instant
+    /// machine-readably AND label the fallback text.
+    #[test]
+    fn format_when_is_machine_readable_and_labelled() {
+        let t = DateTime::parse_from_rfc3339("2026-07-25T18:52:26Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let out = format_when(t);
+
+        assert!(out.contains(r#"datetime="2026-07-25T18:52:26+00:00""#));
+        assert!(out.contains("2026-07-25 18:52 UTC"));
+        assert!(out.contains(r#"class="ts""#));
+    }
+
+    #[test]
+    fn page_ships_the_localiser() {
+        let html = page("records", "alice", "<p>x</p>");
+        assert!(html.contains("time.ts"));
+        assert!(html.contains("toLocaleString"));
+    }
 }

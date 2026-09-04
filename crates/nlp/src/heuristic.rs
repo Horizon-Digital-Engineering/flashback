@@ -69,8 +69,8 @@ fn normalize(text: &str) -> String {
 
 fn is_proper_noun_candidate(word: &str) -> bool {
     word.len() >= 2
-        && word.chars().next().is_some_and(|c| c.is_uppercase())
-        && word.chars().any(|c| c.is_lowercase())
+        && word.chars().next().is_some_and(char::is_uppercase)
+        && word.chars().any(char::is_lowercase)
 }
 
 /// Walk the tokenized stream, grouping runs of "content tokens" (alphanumeric,
@@ -94,7 +94,7 @@ fn extract_phrases(text: &str) -> Vec<String> {
             continue;
         }
         // Numbers alone don't anchor a phrase.
-        if lower.chars().all(|c| c.is_numeric()) {
+        if lower.chars().all(char::is_numeric) {
             flush(&mut current, &mut phrases, &mut seen);
             continue;
         }
@@ -119,7 +119,7 @@ static TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\w[\w'-]*\b").unwrap(
 
 /// English stopword set. Trimmed to function words + filler — kept small so
 /// it doesn't eat real content (e.g. "production", "staging" are NOT stopwords).
-static STOPWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+static STOPWORDS: Lazy<HashSet<&str>> = Lazy::new(|| {
     [
         "a",
         "an",
@@ -288,7 +288,7 @@ static STOPWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
 /// deliberately EXCLUDED from their base form — they can be modifiers in
 /// compounds like "deploy target", "build script", "switch case". Only their
 /// -ed and -ing inflections are listed (those forms are almost always verbal).
-static VERB_LIKE: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+static VERB_LIKE: Lazy<HashSet<&str>> = Lazy::new(|| {
     [
         // Abstract action verbs — all forms are verbal in conversation.
         "use",
