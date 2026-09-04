@@ -418,6 +418,175 @@ fn _arc_marker(_: Arc<()>) {}
 #[cfg(test)]
 mod tests {
 
+    async fn walled(state: crate::AppState) -> axum::Router {
+        use axum::routing::{get, post};
+        axum::Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/records",
+                get(|u: AuthUser| async move { u.user_id })
+                    .post(|u: AuthUser| async move { u.user_id }),
+            )
+            .route(
+                "/admin/x",
+                get(|u: AuthUser| async move { u.user_id })
+                    .post(|u: AuthUser| async move { u.user_id }),
+            )
+            .route("/admin/login", get(|| async { "form" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                require_bearer,
+            ))
+            .with_state(state)
+    }
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, String)],
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let mut req = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, v.clone());
+        }
+        app.clone()
+            .oneshot(req.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_wall_stands_in_both_directions(pool: PgPool) {
+        let service = mint_token(&pool, "alice", None, TokenRole::Service)
+            .await
+            .unwrap()
+            .plaintext;
+        let operator = mint_token(&pool, "op", None, TokenRole::Operator)
+            .await
+            .unwrap()
+            .plaintext;
+        let app = walled(crate::testsupport::state_from(pool)).await;
+
+        let bearer = |t: &str| vec![("authorization", format!("Bearer {t}"))];
+
+        assert_eq!(
+            send(&app, "GET", "/records", &bearer(&service)).await,
+            StatusCode::OK
+        );
+        // The admin surface is a browser one, so its refusal is a redirect to
+        // the login form rather than a JSON 401.
+        assert_eq!(
+            send(&app, "GET", "/admin/x", &bearer(&service)).await,
+            StatusCode::SEE_OTHER,
+            "a service token reached the admin UI"
+        );
+        assert_eq!(
+            send(&app, "GET", "/records", &bearer(&operator)).await,
+            StatusCode::FORBIDDEN,
+            "an operator token called the API"
+        );
+        assert_eq!(
+            send(&app, "GET", "/admin/x", &bearer(&operator)).await,
+            StatusCode::OK
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_token_that_is_missing_wrong_or_revoked_gets_nowhere(pool: PgPool) {
+        let minted = mint_token(&pool, "alice", None, TokenRole::Service)
+            .await
+            .unwrap();
+        revoke_token(&pool, minted.id).await.unwrap();
+        let app = walled(crate::testsupport::state_from(pool)).await;
+
+        assert_eq!(
+            send(&app, "GET", "/records", &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(
+                &app,
+                "GET",
+                "/records",
+                &[("authorization", "Bearer fb_not_a_real_one".into())]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            send(
+                &app,
+                "GET",
+                "/records",
+                &[("authorization", format!("Bearer {}", minted.plaintext))]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "a revoked token still worked"
+        );
+
+        assert_eq!(send(&app, "GET", "/health", &[]).await, StatusCode::OK);
+        assert_eq!(send(&app, "GET", "/admin/login", &[]).await, StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_cookie_write_from_another_site_is_refused(pool: PgPool) {
+        // The cookie rides along automatically on a cross-site request, so a
+        // page you merely visit could drive the admin API as you. A bearer
+        // token cannot be forged that way, so only the cookie is checked.
+        let operator = mint_token(&pool, "op", None, TokenRole::Operator)
+            .await
+            .unwrap()
+            .plaintext;
+        let app = walled(crate::testsupport::state_from(pool)).await;
+        let cookie = || vec![("cookie", format!("flashback_token={operator}"))];
+
+        assert_eq!(
+            send(&app, "GET", "/admin/x", &cookie()).await,
+            StatusCode::OK
+        );
+
+        let mut cross = cookie();
+        cross.push(("sec-fetch-site", "cross-site".into()));
+        assert_eq!(
+            send(&app, "POST", "/admin/x", &cross).await,
+            StatusCode::FORBIDDEN
+        );
+
+        let mut same = cookie();
+        same.push(("sec-fetch-site", "same-origin".into()));
+        assert_eq!(send(&app, "POST", "/admin/x", &same).await, StatusCode::OK);
+
+        assert_eq!(
+            send(&app, "GET", "/admin/x", &cross).await,
+            StatusCode::OK,
+            "a cross-site read is not the thing being stopped"
+        );
+
+        let mut bearer_cross = vec![("authorization", format!("Bearer {operator}"))];
+        bearer_cross.push(("sec-fetch-site", "cross-site".into()));
+        assert_eq!(
+            send(&app, "POST", "/admin/x", &bearer_cross).await,
+            StatusCode::OK,
+            "a bearer token is not ambient and needs no CSRF check"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn dev_mode_lets_everything_through_as_a_synthetic_user(pool: PgPool) {
+        let mut state = crate::testsupport::state_from(pool);
+        let mut cfg = crate::testsupport::test_config();
+        cfg.dev_mode = true;
+        state.cfg = std::sync::Arc::new(cfg);
+        let app = walled(state).await;
+
+        assert_eq!(send(&app, "GET", "/records", &[]).await, StatusCode::OK);
+        assert_eq!(send(&app, "GET", "/admin/x", &[]).await, StatusCode::OK);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn a_service_token_cannot_be_minted_as_the_wildcard(pool: PgPool) {
         // ALL_USERS is documented as reserved so "no real user_id can collide

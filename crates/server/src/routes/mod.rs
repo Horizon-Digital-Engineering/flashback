@@ -595,6 +595,83 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn a_reference_keeps_its_history_and_answers_with_the_latest(pool: PgPool) {
+        // A reference is a state_object raw record projected to a current value.
+        // Raw is append-only, so "changing" one appends and the older value has
+        // to stay readable.
+        for v in ["ship the migration", "ship the migration and the runbook"] {
+            let (code, out) = api(
+                pool.clone(),
+                "alice",
+                "POST",
+                "/records/state/plan/today",
+                Some(serde_json::json!({ "data": { "text": v } })),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{out}");
+        }
+
+        let (code, current) = api(
+            pool.clone(),
+            "alice",
+            "GET",
+            "/records/state/plan/today",
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(current.to_string().contains("and the runbook"), "{current}");
+
+        let (code, history) = api(
+            pool.clone(),
+            "alice",
+            "GET",
+            "/records/state/plan/today/history",
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        let h = history.to_string();
+        assert!(h.contains("and the runbook"));
+        assert!(
+            h.contains("ship the migration\""),
+            "the superseded value is gone from history: {h}"
+        );
+
+        let (code, listed) = api(pool.clone(), "alice", "GET", "/records/state/plan", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(listed.to_string().contains("today"));
+
+        let (code, theirs) = api(
+            pool.clone(),
+            "bob",
+            "GET",
+            "/records/state/plan/today",
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{theirs}");
+
+        let (code, empty) = api(pool, "alice", "GET", "/records/state/plan/nothing", None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{empty}");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_reference_key_that_names_nothing_is_refused(pool: PgPool) {
+        for (kind, key) in [("plan", "%20%20"), ("%20%20", "today")] {
+            let (code, _) = api(
+                pool.clone(),
+                "alice",
+                "POST",
+                &format!("/records/state/{kind}/{key}"),
+                Some(serde_json::json!({ "data": { "text": "x" } })),
+            )
+            .await;
+            assert!(code.is_client_error(), "{kind}/{key} was accepted");
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn no_route_leaks_an_internal_detail_in_its_body(pool: PgPool) {
         // A stack path, a SQL fragment or a connection string in a response body
         // is a disclosure whether or not the status code says error.
