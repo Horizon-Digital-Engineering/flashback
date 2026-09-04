@@ -93,9 +93,12 @@ fn render_nav(active: &str, user_id: &str) -> String {
   {j}
   {k}
   <span class="spacer"></span>
-  <span class="user">{user_id}</span>
+  <span class="user">{user}</span>
   <a href="/admin/logout">logout</a>
 </nav>"#,
+        // A token's user_id is arbitrary text chosen at mint, and the nav is on
+        // every admin page — unescaped here is XSS on all of them at once.
+        user = esc(user_id),
         a = item("dashboard", "/admin", "Dashboard"),
         b = item("records", "/admin/records", "Records"),
         c = item("curated", "/admin/curated", "Curated"),
@@ -1330,8 +1333,11 @@ const MAP_JS: &str = r##"<script>
 // ---------------------------------------------------------------------------
 
 pub fn type_pill(t: &str) -> String {
-    let cls = format!("pill t-{}", t);
-    format!(r#"<span class="{cls}">{t}</span>"#)
+    // Escaped because this renders curated_nodes.kind as well as raw_records.type,
+    // and only the latter is constrained by the schema. It lands in a class
+    // attribute as well as the body, so an unescaped quote breaks out of both.
+    let safe = esc(t);
+    format!(r#"<span class="pill t-{safe}">{safe}</span>"#)
 }
 
 pub fn short_id(id: Uuid) -> String {
@@ -2035,6 +2041,292 @@ $('pg-msg').addEventListener('keydown', e => {{ if (e.key === 'Enter' && (e.meta
 }
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn records_list_escapes_every_column_it_renders() {
+        let filter = RecordsFilter {
+            r#type: Some(XSS.to_string()),
+            topic_id: Some(XSS.to_string()),
+            thread_id: Some(XSS.to_string()),
+            mode: Some(XSS.to_string()),
+            include_superseded: true,
+        };
+        let modes = vec![XSS.to_string()];
+        let html = records_list(
+            "operator",
+            &filter,
+            &modes,
+            &[hostile_row()],
+            1,
+            &[(XSS.to_string(), 2)],
+        );
+        assert_no_live_script(&html, "records_list");
+    }
+
+    #[test]
+    fn records_list_renders_an_empty_state_rather_than_an_empty_table() {
+        let filter = RecordsFilter {
+            r#type: None,
+            topic_id: None,
+            thread_id: None,
+            mode: None,
+            include_superseded: false,
+        };
+        let html = records_list("operator", &filter, &[], &[], 0, &[]);
+        assert!(!html.contains("alert('pwn')"));
+        assert!(html.len() > 200, "a page is still rendered with no records");
+    }
+
+    #[test]
+    fn records_list_round_trips_the_filter_into_the_query_string() {
+        // The pager links have to carry the active filter or paging silently
+        // drops it and the operator sees a different result set on page two.
+        let filter = RecordsFilter {
+            r#type: Some("document".into()),
+            topic_id: Some("health".into()),
+            thread_id: None,
+            mode: Some("code".into()),
+            include_superseded: true,
+        };
+        let qs = build_query_string(&filter);
+        assert!(qs.contains("type=document"));
+        assert!(qs.contains("topic_id=health"));
+        assert!(qs.contains("mode=code"));
+        assert!(
+            !qs.contains("thread_id="),
+            "an unset filter is omitted, not blank"
+        );
+    }
+
+    #[test]
+    fn curated_list_escapes_derived_content() {
+        let nodes = vec![CuratedNodeView {
+            kind: XSS.to_string(),
+            content: XSS.to_string(),
+            level: 0,
+            created_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+        }];
+        assert_no_live_script(&curated_list("operator", &nodes), "curated_list");
+    }
+
+    #[test]
+    fn tokens_list_never_renders_a_secret_and_escapes_the_rest() {
+        let tokens = vec![TokenView {
+            id: Uuid::from_u128(9),
+            prefix: "fb_abc123".to_string(),
+            user_id: XSS.to_string(),
+            name: Some(XSS.to_string()),
+            created_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            last_used_at: None,
+            revoked_at: None,
+        }];
+        let html = tokens_list("operator", &tokens);
+        assert_no_live_script(&html, "tokens_list");
+        // The prefix is all that is stored; the plaintext is shown once at mint
+        // and must never come back from a listing.
+        assert!(
+            html.contains("fb_abc123"),
+            "the prefix identifies the token"
+        );
+    }
+
+    #[test]
+    fn tokens_list_distinguishes_a_revoked_token() {
+        let base = TokenView {
+            id: Uuid::from_u128(9),
+            prefix: "fb_live".to_string(),
+            user_id: "alice".to_string(),
+            name: None,
+            created_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let revoked = TokenView {
+            id: Uuid::from_u128(9),
+            prefix: "fb_dead".to_string(),
+            user_id: "alice".to_string(),
+            name: None,
+            created_at: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            last_used_at: None,
+            revoked_at: Some(Utc.with_ymd_and_hms(2026, 2, 2, 3, 4, 5).unwrap()),
+        };
+        let live_html = tokens_list("operator", &[base]);
+        let dead_html = tokens_list("operator", &[revoked]);
+        assert_ne!(live_html, dead_html, "a revoked token must not look active");
+    }
+
+    #[test]
+    fn curate_view_says_when_the_provider_cannot_distill() {
+        let counts = vec![("episodic".to_string(), 3i64)];
+        let able = curate_view("operator", &counts, true, "remote");
+        let unable = curate_view("operator", &counts, false, "heuristic");
+        assert_ne!(
+            able, unable,
+            "the page has to show that distillation is off"
+        );
+        assert!(unable.contains("heuristic"));
+    }
+
+    #[test]
+    fn curate_view_escapes_the_provider_name() {
+        assert_no_live_script(&curate_view("operator", &[], false, XSS), "curate_view");
+    }
+
+    use crate::routes::admin::handlers::RawAdminRow;
+    use chrono::TimeZone;
+
+    /// Everything a hostile record could carry, in one value.
+    const XSS: &str = r#"<script>alert('pwn')</script>&"#;
+
+    fn hostile_row() -> RawAdminRow {
+        RawAdminRow {
+            id: Uuid::from_u128(1),
+            r#type: "document".to_string(),
+            content: XSS.to_string(),
+            source: XSS.to_string(),
+            topic_id: Some(XSS.to_string()),
+            thread_id: Some(XSS.to_string()),
+            mode: Some(XSS.to_string()),
+            superseded: false,
+            state_kind: Some(XSS.to_string()),
+            state_key: Some(XSS.to_string()),
+            payload: Some(serde_json::json!({ "k": XSS })),
+            entities: vec![XSS.to_string()],
+            event_time: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+        }
+    }
+
+    fn stats() -> DashboardStats {
+        DashboardStats {
+            records_total: 1,
+            records_terminal: 1,
+            state_objects: 0,
+            curated_nodes: 0,
+            proposals_pending: 0,
+            tokens_active: 1,
+            provider: XSS.to_string(),
+            embedder_model: XSS.to_string(),
+            embedder_dim: 384,
+        }
+    }
+
+    /// The admin UI renders records a writer controls. A raw `<script>` reaching
+    /// the page is stored XSS against the operator's own session.
+    fn assert_no_live_script(html: &str, where_: &str) {
+        assert!(
+            !html.contains("<script>alert"),
+            "{where_} rendered an unescaped script tag"
+        );
+        assert!(
+            !html.contains("alert('pwn')"),
+            "{where_} rendered an unescaped single-quoted payload"
+        );
+    }
+
+    #[test]
+    fn esc_covers_every_html_metacharacter() {
+        assert_eq!(esc("&"), "&amp;");
+        assert_eq!(esc("<"), "&lt;");
+        assert_eq!(esc(">"), "&gt;");
+        assert_eq!(esc("\""), "&quot;");
+        assert_eq!(esc("'"), "&#39;");
+        assert_eq!(esc("plain"), "plain");
+        assert_eq!(esc(""), "");
+    }
+
+    #[test]
+    fn esc_handles_ampersand_first_so_entities_are_not_doubled_wrongly() {
+        // Escaping < before & would produce &amp;lt; from a literal <.
+        assert_eq!(esc("<&>"), "&lt;&amp;&gt;");
+        assert_eq!(esc("a & b < c"), "a &amp; b &lt; c");
+    }
+
+    #[test]
+    fn esc_preserves_non_ascii() {
+        assert_eq!(esc("café — 日本語 🙂"), "café — 日本語 🙂");
+    }
+
+    #[test]
+    fn dashboard_escapes_record_content() {
+        let html = dashboard("operator", stats(), &[hostile_row()]);
+        assert_no_live_script(&html, "dashboard");
+        assert!(
+            html.contains("&lt;script&gt;"),
+            "the content is still shown, escaped"
+        );
+    }
+
+    #[test]
+    fn record_detail_escapes_content_source_and_payload() {
+        let r = hostile_row();
+        let html = record_detail("operator", &r, &[]);
+        assert_no_live_script(&html, "record_detail");
+    }
+
+    #[test]
+    fn state_list_escapes_the_identity_it_renders() {
+        let html = state_list("operator", &[hostile_row()]);
+        assert_no_live_script(&html, "state_list");
+    }
+
+    #[test]
+    fn the_user_id_is_escaped_in_the_chrome() {
+        // It comes from a token, but the nav is on every page, so an unescaped
+        // user id would be XSS on all of them at once.
+        let html = page("records", XSS, "<p>body</p>");
+        assert_no_live_script(&html, "page chrome");
+    }
+
+    #[test]
+    fn login_page_escapes_the_error_it_echoes() {
+        let html = login_page(Some(XSS));
+        assert_no_live_script(&html, "login_page");
+    }
+
+    #[test]
+    fn login_page_without_an_error_renders_no_error_block() {
+        let html = login_page(None);
+        assert!(!html.contains("alert('pwn')"));
+        assert!(html.contains("<form"), "the form is still there");
+    }
+
+    #[test]
+    fn short_id_is_the_first_eight_characters() {
+        let id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+        let s = short_id(id);
+        assert_eq!(s.len(), 8);
+        assert!(id.to_string().starts_with(&s));
+    }
+
+    #[test]
+    fn type_pill_carries_the_type_as_a_class() {
+        let html = type_pill("conversation");
+        assert!(html.contains("t-conversation"));
+        assert!(html.contains(">conversation<"));
+    }
+
+    #[test]
+    fn format_when_renders_a_stable_string() {
+        let t = Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap();
+        let a = format_when(t);
+        assert_eq!(a, format_when(t), "same instant, same rendering");
+        assert!(!a.is_empty());
+    }
+
+    #[test]
+    fn the_nav_marks_the_active_page_once() {
+        let html = render_nav("records", "operator");
+        let actives = html.matches("class=\"active\"").count();
+        assert_eq!(actives, 1, "exactly one nav item is current");
+        assert!(html.contains("/admin/records"));
+    }
+
+    #[test]
+    fn map_view_reports_the_counts_it_is_given() {
+        let html = map_view("operator", 42, 17);
+        assert!(html.contains("42"));
+        assert!(html.contains("17"));
+    }
     use super::*;
 
     /// A bare wall-clock string is ambiguous: the viewer reads UTC as local and
