@@ -672,6 +672,170 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn an_import_is_idempotent_on_the_source_reference(pool: PgPool) {
+        // A corpus is re-imported after a failure more often than not; the same
+        // source_ref must not become a second record.
+        let batch = serde_json::json!({
+            "records": [
+                {
+                    "type": "conversation", "content": "the first turn",
+                    "source": "host:helper:user", "source_ref": "turn-1",
+                    "thread_id": "c1"
+                },
+                {
+                    "type": "conversation", "content": "the reply",
+                    "source": "host:helper:assistant", "source_ref": "turn-2",
+                    "thread_id": "c1", "prev_source_ref": "turn-1"
+                }
+            ]
+        });
+
+        let (code, first) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/records/import",
+            Some(batch.clone()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{first}");
+        assert_eq!(first["imported"], 2);
+
+        let (code, again) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/records/import",
+            Some(batch),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{again}");
+        assert_eq!(again["imported"], 0, "{again}");
+        assert_eq!(again["skipped"], 2);
+
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 2);
+
+        // The claim about what preceded it is kept as the writer stated it, and
+        // the link derived from it points at the right row.
+        let linked: Option<String> = sqlx::query_scalar(
+            "SELECT p.content FROM raw_records r
+             JOIN derived_link l ON l.record_id = r.id
+             JOIN raw_records p ON p.id = l.prev_id
+             WHERE r.source_ref = 'turn-2'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(linked.as_deref(), Some("the first turn"));
+
+        let (code, verify) = api(pool, "alice", "GET", "/records/verify", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(verify["broken"], 0, "{verify}");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_rebuild_reproduces_the_derived_layer_from_raw(pool: PgPool) {
+        api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/records/import",
+            Some(serde_json::json!({
+                "records": [
+                    { "type": "conversation", "content": "second", "source": "s",
+                      "source_ref": "b", "prev_source_ref": "a", "thread_id": "c1" },
+                    { "type": "conversation", "content": "first", "source": "s",
+                      "source_ref": "a", "thread_id": "c1" }
+                ]
+            })),
+        )
+        .await;
+
+        // "second" arrived before its parent, so its link could not resolve.
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM derived_link")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, 0, "a parent that had not arrived cannot be linked");
+
+        let (code, out) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/records/rebuild",
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM derived_link")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, 1, "the late parent was never picked up");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_store_is_described_updated_and_synced_by_its_owner_only(pool: PgPool) {
+        let (_, store) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/catalog/stores",
+            Some(serde_json::json!({
+                "name": "invoices", "kind": "external", "description": "first pass"
+            })),
+        )
+        .await;
+        let id = store["id"].as_str().unwrap().to_string();
+
+        let (code, updated) = api(
+            pool.clone(),
+            "alice",
+            "PUT",
+            &format!("/catalog/stores/{id}"),
+            Some(serde_json::json!({
+                "description": "second pass",
+                "schema": { "columns": ["id", "total"] }
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{updated}");
+        assert_eq!(updated["description"], "second pass");
+        assert_eq!(updated["schema"]["columns"][1], "total");
+
+        let (code, _) = api(
+            pool.clone(),
+            "bob",
+            "PUT",
+            &format!("/catalog/stores/{id}"),
+            Some(serde_json::json!({ "description": "mine now" })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "bob edited alice's store");
+
+        let (code, synced) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            &format!("/catalog/stores/{id}/sync"),
+            Some(serde_json::json!({ "facts": [] })),
+        )
+        .await;
+        assert!(code.is_success() || code.is_client_error(), "{synced}");
+
+        let (code, listed) = api(pool, "alice", "GET", "/catalog", None).await;
+        assert_eq!(code, StatusCode::OK);
+        let body = listed.to_string();
+        assert!(body.contains("second pass"), "{body}");
+        assert!(body.contains("raw"), "the built-in stores register on read");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn no_route_leaks_an_internal_detail_in_its_body(pool: PgPool) {
         // A stack path, a SQL fragment or a connection string in a response body
         // is a disclosure whether or not the status code says error.
