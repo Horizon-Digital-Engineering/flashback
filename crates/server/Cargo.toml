@@ -34,3 +34,6 @@ rand.workspace = true
 hex.workspace = true
 
 flashback-nlp = { path = "../nlp" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

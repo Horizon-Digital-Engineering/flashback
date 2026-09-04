@@ -15,6 +15,8 @@ mod references;
 mod routes;
 mod settings;
 mod summaries;
+#[cfg(test)]
+mod testsupport;
 
 use std::sync::Arc;
 

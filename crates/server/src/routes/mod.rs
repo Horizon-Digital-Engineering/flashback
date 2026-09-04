@@ -16,3 +16,59 @@ pub fn router(state: AppState) -> Router {
         .nest("/proposals", crate::proposals::router(state.clone()))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testsupport::state_from;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    async fn get(pool: PgPool, path: &str) -> StatusCode {
+        router(state_from(pool))
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn health_is_mounted_and_open(pool: PgPool) {
+        assert_eq!(get(pool, "/health").await, StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn every_subtree_is_mounted(pool: PgPool) {
+        // A nested router that silently stops being mounted looks exactly like a
+        // handler bug from the outside, so assert the paths resolve at all —
+        // 404 is the failure, anything else means routing found something.
+        for path in [
+            "/records/nope",
+            "/modes",
+            "/catalog",
+            "/proposals",
+            "/admin",
+        ] {
+            let code = get(pool.clone(), path).await;
+            assert_ne!(code, StatusCode::NOT_FOUND, "{path} is not mounted");
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unmounted_path_is_still_a_404(pool: PgPool) {
+        assert_eq!(
+            get(pool, "/definitely-not-a-route").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_api_requires_a_token(pool: PgPool) {
+        // Unauthenticated, so anything other than 401 here would mean the auth
+        // layer is not actually in front of the records routes.
+        let code = get(pool, "/records/00000000-0000-0000-0000-000000000000").await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+}

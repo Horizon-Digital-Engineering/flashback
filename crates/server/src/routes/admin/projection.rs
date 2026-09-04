@@ -155,8 +155,13 @@ struct LayoutParams {
 }
 
 fn optimize_layout_sgd(edges: &HashMap<(usize, usize), f32>, positions: &mut [[f32; 3]], m: usize) {
-    let edge_list: Vec<(usize, usize, f32)> =
+    // Sorted, not just collected. HashMap iteration order is randomised per map
+    // instance, so without this the SGD visits edges in a different order on
+    // every call and the same records land in different places — which is
+    // exactly what seeding the RNG was meant to prevent.
+    let mut edge_list: Vec<(usize, usize, f32)> =
         edges.iter().map(|((i, j), w)| (*i, *j, *w)).collect();
+    edge_list.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     let n_epochs = 200usize;
     let initial_lr = 1.0f32;
     let a = 1.8f32;
@@ -191,6 +196,13 @@ fn apply_attractive_force(
 ) {
     let LayoutParams { a, b, lr, .. } = p;
     let d2 = squared_distance(&positions[i], &positions[j]);
+    // Two records at the same point have nothing to pull together, and b < 1
+    // makes d2.powf(b - 1.0) infinite at zero — which propagates NaN through
+    // every later epoch and renders the whole map blank. The negative-sampling
+    // side already guards this; this side did not.
+    if d2 < 1e-6 {
+        return;
+    }
     let grad_coef = (-2.0 * a * b * d2.powf(b - 1.0)) / (1.0 + a * d2.powf(b));
     for k in 0..3 {
         let diff = positions[i][k] - positions[j][k];
@@ -622,6 +634,221 @@ fn jaccard(a: &[String], b: &[String]) -> f32 {
 
 #[cfg(test)]
 mod tests {
+
+    fn node(seed: u8, entities: &[&str], thread: Option<&str>) -> GraphInput {
+        // Deterministic, well-separated 8-dim embeddings so distances are stable.
+        let mut e = vec![0.0f32; 8];
+        e[(seed as usize) % 8] = 1.0;
+        e[((seed as usize) + 3) % 8] = 0.5;
+        GraphInput {
+            id: Uuid::from_u128(seed as u128 + 1),
+            embedding: e,
+            entities: entities.iter().map(|s| s.to_string()).collect(),
+            thread_id: thread.map(|t| t.to_string()),
+            supersedes: None,
+        }
+    }
+
+    #[test]
+    fn jaccard_is_intersection_over_union() {
+        let a: Vec<String> = ["x", "y", "z"].iter().map(|s| s.to_string()).collect();
+        let b: Vec<String> = ["y", "z", "w"].iter().map(|s| s.to_string()).collect();
+        assert!(
+            (jaccard(&a, &b) - 0.5).abs() < 1e-6,
+            "2 shared of 4 distinct"
+        );
+        assert_eq!(jaccard(&a, &a), 1.0);
+        assert_eq!(jaccard(&a, &[]), 0.0);
+        assert_eq!(
+            jaccard(&[], &[]),
+            0.0,
+            "empty over empty must not divide by zero"
+        );
+    }
+
+    #[test]
+    fn dot_and_normalize_agree_on_unit_length() {
+        assert_eq!(dot(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+        assert_eq!(dot(&[2.0, 3.0], &[4.0, 5.0]), 23.0);
+        let mut v = vec![3.0f32, 4.0];
+        normalize(&mut v);
+        assert!(
+            (dot(&v, &v) - 1.0).abs() < 1e-6,
+            "normalized vector has unit length"
+        );
+        let mut zero = vec![0.0f32, 0.0];
+        normalize(&mut zero);
+        assert!(
+            zero.iter().all(|x| x.is_finite()),
+            "a zero vector must not produce NaN"
+        );
+    }
+
+    #[test]
+    fn squared_distance_is_symmetric_and_zero_on_self() {
+        let p = [1.0, 2.0, 3.0];
+        let q = [4.0, 6.0, 3.0];
+        assert_eq!(squared_distance(&p, &p), 0.0);
+        assert_eq!(squared_distance(&p, &q), squared_distance(&q, &p));
+        assert!((squared_distance(&p, &q) - 25.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn next_rand_is_deterministic_and_moves() {
+        // The map must not dance between page loads, so the RNG is seeded and
+        // reproducible rather than entropy-backed.
+        let mut a = 0x9E3779B97F4A7C15u64;
+        let mut b = 0x9E3779B97F4A7C15u64;
+        let first: Vec<u64> = (0..5).map(|_| next_rand(&mut a)).collect();
+        let second: Vec<u64> = (0..5).map(|_| next_rand(&mut b)).collect();
+        assert_eq!(first, second, "same seed, same sequence");
+        assert!(
+            first.windows(2).any(|w| w[0] != w[1]),
+            "and it actually advances"
+        );
+    }
+
+    #[test]
+    fn normalize_to_cube_bounds_every_axis() {
+        let raw = vec![[-50.0, 0.0, 3.0], [100.0, -7.0, 3.0], [25.0, 12.0, 3.0]];
+        let out = normalize_to_cube(&raw);
+        assert_eq!(out.len(), 3);
+        for p in &out {
+            for k in 0..3 {
+                assert!(
+                    p[k] >= -1.001 && p[k] <= 1.001,
+                    "axis {k} out of cube: {}",
+                    p[k]
+                );
+            }
+        }
+        // A constant axis must not blow up on a zero range.
+        assert!(out.iter().all(|p| p[2].is_finite()));
+    }
+
+    #[test]
+    fn knn_cosine_ranks_nearest_first_and_excludes_self() {
+        let a = [1.0f32, 0.0, 0.0];
+        let b = [0.9f32, 0.1, 0.0];
+        let c = [0.0f32, 0.0, 1.0];
+        let embs: Vec<&[f32]> = vec![&a, &b, &c];
+        let knn = knn_cosine(&embs, 2);
+        assert_eq!(knn.len(), 3);
+        assert!(
+            knn[0].iter().all(|(j, _)| *j != 0),
+            "a node is never its own neighbour"
+        );
+        assert_eq!(knn[0][0].0, 1, "the closest vector comes first");
+    }
+
+    #[test]
+    fn supersede_edges_only_for_records_that_claim_one() {
+        let mut a = node(1, &[], None);
+        let b = node(2, &[], None);
+        a.supersedes = Some(b.id);
+        let edges = supersede_edges(&[a, b]);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].kind, "supersede");
+        assert_eq!(edges[0].weight, 1.0);
+    }
+
+    #[test]
+    fn entity_overlap_edges_respect_the_threshold() {
+        let a = node(1, &["tax", "invoice", "q3"], None);
+        let b = node(2, &["tax", "invoice", "q4"], None);
+        let c = node(3, &["gardening"], None);
+        let edges = entity_overlap_edges(&[a, b, c]);
+        assert_eq!(edges.len(), 1, "only the pair above 0.4 jaccard");
+        assert_eq!(edges[0].kind, "entity");
+        assert!(edges[0].weight >= 0.4);
+    }
+
+    #[test]
+    fn entity_overlap_skips_records_with_no_entities() {
+        let a = node(1, &[], None);
+        let b = node(2, &[], None);
+        assert!(
+            entity_overlap_edges(&[a, b]).is_empty(),
+            "empty sets are not similar"
+        );
+    }
+
+    #[test]
+    fn same_thread_edges_chain_neighbours_not_every_pair() {
+        let items = vec![
+            node(1, &[], Some("t1")),
+            node(2, &[], Some("t1")),
+            node(3, &[], Some("t1")),
+            node(4, &[], Some("t2")),
+        ];
+        let edges = same_thread_edges(&items);
+        // Three in one thread is two links, not three pairs; the lone record in
+        // its own thread links to nothing.
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|e| e.kind == "session"));
+    }
+
+    #[test]
+    fn records_with_no_thread_produce_no_thread_edges() {
+        let items = vec![node(1, &[], None), node(2, &[], None)];
+        assert!(same_thread_edges(&items).is_empty());
+    }
+
+    #[test]
+    fn build_graph_places_every_item_in_both_layouts() {
+        let items: Vec<GraphInput> = (1..=6).map(|i| node(i, &["shared"], Some("t1"))).collect();
+        let ids: Vec<Uuid> = items.iter().map(|i| i.id).collect();
+        let layout = build_graph(&items);
+        for id in &ids {
+            assert!(layout.coords.contains_key(id), "2D coord missing for {id}");
+            assert!(
+                layout.coords_3d.contains_key(id),
+                "3D coord missing for {id}"
+            );
+        }
+        for (_, (x, y)) in &layout.coords {
+            assert!(
+                x.is_finite() && y.is_finite(),
+                "layout produced a non-finite coordinate"
+            );
+        }
+        for (_, (x, y, z)) in &layout.coords_3d {
+            assert!(x.is_finite() && y.is_finite() && z.is_finite());
+        }
+    }
+
+    #[test]
+    fn build_graph_is_deterministic() {
+        // Same input, same picture — the RNG is seeded for exactly this reason.
+        let items: Vec<GraphInput> = (1..=5).map(|i| node(i, &["a"], Some("t"))).collect();
+        let first = build_graph(&items);
+        let second = build_graph(&items);
+        for (id, a) in &first.coords_3d {
+            let b = second.coords_3d.get(id).unwrap();
+            assert!(
+                (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6 && (a.2 - b.2).abs() < 1e-6
+            );
+        }
+    }
+
+    #[test]
+    fn build_graph_survives_degenerate_input() {
+        assert!(build_graph(&[]).coords.is_empty(), "no items, no coords");
+        let one = vec![node(1, &[], None)];
+        assert_eq!(
+            build_graph(&one).coords.len(),
+            1,
+            "a single item still gets placed"
+        );
+        // Identical embeddings give a zero-variance matrix; PCA must not divide
+        // by zero and the layout must stay finite.
+        let same: Vec<GraphInput> = (1..=4).map(|_| node(7, &["x"], None)).collect();
+        let layout = build_graph(&same);
+        assert!(layout
+            .coords_3d
+            .values()
+            .all(|(x, y, z)| x.is_finite() && y.is_finite() && z.is_finite()));
+    }
     use super::*;
 
     #[test]
