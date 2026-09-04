@@ -302,7 +302,7 @@ mod tests {
     use crate::config::ProviderConfig;
 
     fn env_cfg() -> ProviderConfig {
-        let mut cfg = ProviderConfig::from_env();
+        let mut cfg = ProviderConfig::from_env().unwrap();
         cfg.kind = ProviderKind::Heuristic;
         cfg.remote.backend = "openai".into();
         cfg.remote.api_base = Some("http://127.0.0.1:11434/v1".into());

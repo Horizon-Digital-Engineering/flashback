@@ -434,3 +434,83 @@ impl NlpService for Nlp {
 /// Arc-shareable handle for `AppState`. Cheap to clone. Stored as a trait
 /// object so tests can inject stubs without booting fastembed.
 pub type SharedNlp = Arc<dyn NlpService>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{EmbeddedProviderConfig, RemoteProviderConfig};
+
+    fn remote_cfg(backend: &str, api_key: &str, api_base: Option<&str>) -> SrvProviderConfig {
+        SrvProviderConfig {
+            kind: ProviderKind::Remote,
+            fallback: FallbackPolicy::Fail,
+            remote: RemoteProviderConfig {
+                backend: backend.into(),
+                api_key: api_key.into(),
+                api_base: api_base.map(str::to_string),
+                prompt_cache: true,
+                extract_model: "x-model".into(),
+                extract_max_tokens: 256,
+                extract_timeout_ms: 5000,
+                distill_model: "d-model".into(),
+                distill_max_tokens: 512,
+                distill_timeout_ms: 5000,
+            },
+            embedded: EmbeddedProviderConfig {
+                model: String::new(),
+                context_size: 0,
+                max_tokens: 0,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn the_slot_name_identifies_the_backend_the_key_was_sent_to() {
+        for (backend, name) in [
+            ("openrouter", "remote-openrouter"),
+            ("anthropic", "remote-anthropic"),
+            ("openai", "remote-openai"),
+        ] {
+            let slot = build_provider(&remote_cfg(backend, "k", None)).await;
+            assert_eq!(slot.name, name);
+            assert_eq!(
+                slot.models,
+                Some(("x-model".to_string(), "d-model".to_string()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_will_not_build_reports_itself_as_heuristic() {
+        let slot = build_provider(&remote_cfg("openrouter", "", None)).await;
+        assert_eq!(
+            slot.name, "heuristic",
+            "a hosted backend with no key cannot work, and saying so is the point"
+        );
+        assert!(
+            slot.models.is_none(),
+            "reporting the models of a provider that was never built would hide the fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_self_hosted_endpoint_needs_no_key() {
+        let slot =
+            build_provider(&remote_cfg("openai", "", Some("http://127.0.0.1:11434/v1"))).await;
+        assert_eq!(slot.name, "remote-openai");
+    }
+
+    #[tokio::test]
+    async fn the_fallback_policy_travels_with_the_provider() {
+        let mut cfg = remote_cfg("openrouter", "", None);
+        cfg.fallback = FallbackPolicy::Heuristic;
+        let slot = build_provider(&cfg).await;
+        assert_eq!(slot.fallback, FallbackPolicy::Heuristic);
+
+        cfg.kind = ProviderKind::Heuristic;
+        cfg.fallback = FallbackPolicy::Fail;
+        let slot = build_provider(&cfg).await;
+        assert_eq!(slot.name, "heuristic");
+        assert_eq!(slot.fallback, FallbackPolicy::Fail);
+    }
+}

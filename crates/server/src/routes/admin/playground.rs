@@ -1050,7 +1050,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn llm_settings_inherit_the_system_provider_when_sandbox_is_blank(pool: PgPool) {
-        let mut env = crate::config::ProviderConfig::from_env();
+        let mut env = crate::config::ProviderConfig::from_env().unwrap();
         env.kind = crate::config::ProviderKind::Heuristic;
         env.remote.api_base = None;
 

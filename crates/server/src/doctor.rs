@@ -533,7 +533,7 @@ mod tests {
     fn remote_cfg(backend: &str, api_base: Option<&str>) -> RemoteProviderConfig {
         // Reuse the env-default construction, then override the fields under
         // test, so this stays in sync with the real config shape.
-        let mut remote = ProviderConfig::from_env().remote;
+        let mut remote = ProviderConfig::from_env().unwrap().remote;
         remote.backend = backend.to_string();
         remote.api_base = api_base.map(str::to_string);
         remote
