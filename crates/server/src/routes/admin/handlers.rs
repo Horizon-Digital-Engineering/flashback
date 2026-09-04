@@ -143,7 +143,29 @@ pub struct LoginForm {
     pub token: String,
 }
 
-pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+/// True when the request reached us over TLS, so the session cookie can carry
+/// `Secure`. Setting it unconditionally would make the admin UI unusable on a
+/// plain-HTTP deployment — the browser would refuse to send the cookie back —
+/// and leaving it off behind a TLS terminator lets the same cookie ride a
+/// plain-HTTP request to the same host.
+fn arrived_over_tls(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"))
+}
+
+fn session_cookie(value: &str, max_age: &str, secure: bool) -> String {
+    let flag = if secure { "; Secure" } else { "" };
+    format!("flashback_token={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{flag}")
+}
+
+pub async fn login_submit(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let token = form.token.trim();
     if token.is_empty() {
         return Redirect::to("/admin/login?reason=bad-token").into_response();
@@ -171,8 +193,7 @@ pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginF
         return Redirect::to("/admin/login?reason=role").into_response();
     }
 
-    let cookie =
-        format!("flashback_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000");
+    let cookie = session_cookie(token, "2592000", arrived_over_tls(&headers));
     (
         StatusCode::SEE_OTHER,
         [
@@ -183,12 +204,12 @@ pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginF
         .into_response()
 }
 
-pub async fn logout() -> Response {
-    let cookie = "flashback_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+pub async fn logout(headers: axum::http::HeaderMap) -> Response {
+    let cookie = session_cookie("", "0", arrived_over_tls(&headers));
     (
         StatusCode::SEE_OTHER,
         [
-            (header::LOCATION, "/admin/login"),
+            (header::LOCATION, "/admin/login".to_string()),
             (header::SET_COOKIE, cookie),
         ],
     )
@@ -1133,6 +1154,247 @@ pub async fn playground_view(
 }
 #[cfg(test)]
 mod tests {
+
+    async fn admin(
+        pool: PgPool,
+        user: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let mut req = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(b.to_string()))
+                .unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let r = crate::testsupport::authed_router(
+            crate::testsupport::state_from(pool),
+            user,
+            crate::auth::TokenRole::Operator,
+        )
+        .oneshot(req)
+        .await
+        .unwrap();
+        let status = r.status();
+        let hs = r.headers().clone();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (status, hs, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn only_an_operator_token_opens_an_admin_session(pool: PgPool) {
+        let service =
+            crate::auth::mint_token(&pool, "alice", None, crate::auth::TokenRole::Service)
+                .await
+                .unwrap()
+                .plaintext;
+        let operator = crate::auth::mint_token(&pool, "op", None, crate::auth::TokenRole::Operator)
+            .await
+            .unwrap()
+            .plaintext;
+
+        for (token, reason) in [
+            (String::new(), "bad-token"),
+            ("fb_nonsense".to_string(), "bad-token"),
+            (service, "role"),
+        ] {
+            let (code, hs, _) = admin(
+                pool.clone(),
+                "op",
+                "POST",
+                "/admin/login",
+                &[],
+                Some(&format!("token={token}")),
+            )
+            .await;
+            assert_eq!(code, axum::http::StatusCode::SEE_OTHER);
+            let to = hs["location"].to_str().unwrap();
+            assert!(to.contains(reason), "{to} should say {reason}");
+            assert!(!hs.contains_key("set-cookie"), "a cookie was handed out");
+        }
+
+        let (code, hs, _) = admin(
+            pool.clone(),
+            "op",
+            "POST",
+            "/admin/login",
+            &[],
+            Some(&format!("token={operator}")),
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(hs["location"], "/admin");
+        let cookie = hs["set-cookie"].to_str().unwrap().to_string();
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_session_cookie_is_secure_exactly_when_the_request_was(pool: PgPool) {
+        let operator = crate::auth::mint_token(&pool, "op", None, crate::auth::TokenRole::Operator)
+            .await
+            .unwrap()
+            .plaintext;
+        let body = format!("token={operator}");
+
+        let (_, hs, _) = admin(pool.clone(), "op", "POST", "/admin/login", &[], Some(&body)).await;
+        assert!(
+            !hs["set-cookie"].to_str().unwrap().contains("Secure"),
+            "a Secure cookie is never sent back over plain HTTP, which locks the operator out"
+        );
+
+        let (_, hs, _) = admin(
+            pool.clone(),
+            "op",
+            "POST",
+            "/admin/login",
+            &[("x-forwarded-proto", "https")],
+            Some(&body),
+        )
+        .await;
+        assert!(hs["set-cookie"].to_str().unwrap().contains("Secure"));
+
+        let (_, hs, _) = admin(
+            pool,
+            "op",
+            "GET",
+            "/admin/logout",
+            &[("x-forwarded-proto", "https, http")],
+            None,
+        )
+        .await;
+        let cleared = hs["set-cookie"].to_str().unwrap();
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(
+            cleared.contains("Secure"),
+            "the clearing cookie has to match the one it clears: {cleared}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_login_form_says_why_it_turned_you_away(pool: PgPool) {
+        for (reason, needle) in [
+            ("unauth", "expired"),
+            ("bad-token", "invalid or revoked"),
+            ("role", "operator token"),
+        ] {
+            let (code, _, body) = admin(
+                pool.clone(),
+                "op",
+                "GET",
+                &format!("/admin/login?reason={reason}"),
+                &[],
+                None,
+            )
+            .await;
+            assert_eq!(code, axum::http::StatusCode::OK);
+            assert!(body.contains(needle), "{reason}: {body}");
+        }
+
+        let (_, _, plain) = admin(pool, "op", "GET", "/admin/login", &[], None).await;
+        assert!(!plain.contains("expired"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_operator_can_revoke_a_token_from_the_page(pool: PgPool) {
+        let minted = crate::auth::mint_token(
+            &pool,
+            "alice",
+            Some("laptop"),
+            crate::auth::TokenRole::Service,
+        )
+        .await
+        .unwrap();
+
+        let (code, _, listed) = admin(pool.clone(), "op", "GET", "/admin/tokens", &[], None).await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert!(listed.contains("laptop"));
+        assert!(
+            !listed.contains(&minted.plaintext),
+            "the page reprinted a token"
+        );
+
+        let (code, _, _) = admin(
+            pool.clone(),
+            "op",
+            "POST",
+            &format!("/admin/tokens/{}/revoke", minted.id),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::SEE_OTHER);
+        assert!(crate::auth::validate_token(&pool, &minted.plaintext)
+            .await
+            .is_err());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_curation_trigger_runs_a_pass_and_sends_you_to_the_page(pool: PgPool) {
+        let (code, hs, body) =
+            admin(pool.clone(), "op", "POST", "/admin/api/curate", &[], None).await;
+        assert_eq!(code, axum::http::StatusCode::SEE_OTHER, "{body}");
+        assert_eq!(hs["location"], "/admin/curate");
+
+        let (code, _, page) = admin(pool, "op", "GET", "/admin/curate", &[], None).await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert!(!page.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_map_json_is_shaped_for_the_page_that_draws_it(pool: PgPool) {
+        let state = crate::testsupport::state_from(pool.clone());
+        for c in [
+            "the backup drive is in the safe",
+            "the report is due friday",
+        ] {
+            crate::routes::records::ingest_record(
+                &state.pool,
+                &*state.nlp,
+                "alice",
+                crate::routes::records::IngestRecordRequest {
+                    r#type: "document".into(),
+                    content: c.into(),
+                    event_time: None,
+                    source: "test".into(),
+                    source_ref: None,
+                    topic_id: None,
+                    thread_id: Some("c1".into()),
+                    mode: None,
+                    supersedes: None,
+                    prev_source_ref: None,
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let (code, _, body) = admin(pool, "alice", "GET", "/admin/api/map.json", &[], None).await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let nodes = v["nodes"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 2, "{body}");
+        for n in nodes {
+            for coord in ["x", "y", "x3", "y3", "z3"] {
+                let f = n[coord].as_f64().unwrap_or(f64::NAN);
+                assert!(f.is_finite(), "{coord} was {f}: {n}");
+            }
+            assert!(n["label"].is_string());
+        }
+    }
 
     /// Two users, one record each, so every scope assertion has something it
     /// must NOT return as well as something it must.
