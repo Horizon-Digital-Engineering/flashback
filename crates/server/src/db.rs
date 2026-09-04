@@ -190,6 +190,132 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../../migrations")]
+    async fn each_twin_matches_its_production_table(pool: PgPool) {
+        let twins: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename FROM pg_tables WHERE schemaname='playground' ORDER BY tablename",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(!twins.is_empty());
+
+        for t in &twins {
+            let cols: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT table_schema, column_name, data_type FROM information_schema.columns
+                 WHERE table_name = $1 AND table_schema IN ('public','playground')
+                 ORDER BY table_schema, column_name",
+            )
+            .bind(t)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let public: Vec<_> = cols
+                .iter()
+                .filter(|c| c.0 == "public")
+                .map(|c| (&c.1, &c.2))
+                .collect();
+            let sandbox: Vec<_> = cols
+                .iter()
+                .filter(|c| c.0 == "playground")
+                .map(|c| (&c.1, &c.2))
+                .collect();
+            assert_eq!(
+                public, sandbox,
+                "playground.{t} has drifted from public.{t}"
+            );
+
+            let triggers: Vec<(String, String)> = sqlx::query_as(
+                "SELECT n.nspname::text, t.tgname::text FROM pg_trigger t
+                 JOIN pg_class c ON c.oid = t.tgrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relname = $1 AND n.nspname IN ('public','playground')
+                   AND NOT t.tgisinternal ORDER BY n.nspname, t.tgname",
+            )
+            .bind(t)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            let public: Vec<&String> = triggers
+                .iter()
+                .filter(|x| x.0 == "public")
+                .map(|x| &x.1)
+                .collect();
+            let sandbox: Vec<&String> = triggers
+                .iter()
+                .filter(|x| x.0 == "playground")
+                .map(|x| &x.1)
+                .collect();
+            assert_eq!(
+                public, sandbox,
+                "playground.{t} does not enforce what public.{t} enforces"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn no_sandbox_key_points_at_real_data(pool: PgPool) {
+        let crossings: Vec<(String, String)> = sqlx::query_as(
+            "SELECT c.conname::text, tn.nspname::text
+             FROM pg_constraint c
+             JOIN pg_class t ON t.oid = c.conrelid
+             JOIN pg_namespace n ON n.oid = t.relnamespace
+             JOIN pg_class tt ON tt.oid = c.confrelid
+             JOIN pg_namespace tn ON tn.oid = tt.relnamespace
+             WHERE c.contype = 'f' AND n.nspname = 'playground'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let leaking: Vec<_> = crossings
+            .iter()
+            .filter(|(_, ns)| ns != "playground")
+            .collect();
+        assert!(
+            leaking.is_empty(),
+            "sandbox keys reference production rows: {leaking:?}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn every_foreign_key_public_has_the_sandbox_has_too(pool: PgPool) {
+        let fks: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT n.nspname::text, t.relname::text,
+                    pg_get_constraintdef(c.oid)
+             FROM pg_constraint c
+             JOIN pg_class t ON t.oid = c.conrelid
+             JOIN pg_namespace n ON n.oid = t.relnamespace
+             WHERE c.contype = 'f' AND n.nspname IN ('public','playground')",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let twins: Vec<String> =
+            sqlx::query_scalar("SELECT tablename FROM pg_tables WHERE schemaname='playground'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        for t in &twins {
+            let mut want: Vec<String> = fks
+                .iter()
+                .filter(|(ns, tab, _)| ns == "public" && tab == t)
+                .map(|(_, _, def)| def.clone())
+                .collect();
+            let mut got: Vec<String> = fks
+                .iter()
+                .filter(|(ns, tab, _)| ns == "playground" && tab == t)
+                .map(|(_, _, def)| def.replace("playground.", ""))
+                .collect();
+            want.sort();
+            got.sort();
+            assert_eq!(
+                want, got,
+                "playground.{t} does not enforce the same references as public.{t}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
     async fn migrate_creates_pgvector_extension(pool: PgPool) {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')",

@@ -143,7 +143,29 @@ pub struct LoginForm {
     pub token: String,
 }
 
-pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+/// True when the request reached us over TLS, so the session cookie can carry
+/// `Secure`. Setting it unconditionally would make the admin UI unusable on a
+/// plain-HTTP deployment — the browser would refuse to send the cookie back —
+/// and leaving it off behind a TLS terminator lets the same cookie ride a
+/// plain-HTTP request to the same host.
+fn arrived_over_tls(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .is_some_and(|p| p.trim().eq_ignore_ascii_case("https"))
+}
+
+fn session_cookie(value: &str, max_age: &str, secure: bool) -> String {
+    let flag = if secure { "; Secure" } else { "" };
+    format!("flashback_token={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{flag}")
+}
+
+pub async fn login_submit(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let token = form.token.trim();
     if token.is_empty() {
         return Redirect::to("/admin/login?reason=bad-token").into_response();
@@ -171,8 +193,7 @@ pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginF
         return Redirect::to("/admin/login?reason=role").into_response();
     }
 
-    let cookie =
-        format!("flashback_token={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000");
+    let cookie = session_cookie(token, "2592000", arrived_over_tls(&headers));
     (
         StatusCode::SEE_OTHER,
         [
@@ -183,12 +204,12 @@ pub async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginF
         .into_response()
 }
 
-pub async fn logout() -> Response {
-    let cookie = "flashback_token=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+pub async fn logout(headers: axum::http::HeaderMap) -> Response {
+    let cookie = session_cookie("", "0", arrived_over_tls(&headers));
     (
         StatusCode::SEE_OTHER,
         [
-            (header::LOCATION, "/admin/login"),
+            (header::LOCATION, "/admin/login".to_string()),
             (header::SET_COOKIE, cookie),
         ],
     )
@@ -835,7 +856,6 @@ pub async fn map_data(
                 "type": n.type_,
                 "label": n.label,
                 "content": n.content,
-                "importance": n.importance,
                 "superseded": n.superseded,
                 "x": n.x,
                 "y": n.y,
@@ -940,7 +960,6 @@ pub(crate) struct MapNode {
     pub type_: String,
     pub label: String,
     pub content: String,
-    pub importance: f32,
     pub superseded: bool,
     pub x: f32,
     pub y: f32,
@@ -953,7 +972,6 @@ struct GraphRow {
     id: Uuid,
     r#type: String,
     content: String,
-    importance: f32,
     superseded: bool,
     thread_id: Option<String>,
     supersedes: Option<Uuid>,
@@ -1008,7 +1026,6 @@ async fn compute_graph_with_layout(
                 type_: r.r#type,
                 label,
                 content,
-                importance: r.importance,
                 superseded: r.superseded,
                 x,
                 y,
@@ -1031,7 +1048,6 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
         id: Uuid,
         r#type: String,
         content: String,
-        importance: Option<f32>,
         superseded: bool,
         thread_id: Option<String>,
         supersedes: Option<Uuid>,
@@ -1040,7 +1056,8 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
     }
     let rows = sqlx::query_as::<_, Row>(
         r#"
-        SELECT r.id, r.type, r.content, r.importance, r.thread_id, r.supersedes, r.state_key,
+        SELECT r.id, r.type, r.content, r.thread_id, r.supersedes,
+               r.payload->>'key' AS state_key,
                EXISTS (
                    SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id
                ) AS superseded,
@@ -1063,7 +1080,6 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
             id: r.id,
             r#type: r.r#type,
             content: r.content,
-            importance: r.importance.unwrap_or(0.5),
             superseded: r.superseded,
             thread_id: r.thread_id,
             supersedes: r.supersedes,
@@ -1138,6 +1154,335 @@ pub async fn playground_view(
 }
 #[cfg(test)]
 mod tests {
+
+    async fn admin(
+        pool: PgPool,
+        user: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> (axum::http::StatusCode, axum::http::HeaderMap, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let mut req = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(b.to_string()))
+                .unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let r = crate::testsupport::authed_router(
+            crate::testsupport::state_from(pool),
+            user,
+            crate::auth::TokenRole::Operator,
+        )
+        .oneshot(req)
+        .await
+        .unwrap();
+        let status = r.status();
+        let hs = r.headers().clone();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (status, hs, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn only_an_operator_token_opens_an_admin_session(pool: PgPool) {
+        let service =
+            crate::auth::mint_token(&pool, "alice", None, crate::auth::TokenRole::Service)
+                .await
+                .unwrap()
+                .plaintext;
+        let operator = crate::auth::mint_token(&pool, "op", None, crate::auth::TokenRole::Operator)
+            .await
+            .unwrap()
+            .plaintext;
+
+        for (token, reason) in [
+            (String::new(), "bad-token"),
+            ("fb_nonsense".to_string(), "bad-token"),
+            (service, "role"),
+        ] {
+            let (code, hs, _) = admin(
+                pool.clone(),
+                "op",
+                "POST",
+                "/admin/login",
+                &[],
+                Some(&format!("token={token}")),
+            )
+            .await;
+            assert_eq!(code, axum::http::StatusCode::SEE_OTHER);
+            let to = hs["location"].to_str().unwrap();
+            assert!(to.contains(reason), "{to} should say {reason}");
+            assert!(!hs.contains_key("set-cookie"), "a cookie was handed out");
+        }
+
+        let (code, hs, _) = admin(
+            pool.clone(),
+            "op",
+            "POST",
+            "/admin/login",
+            &[],
+            Some(&format!("token={operator}")),
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::SEE_OTHER);
+        assert_eq!(hs["location"], "/admin");
+        let cookie = hs["set-cookie"].to_str().unwrap().to_string();
+        assert!(cookie.contains("HttpOnly"), "{cookie}");
+        assert!(cookie.contains("SameSite=Lax"), "{cookie}");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_session_cookie_is_secure_exactly_when_the_request_was(pool: PgPool) {
+        let operator = crate::auth::mint_token(&pool, "op", None, crate::auth::TokenRole::Operator)
+            .await
+            .unwrap()
+            .plaintext;
+        let body = format!("token={operator}");
+
+        let (_, hs, _) = admin(pool.clone(), "op", "POST", "/admin/login", &[], Some(&body)).await;
+        assert!(
+            !hs["set-cookie"].to_str().unwrap().contains("Secure"),
+            "a Secure cookie is never sent back over plain HTTP, which locks the operator out"
+        );
+
+        let (_, hs, _) = admin(
+            pool.clone(),
+            "op",
+            "POST",
+            "/admin/login",
+            &[("x-forwarded-proto", "https")],
+            Some(&body),
+        )
+        .await;
+        assert!(hs["set-cookie"].to_str().unwrap().contains("Secure"));
+
+        let (_, hs, _) = admin(
+            pool,
+            "op",
+            "GET",
+            "/admin/logout",
+            &[("x-forwarded-proto", "https, http")],
+            None,
+        )
+        .await;
+        let cleared = hs["set-cookie"].to_str().unwrap();
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(
+            cleared.contains("Secure"),
+            "the clearing cookie has to match the one it clears: {cleared}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_login_form_says_why_it_turned_you_away(pool: PgPool) {
+        for (reason, needle) in [
+            ("unauth", "expired"),
+            ("bad-token", "invalid or revoked"),
+            ("role", "operator token"),
+        ] {
+            let (code, _, body) = admin(
+                pool.clone(),
+                "op",
+                "GET",
+                &format!("/admin/login?reason={reason}"),
+                &[],
+                None,
+            )
+            .await;
+            assert_eq!(code, axum::http::StatusCode::OK);
+            assert!(body.contains(needle), "{reason}: {body}");
+        }
+
+        let (_, _, plain) = admin(pool, "op", "GET", "/admin/login", &[], None).await;
+        assert!(!plain.contains("expired"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_operator_can_revoke_a_token_from_the_page(pool: PgPool) {
+        let minted = crate::auth::mint_token(
+            &pool,
+            "alice",
+            Some("laptop"),
+            crate::auth::TokenRole::Service,
+        )
+        .await
+        .unwrap();
+
+        let (code, _, listed) = admin(pool.clone(), "op", "GET", "/admin/tokens", &[], None).await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert!(listed.contains("laptop"));
+        assert!(
+            !listed.contains(&minted.plaintext),
+            "the page reprinted a token"
+        );
+
+        let (code, _, _) = admin(
+            pool.clone(),
+            "op",
+            "POST",
+            &format!("/admin/tokens/{}/revoke", minted.id),
+            &[],
+            None,
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::SEE_OTHER);
+        assert!(crate::auth::validate_token(&pool, &minted.plaintext)
+            .await
+            .is_err());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_curation_trigger_runs_a_pass_and_sends_you_to_the_page(pool: PgPool) {
+        let (code, hs, body) =
+            admin(pool.clone(), "op", "POST", "/admin/api/curate", &[], None).await;
+        assert_eq!(code, axum::http::StatusCode::SEE_OTHER, "{body}");
+        assert_eq!(hs["location"], "/admin/curate");
+
+        let (code, _, page) = admin(pool, "op", "GET", "/admin/curate", &[], None).await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert!(!page.is_empty());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_map_json_is_shaped_for_the_page_that_draws_it(pool: PgPool) {
+        let state = crate::testsupport::state_from(pool.clone());
+        for c in [
+            "the backup drive is in the safe",
+            "the report is due friday",
+        ] {
+            crate::routes::records::ingest_record(
+                &state.pool,
+                &*state.nlp,
+                "alice",
+                crate::routes::records::IngestRecordRequest {
+                    r#type: "document".into(),
+                    content: c.into(),
+                    event_time: None,
+                    source: "test".into(),
+                    source_ref: None,
+                    topic_id: None,
+                    thread_id: Some("c1".into()),
+                    mode: None,
+                    supersedes: None,
+                    prev_source_ref: None,
+                    payload: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let (code, _, body) = admin(pool, "alice", "GET", "/admin/api/map.json", &[], None).await;
+        assert_eq!(code, axum::http::StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let nodes = v["nodes"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 2, "{body}");
+        for n in nodes {
+            for coord in ["x", "y", "x3", "y3", "z3"] {
+                let f = n[coord].as_f64().unwrap_or(f64::NAN);
+                assert!(f.is_finite(), "{coord} was {f}: {n}");
+            }
+            assert!(n["label"].is_string());
+        }
+    }
+
+    /// Two users, one record each, so every scope assertion has something it
+    /// must NOT return as well as something it must.
+    async fn two_users(pool: &PgPool) {
+        for (u, c) in [("alice", "alice private note"), ("bob", "bob private note")] {
+            sqlx::query(
+                "INSERT INTO raw_records (type, content, event_time, source, user_id)
+                 VALUES ('document', $1, NOW(), 'test', $2)",
+            )
+            .bind(c)
+            .bind(u)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_service_scope_never_returns_another_users_records(pool: PgPool) {
+        two_users(&pool).await;
+        let q = RecordQuery::default();
+        let rows = fetch_records(&pool, "alice", &q, 50, 0).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].content.contains("alice"));
+        assert_eq!(count_records(&pool, "alice", &q).await.unwrap(), 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_operator_wildcard_sees_the_whole_estate(pool: PgPool) {
+        two_users(&pool).await;
+        let q = RecordQuery::default();
+        let rows = fetch_records(&pool, crate::auth::ALL_USERS, &q, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "an operator sees both users");
+        assert_eq!(
+            count_records(&pool, crate::auth::ALL_USERS, &q)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_user_id_that_looks_like_the_wildcard_is_still_only_itself(pool: PgPool) {
+        // The scope predicate is `$1 = '*' OR user_id = $1`. Anything that is
+        // not literally the wildcard has to fall through to the equality.
+        two_users(&pool).await;
+        let q = RecordQuery::default();
+        for probe in ["*x", "%", "alice%", "'*'", " * "] {
+            let rows = fetch_records(&pool, probe, &q, 50, 0).await.unwrap();
+            assert!(
+                rows.is_empty(),
+                "{probe:?} matched records it should not have"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn paging_does_not_repeat_or_drop_a_record(pool: PgPool) {
+        for i in 0..7 {
+            sqlx::query(
+                "INSERT INTO raw_records (type, content, event_time, source, user_id)
+                 VALUES ('document', $1, NOW() + ($2 || ' seconds')::interval, 'test', 'alice')",
+            )
+            .bind(format!("row {i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let q = RecordQuery::default();
+        let mut seen: Vec<uuid::Uuid> = Vec::new();
+        for page in 0..3 {
+            let rows = fetch_records(&pool, "alice", &q, 3, page * 3)
+                .await
+                .unwrap();
+            seen.extend(rows.iter().map(|r| r.id));
+        }
+        let total = count_records(&pool, "alice", &q).await.unwrap();
+        assert_eq!(total, 7);
+        assert_eq!(seen.len(), 7, "three pages of three covered every record");
+        let mut uniq = seen.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), seen.len(), "a record appeared on two pages");
+    }
+
     use super::*;
     use sqlx::PgPool;
 

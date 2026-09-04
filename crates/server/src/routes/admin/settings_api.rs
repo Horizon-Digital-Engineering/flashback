@@ -166,7 +166,6 @@ pub async fn save(
     settings::save(&state.pool, &s).await?;
 
     let cfg = settings::resolve(&state.cfg.provider, &s);
-    let wanted_remote = cfg.kind == ProviderKind::Remote;
     let applied = state.nlp.reconfigure_provider(&cfg).await;
 
     let warnings = provider_warnings(&cfg, &applied).await;
@@ -181,7 +180,210 @@ pub async fn save(
 }
 #[cfg(test)]
 mod tests {
-    use super::probe_key_allowed;
+    use super::*;
+    use crate::testsupport::{spawn_stub, state_from};
+    use axum::extract::State;
+    use sqlx::PgPool;
+
+    fn models_stub() -> axum::Router {
+        axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                axum::Json(json!({
+                    "data": [
+                        { "id": "qwen2.5:3b" },
+                        { "id": "gemma3:12b" },
+                        { "id": "qwen2.5:3b" },
+                    ],
+                    "seen_auth": headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string(),
+                }))
+            }),
+        )
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_model_list_is_sorted_and_deduped(pool: PgPool) {
+        let (base, jh) = spawn_stub(models_stub()).await;
+        let state = state_from(pool);
+        let out = models(
+            State(state),
+            operator(),
+            axum::Json(ModelsQuery {
+                base: format!("{base}/v1"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0["models"], json!(["gemma3:12b", "qwen2.5:3b"]));
+        jh.abort();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_environment_key_never_follows_a_caller_supplied_base(pool: PgPool) {
+        // The operator can be walked onto a link that names someone else's
+        // endpoint; the key must not go with them.
+        let (base, jh) = spawn_stub(axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                axum::Json(json!({
+                    "data": [{ "id": format!(
+                        "auth={}",
+                        headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("none")
+                    ) }]
+                }))
+            }),
+        ))
+        .await;
+
+        let mut state = state_from(pool);
+        let env_key = "env-key-must-not-travel";
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.remote.api_key = env_key.into();
+        cfg.provider.remote.api_base = Some("https://elsewhere.example/v1".into());
+        state.cfg = std::sync::Arc::new(cfg);
+
+        let out = models(
+            State(state.clone()),
+            operator(),
+            axum::Json(ModelsQuery {
+                base: format!("{base}/v1"),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.0["models"],
+            json!(["auth=none"]),
+            "the key travelled to a base that is not the effective one"
+        );
+        jh.abort();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_base_the_pipeline_would_not_call_is_refused_outright(pool: PgPool) {
+        let state = state_from(pool);
+        for bad in [
+            "http://169.254.169.254/v1",
+            "http://[fd00:ec2::254]/v1",
+            "file:///etc/passwd",
+        ] {
+            let err = models(
+                State(state.clone()),
+                operator(),
+                axum::Json(ModelsQuery { base: bad.into() }),
+            )
+            .await
+            .expect_err("{bad} was probed");
+            assert!(matches!(err, AppError::BadRequest(_)));
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn there_is_nothing_to_test_when_the_draft_is_the_heuristic(pool: PgPool) {
+        let state = state_from(pool);
+        let err = test_extraction(
+            State(state),
+            operator(),
+            axum::Json(SystemSettings {
+                provider: Some("heuristic".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("the heuristic has no endpoint to prove");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_draft_that_will_not_normalise_is_refused_before_anything_is_dialled(pool: PgPool) {
+        let state = state_from(pool);
+        let err = test_extraction(
+            State(state),
+            operator(),
+            axum::Json(SystemSettings {
+                provider: Some("remote".into()),
+                remote_backend: Some("not-a-backend".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("an unknown backend must not reach the provider builder");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn saving_reports_the_provider_that_is_actually_live(pool: PgPool) {
+        let state = state_from(pool);
+        let out = save(
+            State(state.clone()),
+            operator(),
+            axum::Json(SystemSettings {
+                provider: Some("heuristic".into()),
+                extract_model: Some("  gemma3:12b  ".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0["saved"]["extract_model"], "gemma3:12b");
+        assert_eq!(out.0["applied_provider"], "test");
+
+        let stored = settings::load(&state.pool).await.unwrap();
+        assert_eq!(stored.extract_model.as_deref(), Some("gemma3:12b"));
+    }
+
+    #[tokio::test]
+    async fn a_remote_config_that_fell_back_to_heuristic_says_so() {
+        let mut cfg = crate::testsupport::test_config().provider;
+        cfg.kind = ProviderKind::Remote;
+        let warnings = provider_warnings(&cfg, "heuristic").await;
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("fell back to heuristic"),
+            "{warnings:?}"
+        );
+
+        assert!(provider_warnings(&cfg, "remote-openai").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_the_endpoint_does_not_serve_is_called_out_by_role() {
+        let (base, jh) = spawn_stub(models_stub()).await;
+        let mut cfg = crate::testsupport::test_config().provider;
+        cfg.kind = ProviderKind::Remote;
+        cfg.remote.api_base = Some(format!("{base}/v1"));
+        cfg.remote.extract_model = "qwen2.5:3b".into();
+        cfg.remote.distill_model = "a-model-nobody-pulled".into();
+
+        let warnings = provider_warnings(&cfg, "remote-openai").await;
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("distill model"), "{warnings:?}");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_cannot_be_asked_leaves_the_models_unverified() {
+        let mut cfg = crate::testsupport::test_config().provider;
+        cfg.kind = ProviderKind::Remote;
+        cfg.remote.api_base = Some("http://127.0.0.1:1/v1".into());
+        let warnings = provider_warnings(&cfg, "remote-openai").await;
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("unverified"), "{warnings:?}");
+    }
+
+    fn operator() -> AuthUser {
+        AuthUser {
+            user_id: "op".into(),
+            role: crate::auth::TokenRole::Operator,
+        }
+    }
 
     #[test]
     fn key_travels_only_to_the_effective_base() {

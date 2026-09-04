@@ -491,7 +491,30 @@ async fn main() -> Result<()> {
         .parse()
         .unwrap_or(8082);
 
-    // Per-session handler instance.
+    let app = build_router(flashback_url.clone());
+
+    let addr: SocketAddr = format!("{host}:{port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    if host == "0.0.0.0" {
+        tracing::warn!(
+            "listening on all interfaces ({addr}) — every host that can route here \
+             reaches this endpoint, and it holds the same memory the API does. \
+             Bind a specific address (MCP_HOST=...) unless that is intended."
+        );
+    }
+    tracing::info!("flashback-mcp listening on http://{addr}/mcp");
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The wrapper's HTTP surface. No CORS layer, for the reason the API server
+/// carries none either: every client of this endpoint — an assistant host, the
+/// API sidecar — is server-side, where CORS does not apply, and a permissive
+/// layer only ever widens what a page you merely visit can do to a port on
+/// your own machine. `/health` names the upstream URL, which is an internal
+/// hostname on most installs.
+fn build_router(flashback_url: Arc<String>) -> Router {
     let url_for_factory = flashback_url.clone();
     let svc: StreamableHttpService<Flashback, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(Flashback::new((*url_for_factory).clone())),
@@ -499,8 +522,8 @@ async fn main() -> Result<()> {
         StreamableHttpServerConfig::default(),
     );
 
-    let url_for_health = flashback_url.clone();
-    let app: Router = Router::new()
+    let url_for_health = flashback_url;
+    Router::new()
         .route(
             "/health",
             get(move || {
@@ -518,22 +541,7 @@ async fn main() -> Result<()> {
             }),
         )
         .nest_service("/mcp", svc)
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .layer(tower_http::trace::TraceLayer::new_for_http());
-
-    let addr: SocketAddr = format!("{host}:{port}").parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    if host == "0.0.0.0" {
-        tracing::warn!(
-            "listening on all interfaces ({addr}) — every host that can route here \
-             reaches this endpoint, and it holds the same memory the API does. \
-             Bind a specific address (MCP_HOST=...) unless that is intended."
-        );
-    }
-    tracing::info!("flashback-mcp listening on http://{addr}/mcp");
-
-    axum::serve(listener, app).await?;
-    Ok(())
+        .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
 fn health_response(upstream_ok: bool, url: &str) -> impl IntoResponse {
@@ -548,6 +556,141 @@ fn health_response(upstream_ok: bool, url: &str) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn stub_upstream(
+        handler: axum::routing::MethodRouter,
+        path: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(path, handler);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let jh = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), jh)
+    }
+
+    #[tokio::test]
+    async fn the_wrapper_forwards_the_callers_token_and_nothing_else() {
+        let (url, jh) = stub_upstream(
+            axum::routing::post(|headers: axum::http::HeaderMap, body: String| async move {
+                Json(json!({
+                    "auth": headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default(),
+                    "cookie": headers.contains_key("cookie"),
+                    "echo": body,
+                }))
+            }),
+            "/records",
+        )
+        .await;
+
+        let fb = Flashback::new(url);
+        let out = fb
+            .post("/records", "fb_tok", json!({ "content": "hi" }))
+            .await
+            .unwrap();
+        assert_eq!(out["auth"], "Bearer fb_tok");
+        assert_eq!(out["cookie"], false);
+        assert_eq!(out["echo"], r#"{"content":"hi"}"#);
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn an_upstream_refusal_is_reported_without_the_token() {
+        let (url, jh) = stub_upstream(
+            axum::routing::get(|| async { (StatusCode::UNAUTHORIZED, "invalid or revoked token") }),
+            "/records",
+        )
+        .await;
+
+        let fb = Flashback::new(url);
+        let err = fb.get("/records", "fb_secret_token").await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("401"), "{msg}");
+        assert!(msg.contains("/records"), "the path has to be in the error");
+        assert!(
+            !msg.contains("fb_secret_token"),
+            "the token must not travel into an error that gets logged"
+        );
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn an_empty_body_is_null_and_a_non_json_body_is_an_error() {
+        let (url, jh) = stub_upstream(axum::routing::get(|| async { "" }), "/records").await;
+        let fb = Flashback::new(url);
+        assert_eq!(fb.get("/records", "t").await.unwrap(), Value::Null);
+        jh.abort();
+
+        let (url, jh) =
+            stub_upstream(axum::routing::get(|| async { "not json" }), "/records").await;
+        let fb = Flashback::new(url);
+        assert!(fb.get("/records", "t").await.is_err());
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_upstream_names_the_path_it_could_not_reach() {
+        let fb = Flashback::new("http://127.0.0.1:1".to_string());
+        let err = fb.get("/records", "t").await.unwrap_err();
+        assert!(format!("{err:?}").contains("/records"));
+    }
+
+    #[tokio::test]
+    async fn health_is_open_but_carries_no_cross_origin_grant() {
+        // A page you merely visit must not be able to read a port on your own
+        // machine; /health names the upstream host.
+        let app = build_router(Arc::new("http://127.0.0.1:1".to_string()));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("origin", "https://evil.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "the wrapper handed out a cross-origin grant"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["status"], "degraded");
+        assert_eq!(body["upstream_ok"], false);
+    }
+
+    #[tokio::test]
+    async fn the_mcp_endpoint_is_mounted() {
+        let app = build_router(Arc::new("http://127.0.0.1:1".to_string()));
+        let resp = app
+            .oneshot(Request::builder().uri("/mcp").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_tool_result_carries_the_same_value_twice() {
+        // Older clients read `content`, current ones read `structured_content`;
+        // a client that reads only one must not see less.
+        let v = json!({ "id": "abc", "seq": 4 });
+        let r = result_ok(v.clone()).unwrap();
+        assert_eq!(r.structured_content, Some(v.clone()));
+        let text = serde_json::to_string(&r.content).unwrap();
+        assert!(text.contains("abc"), "{text}");
+    }
 
     #[test]
     fn enc_segment_passes_unreserved_through() {

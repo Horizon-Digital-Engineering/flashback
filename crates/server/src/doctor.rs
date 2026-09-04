@@ -450,13 +450,217 @@ async fn probe(url: &str) -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
+
+    fn url_of(pool: &PgPool) -> String {
+        use sqlx::ConnectOptions;
+        pool.connect_options().to_url_lossy().to_string()
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_migrated_database_reports_clean(pool: PgPool) {
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.database_url = url_of(&pool);
+        let out = check_database(&mut r, &cfg).await;
+        assert!(out.is_some());
+        assert_eq!(
+            (r.warnings, r.failures),
+            (0, 0),
+            "a healthy database should give the operator nothing to read"
+        );
+    }
+
+    #[sqlx::test]
+    async fn an_unmigrated_database_fails_unless_it_is_going_to_migrate_itself(pool: PgPool) {
+        let mut cfg = crate::testsupport::test_config();
+        cfg.database_url = url_of(&pool);
+
+        let mut r = Report::new();
+        cfg.auto_migrate = false;
+        check_database(&mut r, &cfg).await;
+        assert_eq!(
+            r.failures, 1,
+            "pending migrations with no plan to apply them"
+        );
+
+        let mut r = Report::new();
+        cfg.auto_migrate = true;
+        check_database(&mut r, &cfg).await;
+        assert_eq!(r.failures, 0);
+        assert!(r.warnings >= 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_heuristic_provider_has_nothing_to_reach(pool: PgPool) {
+        let mut r = Report::new();
+        let cfg = crate::testsupport::test_config();
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+        assert_eq!((r.warnings, r.failures), (0, 0));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_hosted_backend_with_no_key_is_a_failure(pool: PgPool) {
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.kind = ProviderKind::Remote;
+        cfg.provider.remote.api_key = String::new();
+        cfg.provider.remote.api_base = None;
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+        assert!(r.failures >= 1, "no key and a hosted default cannot work");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_reachability_probe_carries_no_credential(pool: PgPool) {
+        // The doctor is run by an operator on a box that may not be the one the
+        // key belongs to; the probe only needs to know something answers.
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(true));
+        let captured = seen.clone();
+        let (base, jh) = crate::testsupport::spawn_stub(axum::Router::new().route(
+            "/",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().unwrap() = headers.contains_key("authorization");
+                    "up"
+                }
+            }),
+        ))
+        .await;
+
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.kind = ProviderKind::Remote;
+        cfg.provider.remote.api_key = "a-key".into();
+        cfg.provider.remote.api_base = Some(base);
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+
+        assert_eq!(r.failures, 0, "the endpoint answered");
+        assert!(!*seen.lock().unwrap(), "the probe sent the API key");
+        jh.abort();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn an_unreachable_endpoint_is_a_failure_and_names_the_url(pool: PgPool) {
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.kind = ProviderKind::Remote;
+        cfg.provider.remote.api_key = "a-key".into();
+        cfg.provider.remote.api_base = Some("http://127.0.0.1:1".into());
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+        assert!(r.failures >= 1);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_doctor_judges_what_the_server_would_actually_run(pool: PgPool) {
+        // Settings saved through the admin page override the environment at
+        // startup. A doctor that read only the environment would report on a
+        // provider nobody is running.
+        crate::settings::save(
+            &pool,
+            &crate::settings::SystemSettings {
+                provider: Some("heuristic".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.provider.kind = ProviderKind::Remote;
+        cfg.provider.remote.api_key = String::new();
+        cfg.provider.remote.api_base = None;
+        check_provider(&mut r, &cfg, &Some(pool)).await;
+
+        assert_eq!(
+            r.failures, 0,
+            "the environment says remote-with-no-key, but the database says heuristic"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn check_database_passes_on_a_migrated_database(pool: PgPool) {
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.database_url = std::env::var("DATABASE_URL").unwrap_or_default();
+        let _ = pool;
+        cfg.database_url = "postgres://nobody@127.0.0.1:1/none".to_string();
+        let out = check_database(&mut r, &cfg).await;
+        assert!(out.is_none(), "an unreachable database yields no pool");
+        assert!(r.failures > 0, "and is reported as a failure");
+    }
+
+    #[test]
+    fn check_embedding_cache_distinguishes_unset_empty_and_populated() {
+        let mut cfg = crate::testsupport::test_config();
+
+        let mut r = Report::new();
+        cfg.fastembed_cache_dir = None;
+        check_embedding_cache(&mut r, &cfg);
+        assert_eq!(r.failures, 0);
+        assert_eq!(r.warnings, 0, "unset is information, not a warning");
+
+        let empty = std::env::temp_dir().join(format!("fb-doctor-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let mut r = Report::new();
+        cfg.fastembed_cache_dir = Some(empty.clone());
+        check_embedding_cache(&mut r, &cfg);
+        assert_eq!(
+            r.warnings, 1,
+            "an empty cache means a download on first start"
+        );
+
+        std::fs::write(empty.join("model.onnx"), b"x").unwrap();
+        let mut r = Report::new();
+        check_embedding_cache(&mut r, &cfg);
+        assert_eq!(r.warnings, 0, "a populated cache is fine");
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    #[test]
+    fn dir_is_populated_is_false_for_missing_and_empty() {
+        let missing = std::env::temp_dir().join(format!("fb-none-{}", uuid::Uuid::new_v4()));
+        assert!(
+            !dir_is_populated(&missing),
+            "a missing directory is not populated"
+        );
+
+        let empty = std::env::temp_dir().join(format!("fb-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(!dir_is_populated(&empty));
+        std::fs::write(empty.join("f"), b"x").unwrap();
+        assert!(dir_is_populated(&empty));
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    #[test]
+    fn the_report_counts_only_warnings_and_failures() {
+        let mut r = Report::new();
+        r.line(Level::Ok, "a", "fine");
+        r.line(Level::Info, "b", "noted");
+        assert_eq!((r.warnings, r.failures), (0, 0));
+        r.line(Level::Warn, "c", "hmm");
+        assert_eq!((r.warnings, r.failures), (1, 0));
+        r.line(Level::Fail, "d", "broken");
+        assert_eq!((r.warnings, r.failures), (1, 1));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn check_server_port_reports_rather_than_fails(pool: PgPool) {
+        let _ = pool;
+        let mut r = Report::new();
+        let cfg = crate::testsupport::test_config();
+        check_server_port(&mut r, &cfg).await;
+        assert_eq!(r.failures, 0);
+        assert_eq!(r.warnings, 0);
+    }
     use super::*;
     use crate::config::ProviderConfig;
 
     fn remote_cfg(backend: &str, api_base: Option<&str>) -> RemoteProviderConfig {
         // Reuse the env-default construction, then override the fields under
         // test, so this stays in sync with the real config shape.
-        let mut remote = ProviderConfig::from_env().remote;
+        let mut remote = ProviderConfig::from_env().unwrap().remote;
         remote.backend = backend.to_string();
         remote.api_base = api_base.map(str::to_string);
         remote

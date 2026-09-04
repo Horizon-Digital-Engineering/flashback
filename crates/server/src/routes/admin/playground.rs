@@ -320,12 +320,16 @@ async fn call_llm_stream(
 
     let mut text = String::new();
     let mut stats = LlmStats::default();
-    let mut buf = String::new();
     // SSE from the model server: `data: {json}\n\n` frames, `data: [DONE]` last.
+    // Buffered as bytes, not as a string: a chunk boundary can fall inside a
+    // multi-byte character, and decoding each chunk on arrival turns that
+    // character into a replacement one. The frame delimiter is ASCII, so a
+    // complete frame is always safe to decode.
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buf.find("\n\n") {
-            let frame = buf[..pos].to_string();
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
             buf.drain(..pos + 2);
             consume_sse_frame(&frame, &mut text, &mut stats, &tx).await;
         }
@@ -789,6 +793,618 @@ pub async fn save_settings(
 mod tests {
     use super::*;
 
+    fn user(id: &str) -> AuthUser {
+        AuthUser {
+            user_id: id.into(),
+            role: crate::auth::TokenRole::Operator,
+        }
+    }
+
+    fn turn_req(message: &str, thread: &str) -> TurnRequest {
+        TurnRequest {
+            message: message.into(),
+            thread_id: thread.into(),
+            mode: None,
+            limit: None,
+            api_key: None,
+            include_real: false,
+        }
+    }
+
+    async fn events_of(state: AppState, u: AuthUser, req: TurnRequest) -> Vec<(String, String)> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        run_turn(state, u, req, tx).await;
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let s = format!("{ev:?}");
+            let kind = if s.contains("\"trace\"") || s.contains("event: trace") {
+                "trace"
+            } else if s.contains("delta") {
+                "delta"
+            } else if s.contains("done") {
+                "done"
+            } else {
+                "error"
+            };
+            out.push((kind.to_string(), s));
+        }
+        out
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_turn_with_no_model_still_writes_and_still_traces(pool: PgPool) {
+        // The memory system is what is under test here; the model is only the
+        // probe. Retrieval, the prompt and the write must all happen without one.
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        let evs = events_of(
+            state,
+            user("alice"),
+            turn_req("the report is due friday", "c1"),
+        )
+        .await;
+
+        assert!(
+            evs.iter().any(|(k, _)| k == "trace"),
+            "no trace event: {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(|(k, _)| k == "delta"),
+            "there was no model to stream from"
+        );
+
+        let scratch: Vec<String> = sqlx::query_scalar(
+            "SELECT source FROM playground.raw_records WHERE user_id = 'alice' ORDER BY seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scratch, vec![SOURCE_USER.to_string()]);
+
+        let real: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.raw_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(real, 0, "a sandbox turn reached real memory");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_turn_against_a_model_writes_both_sides_of_the_exchange(pool: PgPool) {
+        let (base, jh) = sse_stub(vec![
+            frame("the report "),
+            frame("is due friday"),
+            b"data: [DONE]\n\n".to_vec(),
+        ])
+        .await;
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        save_settings(
+            State(state.clone()),
+            user("alice"),
+            Json(Settings {
+                base_url: Some(base),
+                model: Some("stub-model".into()),
+                system_prompt: None,
+                context_limit: Some(5),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let evs = events_of(
+            state,
+            user("alice"),
+            turn_req("when is the report due?", "c1"),
+        )
+        .await;
+        assert!(evs.iter().any(|(k, _)| k == "delta"), "{evs:?}");
+        assert!(evs.iter().any(|(k, _)| k == "done"), "{evs:?}");
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source, content FROM playground.raw_records WHERE user_id='alice' ORDER BY seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, SOURCE_USER);
+        assert_eq!(rows[1].0, SOURCE_ASSISTANT);
+        assert_eq!(rows[1].1, "the report is due friday");
+
+        let model: Option<String> = sqlx::query_scalar(
+            "SELECT payload->>'model' FROM playground.raw_records WHERE source = $1",
+        )
+        .bind(SOURCE_ASSISTANT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(model.as_deref(), Some("stub-model"));
+        jh.abort();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_turn_that_cannot_start_says_so_and_writes_nothing(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+
+        for (u, req) in [
+            (user("alice"), turn_req("   ", "c1")),
+            (user(crate::auth::ALL_USERS), turn_req("hello", "c1")),
+        ] {
+            let evs = events_of(state.clone(), u, req).await;
+            assert_eq!(evs.len(), 1, "{evs:?}");
+            assert_eq!(evs[0].0, "error");
+        }
+
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playground.raw_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(written, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_live_conversation_is_not_offered_back_as_memory(pool: PgPool) {
+        // Everything in this thread is already on screen; memory means the
+        // OTHER conversations.
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        seed_lines(
+            &state.playground,
+            &*state.nlp,
+            "alice",
+            "the backup drive is in the safe",
+        )
+        .await
+        .unwrap();
+
+        events_of(state.clone(), user("alice"), turn_req("first turn", "c1")).await;
+        let evs = events_of(state, user("alice"), turn_req("second turn", "c1")).await;
+        let trace = evs
+            .iter()
+            .find(|(k, _)| k == "trace")
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
+        assert!(
+            !trace.contains("first turn"),
+            "the live thread was fed back as memory: {trace}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn settings_normalise_blanks_and_bound_the_context_limit(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        let out = save_settings(
+            State(state.clone()),
+            user("alice"),
+            Json(Settings {
+                base_url: Some("   ".into()),
+                model: Some("  m  ".into()),
+                system_prompt: Some(String::new()),
+                context_limit: Some(9999),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0.base_url, None, "cleared and never-set are one state");
+        assert_eq!(out.0.model.as_deref(), Some("m"));
+        assert_eq!(out.0.system_prompt, None);
+        assert_eq!(
+            out.0.context_limit, None,
+            "an unbounded limit is not a limit"
+        );
+
+        let err = save_settings(
+            State(state.clone()),
+            user("alice"),
+            Json(Settings {
+                base_url: Some("http://169.254.169.254/v1".into()),
+                model: Some("m".into()),
+                system_prompt: None,
+                context_limit: None,
+            }),
+        )
+        .await;
+        assert!(err.is_err(), "a metadata address was accepted for storage");
+
+        let round = load_settings(&state.pool, "alice").await.unwrap();
+        assert_eq!(round.model.as_deref(), Some("m"));
+        assert!(load_settings(&state.pool, "bob")
+            .await
+            .unwrap()
+            .model
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn distilling_reports_what_the_conversation_taught(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        events_of(
+            state.clone(),
+            user("alice"),
+            turn_req("a first thing", "c1"),
+        )
+        .await;
+
+        let out = distill_now(
+            State(state),
+            user("alice"),
+            Json(DistillNowRequest {
+                thread_id: "c1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0["provider"], "test");
+        assert!(out.0["facts"].is_array());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn seeding_through_the_route_lands_in_the_sandbox_only(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        let out = seed(
+            State(state),
+            user("alice"),
+            Json(SeedRequest {
+                text: "one\n\ntwo\nthree".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0["seeded"], 3);
+
+        let real: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.raw_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(real, 0);
+    }
+
+    async fn sse_stub(frames: Vec<Vec<u8>>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::response::IntoResponse;
+        let frames = std::sync::Arc::new(frames);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let frames = frames.clone();
+                async move {
+                    // Sent one at a time with a gap, so each lands in its own
+                    // read on the client side. Handed over as a single stream
+                    // the parts coalesce and the seam under test never exists.
+                    let (btx, brx) = tokio::sync::mpsc::channel(8);
+                    tokio::spawn(async move {
+                        for f in frames.iter() {
+                            if btx
+                                .send(Ok::<_, std::convert::Infallible>(f.clone()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                        }
+                    });
+                    let stream = ReceiverStream::new(brx);
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let jh = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), jh)
+    }
+
+    fn frame(delta: &str) -> Vec<u8> {
+        format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content": delta}}]})
+        )
+        .into_bytes()
+    }
+
+    async fn drain(mut rx: tokio::sync::mpsc::Receiver<Event>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(format!("{ev:?}"));
+        }
+        rx.close();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_character_split_across_two_chunks_survives() {
+        // The model server has no obligation to align its writes to character
+        // boundaries, and decoding each chunk as it lands corrupts the one that
+        // straddles the seam.
+        let whole = frame("café ☕");
+        // Cut one byte into the emoji, so the first chunk ends on an incomplete
+        // character rather than anywhere convenient.
+        let emoji = "☕".as_bytes();
+        let cut = whole
+            .windows(emoji.len())
+            .position(|w| w == emoji)
+            .expect("emoji is in the frame")
+            + 1;
+        let (base, jh) = sse_stub(vec![whole[..cut].to_vec(), whole[cut..].to_vec()]).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cfg = LlmSettings {
+            base_url: base,
+            model: "m".into(),
+            api_key: None,
+        };
+        let (text, _stats) = call_llm_stream(&cfg, &[], &tx).await.unwrap();
+        assert_eq!(text, "café ☕", "a chunk boundary ate a character");
+        drop(tx);
+        let _ = drain(rx).await;
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn deltas_accumulate_and_usage_is_reported() {
+        let usage = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{}}],"usage":{"prompt_tokens":11,"completion_tokens":4}})
+        )
+        .into_bytes();
+        let (base, jh) = sse_stub(vec![frame("hello "), frame("world"), usage]).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cfg = LlmSettings {
+            base_url: base,
+            model: "m".into(),
+            api_key: None,
+        };
+        let (text, stats) = call_llm_stream(&cfg, &[], &tx).await.unwrap();
+        assert_eq!(text, "hello world");
+        assert_eq!(stats.prompt_tokens, Some(11));
+        assert_eq!(stats.completion_tokens, Some(4));
+        drop(tx);
+        let events = drain(rx).await;
+        assert_eq!(events.len(), 2, "one delta event per non-empty delta");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_says_nothing_is_an_error_not_an_empty_answer() {
+        let (base, jh) = sse_stub(vec![b"data: [DONE]\n\n".to_vec()]).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let cfg = LlmSettings {
+            base_url: base,
+            model: "m".into(),
+            api_key: None,
+        };
+        assert!(call_llm_stream(&cfg, &[], &tx).await.is_err());
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stored_base_url_is_re_checked_before_the_request_goes_out() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        for bad in [
+            "http://169.254.169.254/v1",
+            "file:///etc/passwd",
+            "http://[fd00:ec2::254]/v1",
+        ] {
+            let cfg = LlmSettings {
+                base_url: bad.into(),
+                model: "m".into(),
+                api_key: None,
+            };
+            assert!(
+                call_llm_stream(&cfg, &[], &tx).await.is_err(),
+                "{bad} was dialled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upstream_refusal_is_reported_with_its_status() {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (axum::http::StatusCode::TOO_MANY_REQUESTS, "slow down")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let jh = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let cfg = LlmSettings {
+            base_url: format!("http://{addr}/v1"),
+            model: "m".into(),
+            api_key: Some("  ".into()),
+        };
+        let err = call_llm_stream(&cfg, &[], &tx).await.unwrap_err();
+        assert!(err.contains("429"), "{err}");
+        assert!(err.contains("slow down"), "{err}");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_is_not_json_is_skipped_rather_than_fatal() {
+        let mut text = String::new();
+        let mut stats = LlmStats::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        consume_sse_frame(": keep-alive", &mut text, &mut stats, &tx).await;
+        consume_sse_frame("data: not json", &mut text, &mut stats, &tx).await;
+        consume_sse_frame("data: [DONE]", &mut text, &mut stats, &tx).await;
+        consume_sse_frame(
+            &format!("data: {}", json!({"choices":[{"delta":{"content":""}}]})),
+            &mut text,
+            &mut stats,
+            &tx,
+        )
+        .await;
+        assert!(text.is_empty());
+        assert_eq!(stats.prompt_tokens, None);
+    }
+
+    async fn public_row_counts(pool: &PgPool) -> Vec<(String, i64)> {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+               AND tablename <> '_sqlx_migrations' ORDER BY tablename",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        for t in tables {
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM public.{t}"
+            )))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            out.push((t, n));
+        }
+        out
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_seeded_and_curated_sandbox_writes_nothing_into_public(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        let before = public_row_counts(&pool).await;
+
+        let seeded = seed_lines(
+            &state.playground,
+            &*state.nlp,
+            "alice",
+            "2025-11-02 | switched the backup drive\nprefers coffee at 93C\n\nthe billing service moved clusters",
+        )
+        .await
+        .unwrap();
+        assert_eq!(seeded, 3);
+
+        crate::curation::curate(&state.playground, &*state.nlp, "alice")
+            .await
+            .unwrap();
+
+        let after = public_row_counts(&pool).await;
+        let changed: Vec<(String, i64, i64)> = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(b, a)| b.1 != a.1)
+            .map(|(b, a)| (b.0.clone(), b.1, a.1))
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "the sandbox reached public tables: {changed:?}"
+        );
+
+        let scratch: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM playground.raw_records WHERE user_id='alice'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(scratch, 3);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn every_table_the_sandbox_writes_has_a_twin(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        seed_lines(&state.playground, &*state.nlp, "alice", "one\ntwo")
+            .await
+            .unwrap();
+        crate::curation::curate(&state.playground, &*state.nlp, "alice")
+            .await
+            .unwrap();
+
+        let written: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'playground' ORDER BY tablename",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        for t in &written {
+            let public_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=$1)",
+            )
+            .bind(t)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                public_exists,
+                "playground.{t} has no production counterpart"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_sandbox_cannot_see_real_memories(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        crate::routes::records::ingest_record(
+            &state.pool,
+            &*state.nlp,
+            "alice",
+            crate::routes::records::IngestRecordRequest {
+                r#type: "document".into(),
+                content: "the real passphrase is in the safe".into(),
+                event_time: None,
+                source: "test".into(),
+                source_ref: None,
+                topic_id: None,
+                thread_id: None,
+                mode: None,
+                supersedes: None,
+                prev_source_ref: None,
+                payload: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM raw_records WHERE user_id = 'alice'")
+                .fetch_all(&state.playground)
+                .await
+                .unwrap();
+        assert!(seen.is_empty(), "sandbox read real memory: {seen:?}");
+
+        let via_real: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM raw_records WHERE user_id = 'alice'")
+                .fetch_all(read_pool(&state, true))
+                .await
+                .unwrap();
+        assert_eq!(via_real.len(), 1, "include_real reads production");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn seed_and_distill_refuse_the_operator_wildcard(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool).await;
+        let wildcard = AuthUser {
+            user_id: crate::auth::ALL_USERS.to_string(),
+            role: crate::auth::TokenRole::Operator,
+        };
+        let err = seed(
+            State(state.clone()),
+            wildcard.clone(),
+            Json(SeedRequest { text: "x".into() }),
+        )
+        .await
+        .expect_err("wildcard seeding has no owner to write as");
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let err = distill_now(
+            State(state),
+            wildcard,
+            Json(DistillNowRequest {
+                thread_id: "c1".into(),
+            }),
+        )
+        .await
+        .expect_err("wildcard distillation has no owner");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
     #[test]
     fn context_block_is_verbatim_and_numbered() {
         let items = vec![RetrievedItem {
@@ -891,7 +1507,7 @@ mod tests {
 
     #[sqlx::test(migrations = "../../migrations")]
     async fn llm_settings_inherit_the_system_provider_when_sandbox_is_blank(pool: PgPool) {
-        let mut env = crate::config::ProviderConfig::from_env();
+        let mut env = crate::config::ProviderConfig::from_env().unwrap();
         env.kind = crate::config::ProviderKind::Heuristic;
         env.remote.api_base = None;
 

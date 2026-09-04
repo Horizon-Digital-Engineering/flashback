@@ -33,3 +33,54 @@ pub async fn health_check(State(state): State<AppState>) -> Json<Value> {
         }
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testsupport::state_from;
+    use sqlx::PgPool;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn health_reports_ok_when_the_database_answers(pool: PgPool) {
+        let Json(v) = health_check(State(state_from(pool))).await;
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["service"], "flashback");
+        assert_eq!(v["db"]["ok"], true);
+        assert_eq!(v["dev_mode"], false);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn health_names_the_embedder_and_the_extractor(pool: PgPool) {
+        // This endpoint is how you notice a box silently running the heuristic
+        // provider, so the provider name has to be real rather than hardcoded.
+        let Json(v) = health_check(State(state_from(pool))).await;
+        assert_eq!(v["nlp"]["embedder"]["name"], "test-embedder");
+        assert_eq!(v["nlp"]["embedder"]["dimension"], 384);
+        assert_eq!(v["nlp"]["extractor"]["provider"], "test");
+        assert!(
+            v["nlp"]["extractor"]["extract_model"].is_null(),
+            "a model-less provider reports null, not a guess"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn health_reports_degraded_when_the_database_is_gone(pool: PgPool) {
+        let state = state_from(pool);
+        state.pool.close().await;
+        let Json(v) = health_check(State(state)).await;
+        assert_eq!(
+            v["status"], "degraded",
+            "a dead database must not report ok"
+        );
+        assert_eq!(v["db"]["ok"], false);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn health_carries_build_information(pool: PgPool) {
+        let Json(v) = health_check(State(state_from(pool))).await;
+        assert!(
+            v["build"].is_object(),
+            "build info is how you tell which commit is deployed"
+        );
+    }
+}

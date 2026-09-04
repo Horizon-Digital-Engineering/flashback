@@ -281,6 +281,61 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_slice_seeds_asks_and_scores(pool: PgPool) {
+        let nlp = crate::testsupport::TestNlp;
+        let entries = parse_slice(
+            r#"
+# a comment, and the blank line above
+{"memory":"the backup drive is in the safe","when":"2025-11-02"}
+{"memory":"the report is due friday"}
+{"question":"where is the backup drive","expect":["safe"],"reject":["nowhere"]}
+"#,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let out = run_slice(&pool, &nlp, "eval-user", &entries).await.unwrap();
+        assert_eq!(out.memories, 2);
+        assert_eq!(out.questions, 1);
+        assert_eq!(out.noise, 0);
+        assert_eq!(out.detail.len(), 1);
+
+        let seeded: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM raw_records WHERE user_id = 'eval-user'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(seeded, 2, "the eval store is its own user and nothing else");
+
+        let rendered = out.render();
+        assert!(rendered.contains("seeded 2 memories"), "{rendered}");
+        assert!(rendered.contains("retrieval"), "{rendered}");
+    }
+
+    #[test]
+    fn a_malformed_line_names_its_number_rather_than_vanishing() {
+        let err = parse_slice("{\"memory\":\"ok\"}\nnot json at all\n").unwrap_err();
+        assert!(err.starts_with("line 2:"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_slice_scores_zero_without_dividing_by_it() {
+        let out = EvalOutcome::default();
+        let rendered = out.render();
+        assert!(rendered.contains("(0%)"), "{rendered}");
+        assert!(!rendered.contains("NaN"), "{rendered}");
+    }
+
+    #[test]
+    fn a_provider_that_cannot_distill_says_the_synthesis_score_is_meaningless() {
+        let out = EvalOutcome {
+            skipped_distill: true,
+            ..Default::default()
+        };
+        assert!(out.render().contains("measure nothing"));
+    }
     use super::*;
 
     #[test]

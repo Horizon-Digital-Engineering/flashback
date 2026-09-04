@@ -15,6 +15,8 @@ mod references;
 mod routes;
 mod settings;
 mod summaries;
+#[cfg(test)]
+mod testsupport;
 
 use std::sync::Arc;
 
@@ -344,6 +346,154 @@ fn take_flag(args: &[String], name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use sqlx::PgPool;
+
+    async fn headers_of(status: axum::http::StatusCode) -> axum::http::HeaderMap {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/x", axum::routing::get(move || async move { status }))
+            .layer(axum::middleware::from_fn(security_headers));
+        app.oneshot(Request::builder().uri("/x").body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .headers()
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers() {
+        // Including the failures — an error page is still a page, and a 401 is
+        // the one a browser is most likely to be pointed at from elsewhere.
+        for status in [
+            axum::http::StatusCode::OK,
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let h = headers_of(status).await;
+            assert_eq!(h["x-content-type-options"], "nosniff");
+            assert_eq!(h["x-frame-options"], "DENY");
+            assert_eq!(h["referrer-policy"], "no-referrer");
+            assert!(h.contains_key("content-security-policy"));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_policy_admits_no_third_party_origin() {
+        let h = headers_of(axum::http::StatusCode::OK).await;
+        let csp = h["content-security-policy"].to_str().unwrap().to_string();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("base-uri 'none'"));
+        assert!(
+            !csp.contains("http://") && !csp.contains("https://") && !csp.contains('*'),
+            "the policy names an outside origin: {csp}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_cli_will_not_mint_the_wildcard(pool: PgPool) {
+        // "*" is the operator scope and the modes template user; a token minted
+        // as it would read every user's records.
+        let err = token_dispatch(&pool, &args(&["mint", "--user=*"]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "{err}");
+
+        for blank in ["--user=", "--user=   "] {
+            assert!(token_dispatch(&pool, &args(&["mint", blank]))
+                .await
+                .is_err());
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_role_the_cli_does_not_know_is_refused(pool: PgPool) {
+        let err = token_dispatch(&pool, &args(&["mint", "--user=alice", "--role=admin"]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("service"), "{err}");
+
+        let out = token_dispatch(&pool, &args(&["mint", "--user=alice", "--role=operator"]))
+            .await
+            .unwrap();
+        assert!(out.contains("role=operator"), "{out}");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn listing_shows_the_prefix_and_never_the_token(pool: PgPool) {
+        assert_eq!(
+            token_dispatch(&pool, &args(&["list"])).await.unwrap(),
+            "(no tokens)\n"
+        );
+
+        let minted = token_dispatch(&pool, &args(&["mint", "--user=alice", "--name=laptop"]))
+            .await
+            .unwrap();
+        let plaintext = minted
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("TOKEN:  "))
+            .expect("the mint block prints the token once")
+            .to_string();
+
+        let listed = token_dispatch(&pool, &args(&["list"])).await.unwrap();
+        assert!(listed.contains("alice"));
+        assert!(listed.contains("laptop"));
+        assert!(listed.contains("unused"));
+        assert!(
+            !listed.contains(&plaintext),
+            "the listing reprinted the token"
+        );
+
+        token_dispatch(&pool, &args(&["mint", "--user=bob"]))
+            .await
+            .unwrap();
+        let only_bob = token_dispatch(&pool, &args(&["list", "--user=bob"]))
+            .await
+            .unwrap();
+        assert!(only_bob.contains("bob"));
+        assert!(!only_bob.contains("alice"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn revoking_is_reported_honestly(pool: PgPool) {
+        let minted = token_dispatch(&pool, &args(&["mint", "--user=alice"]))
+            .await
+            .unwrap();
+        let id = minted
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("ID:     "))
+            .expect("the mint block prints the id")
+            .to_string();
+
+        assert!(token_dispatch(&pool, &args(&["revoke", &id]))
+            .await
+            .unwrap()
+            .contains("revoked"));
+        assert!(token_dispatch(&pool, &args(&["revoke", &id]))
+            .await
+            .unwrap()
+            .contains("nothing to revoke"));
+        assert!(token_dispatch(
+            &pool,
+            &args(&["revoke", "00000000-0000-0000-0000-000000000000"])
+        )
+        .await
+        .unwrap()
+        .contains("nothing to revoke"));
+
+        let err = token_dispatch(&pool, &args(&["revoke", "not-a-uuid"]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid UUID"), "{err}");
+        assert!(token_dispatch(&pool, &args(&["revoke"])).await.is_err());
+
+        let listed = token_dispatch(&pool, &args(&["list"])).await.unwrap();
+        assert!(listed.contains("revoked"));
+    }
 
     fn args(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()

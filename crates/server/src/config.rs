@@ -83,19 +83,38 @@ fn dev_mode_from_env_or_args() -> bool {
 }
 
 impl ProviderConfig {
-    pub fn from_env() -> Self {
+    /// The settings page rejects a provider or backend name it does not know;
+    /// the environment used to accept anything and quietly resolve it to the
+    /// default. A one-character typo in `PROVIDER_REMOTE_PROVIDER` therefore
+    /// sent `PROVIDER_REMOTE_API_KEY` to openrouter.ai, and one in `PROVIDER`
+    /// downgraded the whole pipeline to the heuristic, both silently. Both
+    /// surfaces now refuse the same set of names.
+    pub fn from_env() -> Result<Self> {
         let kind = match std::env::var("PROVIDER").as_deref() {
             Ok("embedded") => ProviderKind::Embedded,
             Ok("remote") => ProviderKind::Remote,
-            _ => ProviderKind::Heuristic,
+            Ok("heuristic") | Ok("") | Err(_) => ProviderKind::Heuristic,
+            Ok(other) => {
+                anyhow::bail!("PROVIDER must be 'heuristic', 'remote' or 'embedded', got '{other}'")
+            }
         };
         let fallback = match std::env::var("PROVIDER_FALLBACK").as_deref() {
             Ok("heuristic") => FallbackPolicy::Heuristic,
-            _ => FallbackPolicy::Fail,
+            Ok("fail") | Ok("") | Err(_) => FallbackPolicy::Fail,
+            Ok(other) => {
+                anyhow::bail!("PROVIDER_FALLBACK must be 'fail' or 'heuristic', got '{other}'")
+            }
         };
 
         let backend =
             std::env::var("PROVIDER_REMOTE_PROVIDER").unwrap_or_else(|_| "openrouter".to_string());
+        if !matches!(backend.as_str(), "openrouter" | "anthropic" | "openai") {
+            anyhow::bail!(
+                "PROVIDER_REMOTE_PROVIDER must be 'openrouter', 'anthropic' or 'openai', \
+                 got '{backend}' — an unrecognised name resolves to openrouter.ai, which \
+                 is where the API key would then be sent"
+            );
+        }
         let model = std::env::var("PROVIDER_REMOTE_MODEL").unwrap_or_else(|_| {
             match backend.as_str() {
                 "anthropic" => "claude-haiku-4-5".to_string(),
@@ -156,7 +175,7 @@ impl ProviderConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(512);
 
-        Self {
+        Ok(Self {
             kind,
             fallback,
             remote: RemoteProviderConfig {
@@ -176,7 +195,7 @@ impl ProviderConfig {
                 context_size: embedded_ctx,
                 max_tokens: embedded_max,
             },
-        }
+        })
     }
 }
 
@@ -197,7 +216,7 @@ impl Config {
                 Ok("1" | "true" | "TRUE" | "yes")
             ),
             fastembed_cache_dir: std::env::var_os("FLASHBACK_FASTEMBED_CACHE").map(PathBuf::from),
-            provider: ProviderConfig::from_env(),
+            provider: ProviderConfig::from_env()?,
             dev_mode: dev_mode_from_env_or_args(),
         })
     }
@@ -418,7 +437,7 @@ mod tests {
     fn provider_from_env_defaults_to_heuristic_fail() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let snap = snapshot_provider_env();
-        let p = ProviderConfig::from_env();
+        let p = ProviderConfig::from_env().unwrap();
         assert_eq!(p.kind, ProviderKind::Heuristic);
         assert_eq!(p.fallback, FallbackPolicy::Fail);
         assert_eq!(p.remote.backend, "openrouter");
@@ -433,13 +452,67 @@ mod tests {
         let snap = snapshot_provider_env();
 
         unsafe { std::env::set_var("PROVIDER", "remote") };
-        assert_eq!(ProviderConfig::from_env().kind, ProviderKind::Remote);
+        assert_eq!(
+            ProviderConfig::from_env().unwrap().kind,
+            ProviderKind::Remote
+        );
 
         unsafe { std::env::set_var("PROVIDER", "embedded") };
-        assert_eq!(ProviderConfig::from_env().kind, ProviderKind::Embedded);
+        assert_eq!(
+            ProviderConfig::from_env().unwrap().kind,
+            ProviderKind::Embedded
+        );
 
-        unsafe { std::env::set_var("PROVIDER", "garbage") };
-        assert_eq!(ProviderConfig::from_env().kind, ProviderKind::Heuristic);
+        unsafe { std::env::set_var("PROVIDER", "heuristic") };
+        assert_eq!(
+            ProviderConfig::from_env().unwrap().kind,
+            ProviderKind::Heuristic
+        );
+
+        restore_env(snap);
+    }
+
+    #[test]
+    fn an_unknown_provider_name_is_refused_rather_than_downgraded() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshot_provider_env();
+
+        unsafe { std::env::set_var("PROVIDER", "remot") };
+        let err = ProviderConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("PROVIDER"), "{err}");
+        assert!(
+            err.contains("remot"),
+            "the message has to name the typo: {err}"
+        );
+
+        unsafe { std::env::set_var("PROVIDER", "heuristic") };
+        unsafe { std::env::set_var("PROVIDER_FALLBACK", "heuristik") };
+        assert!(ProviderConfig::from_env().is_err());
+
+        restore_env(snap);
+    }
+
+    #[test]
+    fn an_unknown_backend_never_silently_becomes_openrouter() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = snapshot_provider_env();
+
+        unsafe {
+            std::env::set_var("PROVIDER", "remote");
+            std::env::set_var("PROVIDER_REMOTE_PROVIDER", "anthropi");
+            std::env::set_var("PROVIDER_REMOTE_API_KEY", "the-operators-key");
+        }
+        let err = ProviderConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("anthropi"), "{err}");
+        assert!(
+            !err.contains("the-operators-key"),
+            "the key must not appear in an error that gets logged"
+        );
+
+        for good in ["openrouter", "anthropic", "openai"] {
+            unsafe { std::env::set_var("PROVIDER_REMOTE_PROVIDER", good) };
+            assert_eq!(ProviderConfig::from_env().unwrap().remote.backend, good);
+        }
 
         restore_env(snap);
     }
@@ -450,11 +523,14 @@ mod tests {
         let snap = snapshot_provider_env();
         unsafe { std::env::set_var("PROVIDER_FALLBACK", "heuristic") };
         assert_eq!(
-            ProviderConfig::from_env().fallback,
+            ProviderConfig::from_env().unwrap().fallback,
             FallbackPolicy::Heuristic
         );
         unsafe { std::env::set_var("PROVIDER_FALLBACK", "fail") };
-        assert_eq!(ProviderConfig::from_env().fallback, FallbackPolicy::Fail);
+        assert_eq!(
+            ProviderConfig::from_env().unwrap().fallback,
+            FallbackPolicy::Fail
+        );
         restore_env(snap);
     }
 
@@ -465,11 +541,17 @@ mod tests {
 
         unsafe { std::env::set_var("PROVIDER_REMOTE_PROVIDER", "anthropic") };
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "ak-anthropic") };
-        assert_eq!(ProviderConfig::from_env().remote.api_key, "ak-anthropic");
+        assert_eq!(
+            ProviderConfig::from_env().unwrap().remote.api_key,
+            "ak-anthropic"
+        );
 
         // Generic key wins over backend-specific.
         unsafe { std::env::set_var("PROVIDER_REMOTE_API_KEY", "generic-wins") };
-        assert_eq!(ProviderConfig::from_env().remote.api_key, "generic-wins");
+        assert_eq!(
+            ProviderConfig::from_env().unwrap().remote.api_key,
+            "generic-wins"
+        );
 
         restore_env(snap);
     }
@@ -480,13 +562,13 @@ mod tests {
         let snap = snapshot_provider_env();
 
         unsafe { std::env::set_var("PROVIDER_REMOTE_MODEL", "default-model") };
-        let p = ProviderConfig::from_env();
+        let p = ProviderConfig::from_env().unwrap();
         assert_eq!(p.remote.extract_model, "default-model");
         assert_eq!(p.remote.distill_model, "default-model");
 
         // Override only extract; distill still falls back to default.
         unsafe { std::env::set_var("PROVIDER_REMOTE_EXTRACT_MODEL", "fast-model") };
-        let p = ProviderConfig::from_env();
+        let p = ProviderConfig::from_env().unwrap();
         assert_eq!(p.remote.extract_model, "fast-model");
         assert_eq!(p.remote.distill_model, "default-model");
 
@@ -501,13 +583,13 @@ mod tests {
         for v in ["0", "false", "no"] {
             unsafe { std::env::set_var("PROVIDER_REMOTE_PROMPT_CACHE", v) };
             assert!(
-                !ProviderConfig::from_env().remote.prompt_cache,
+                !ProviderConfig::from_env().unwrap().remote.prompt_cache,
                 "value {v} should disable prompt cache"
             );
         }
         // Any other value (or unset) → cache on.
         unsafe { std::env::set_var("PROVIDER_REMOTE_PROMPT_CACHE", "on") };
-        assert!(ProviderConfig::from_env().remote.prompt_cache);
+        assert!(ProviderConfig::from_env().unwrap().remote.prompt_cache);
 
         restore_env(snap);
     }

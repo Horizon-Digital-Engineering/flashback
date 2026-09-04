@@ -5,7 +5,25 @@
 //! `entities`; the semantic path reads `topic` + `intent` + `operation` to do
 //! semantic supersede instead of string-Jaccard.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Read an enum-valued field without letting an unrecognised value discard the
+/// rest of the extraction. Models return synonyms — "note" for update, "modify"
+/// for replace — and a strict parse threw away the topic and the entities along
+/// with the word it could not place. `Intent::Unknown` exists for exactly this
+/// case; an operation it cannot name is simply absent.
+fn lenient<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(raw.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+fn lenient_intent<'de, D: Deserializer<'de>>(d: D) -> Result<Intent, D::Error> {
+    Ok(lenient::<D, Intent>(d)?.unwrap_or_default())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -54,10 +72,10 @@ pub struct Extraction {
     #[serde(default)]
     pub topic: Option<String>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_intent")]
     pub intent: Intent,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     pub operation: Option<Operation>,
 
     /// The cognitive register this turn belongs to (e.g. "code", "general",
@@ -145,4 +163,47 @@ pub struct DistilledFact {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DistillResponse {
     pub facts: Vec<DistilledFact>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_word_the_enum_does_not_have_costs_only_that_word() {
+        let e: Extraction = serde_json::from_str(
+            r#"{"topic":"backups","intent":"note","operation":"modify","entities":["backup drive"]}"#,
+        )
+        .expect("one unrecognised word must not discard the extraction");
+        assert_eq!(e.topic.as_deref(), Some("backups"));
+        assert_eq!(e.entities, vec!["backup drive".to_string()]);
+        assert_eq!(e.intent, Intent::Unknown);
+        assert!(e.operation.is_none());
+    }
+
+    #[test]
+    fn a_word_the_enum_does_have_is_still_read() {
+        let e: Extraction =
+            serde_json::from_str(r#"{"intent":"decision","operation":"replace"}"#).unwrap();
+        assert_eq!(e.intent, Intent::Decision);
+        assert!(matches!(e.operation, Some(Operation::Replace)));
+    }
+
+    #[test]
+    fn a_field_of_the_wrong_shape_entirely_is_also_survivable() {
+        let e: Extraction =
+            serde_json::from_str(r#"{"topic":"t","intent":7,"operation":["a"]}"#).unwrap();
+        assert_eq!(e.topic.as_deref(), Some("t"));
+        assert_eq!(e.intent, Intent::Unknown);
+        assert!(e.operation.is_none());
+    }
+
+    #[test]
+    fn an_absent_field_is_the_default() {
+        let e: Extraction = serde_json::from_str("{}").unwrap();
+        assert_eq!(e.intent, Intent::Unknown);
+        assert!(e.operation.is_none());
+        assert!(e.topic.is_none());
+        assert!(e.entities.is_empty());
+    }
 }

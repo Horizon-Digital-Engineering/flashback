@@ -5,7 +5,7 @@ ALTER TABLE playground.raw_records
     ADD CONSTRAINT raw_records_supersedes_fkey
         FOREIGN KEY (supersedes) REFERENCES playground.raw_records(id);
 
--- LIKE does not copy triggers, so all four are re-attached by hand. The sandbox
+-- LIKE does not copy triggers, so all three are re-attached by hand. The sandbox
 -- must have the SAME storage semantics as production or it stops being a
 -- rehearsal: an app-level UPDATE that passes here would fail in public.
 CREATE TRIGGER raw_records_fill_hash BEFORE INSERT ON playground.raw_records
@@ -52,10 +52,14 @@ ALTER TABLE playground.derived_record_mode
 CREATE TABLE playground.derived_superseded (LIKE public.derived_superseded INCLUDING ALL);
 ALTER TABLE playground.derived_superseded
     ADD CONSTRAINT derived_superseded_record_fkey
-        FOREIGN KEY (record_id) REFERENCES playground.raw_records(id) ON DELETE CASCADE;
+        FOREIGN KEY (record_id) REFERENCES playground.raw_records(id) ON DELETE CASCADE,
+    ADD CONSTRAINT derived_superseded_superseded_by_fkey
+        FOREIGN KEY (superseded_by) REFERENCES playground.raw_records(id);
 
 CREATE TABLE playground.derived_link (LIKE public.derived_link INCLUDING ALL);
 ALTER TABLE playground.derived_link
     ADD CONSTRAINT derived_link_record_fkey
-        FOREIGN KEY (record_id) REFERENCES playground.raw_records(id) ON DELETE CASCADE;
+        FOREIGN KEY (record_id) REFERENCES playground.raw_records(id) ON DELETE CASCADE,
+    ADD CONSTRAINT derived_link_prev_fkey
+        FOREIGN KEY (prev_id) REFERENCES playground.raw_records(id);
 CREATE TABLE playground.derived_labels (LIKE public.derived_labels INCLUDING ALL);

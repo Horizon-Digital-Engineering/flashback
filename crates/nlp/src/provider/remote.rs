@@ -423,6 +423,306 @@ struct _DummySerialize;
 mod tests {
     use super::*;
 
+    async fn stub(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let jh = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), jh)
+    }
+
+    fn cfg_for(backend: RemoteBackend, base: &str, key: &str) -> RemoteLlmConfig {
+        RemoteLlmConfig {
+            backend,
+            api_key: key.into(),
+            api_base: Some(base.to_string()),
+            prompt_cache: true,
+            extract_model: "x-model".into(),
+            extract_max_tokens: 256,
+            extract_timeout_ms: 5000,
+            distill_model: "d-model".into(),
+            distill_max_tokens: 512,
+            distill_timeout_ms: 5000,
+        }
+    }
+
+    fn openai_reply(content: &str) -> serde_json::Value {
+        json!({ "choices": [ { "message": { "content": content } } ] })
+    }
+
+    #[tokio::test]
+    async fn an_openai_compatible_endpoint_is_asked_for_json_and_parsed() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+        let captured = seen.clone();
+        let (base, jh) = stub(axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        *captured.lock().unwrap() = json!({
+                            "body": body,
+                            "auth": headers.get("authorization").is_some(),
+                            "title": headers
+                                .get("x-title")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string(),
+                        });
+                        axum::Json(openai_reply(
+                            r#"{"topic":"backups","intent":"update","entities":["backup drive"]}"#,
+                        ))
+                    }
+                },
+            ),
+        ))
+        .await;
+
+        let p = RemoteLlmProvider::new(cfg_for(RemoteBackend::OpenAI, &base, "a-key")).unwrap();
+        let out = p
+            .extract("swapped the backup drive", &ExtractContext::default())
+            .await
+            .unwrap();
+        assert_eq!(out.topic.as_deref(), Some("backups"));
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen["body"]["model"], "x-model");
+        assert_eq!(seen["body"]["temperature"], 0.0);
+        assert_eq!(seen["body"]["response_format"]["type"], "json_object");
+        assert_eq!(seen["auth"], true);
+        assert_eq!(seen["title"], "flashback");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_keyless_endpoint_is_called_without_an_authorization_header() {
+        // A self-hosted server is a real configuration, and some reject an
+        // empty Authorization outright.
+        let (base, jh) = stub(axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                axum::Json(openai_reply(&format!(
+                    r#"{{"topic":"auth-{}"}}"#,
+                    headers.contains_key("authorization")
+                )))
+            }),
+        ))
+        .await;
+
+        let p = RemoteLlmProvider::new(cfg_for(RemoteBackend::OpenAI, &base, "")).unwrap();
+        let out = p.extract("x", &ExtractContext::default()).await.unwrap();
+        assert_eq!(out.topic.as_deref(), Some("auth-false"));
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn the_anthropic_shape_is_its_own_and_thinking_blocks_are_skipped() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+        let captured = seen.clone();
+        let (base, jh) = stub(axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        *captured.lock().unwrap() = json!({
+                            "body": body,
+                            "key_header": headers.contains_key("x-api-key"),
+                            "bearer": headers.contains_key("authorization"),
+                            "version": headers
+                                .get("anthropic-version")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string(),
+                        });
+                        axum::Json(json!({
+                            "content": [
+                                { "type": "thinking", "text": "not the answer" },
+                                { "type": "text", "text": r#"{"topic":"the answer"}"# },
+                            ]
+                        }))
+                    }
+                },
+            ),
+        ))
+        .await;
+
+        let p = RemoteLlmProvider::new(cfg_for(RemoteBackend::Anthropic, &base, "k")).unwrap();
+        let out = p.extract("x", &ExtractContext::default()).await.unwrap();
+        assert_eq!(
+            out.topic.as_deref(),
+            Some("the answer"),
+            "a leading non-text block was read as the reply"
+        );
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen["key_header"], true);
+        assert_eq!(seen["bearer"], false, "the bearer scheme is the other API");
+        assert_eq!(seen["version"], "2023-06-01");
+        assert_eq!(
+            seen["body"]["system"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn cache_control_is_left_off_when_the_config_says_so() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+        let captured = seen.clone();
+        let (base, jh) = stub(axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().unwrap() = body;
+                    axum::Json(json!({ "content": [ { "type": "text", "text": "{}" } ] }))
+                }
+            }),
+        ))
+        .await;
+
+        let mut cfg = cfg_for(RemoteBackend::Anthropic, &base, "k");
+        cfg.prompt_cache = false;
+        let p = RemoteLlmProvider::new(cfg).unwrap();
+        p.extract("x", &ExtractContext::default()).await.unwrap();
+        assert!(seen.lock().unwrap()["system"][0]["cache_control"].is_null());
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn an_upstream_refusal_keeps_its_status_and_body() {
+        let (base, jh) = stub(axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::PAYMENT_REQUIRED,
+                    "insufficient credits",
+                )
+            }),
+        ))
+        .await;
+
+        let p = RemoteLlmProvider::new(cfg_for(RemoteBackend::OpenRouter, &base, "k")).unwrap();
+        let err = p
+            .extract("x", &ExtractContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Upstream(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("402"), "{msg}");
+        assert!(msg.contains("insufficient credits"), "{msg}");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_no_choices_is_bad_output_not_an_empty_extraction() {
+        let (base, jh) = stub(axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async { axum::Json(json!({ "choices": [] })) }),
+        ))
+        .await;
+
+        let p = RemoteLlmProvider::new(cfg_for(RemoteBackend::OpenAI, &base, "k")).unwrap();
+        let err = p
+            .extract("x", &ExtractContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::BadOutput(_)), "{err}");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_model_that_answers_in_prose_is_bad_output() {
+        let (base, jh) = stub(axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(openai_reply("I'm afraid I can't help with that."))
+            }),
+        ))
+        .await;
+
+        let p = RemoteLlmProvider::new(cfg_for(RemoteBackend::OpenAI, &base, "k")).unwrap();
+        assert!(matches!(
+            p.extract("x", &ExtractContext::default()).await,
+            Err(ProviderError::BadOutput(_))
+        ));
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn distillation_of_nothing_never_leaves_the_process() {
+        // No endpoint is running; reaching one would hang until the timeout.
+        let p = RemoteLlmProvider::new(cfg_for(RemoteBackend::OpenAI, "http://127.0.0.1:1", "k"))
+            .unwrap();
+        assert!(p.distill_facts(&[]).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn distilled_facts_come_back_through_the_fences_a_model_adds() {
+        let (base, jh) = stub(axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(openai_reply(
+                    "```json\n{\"facts\":[{\"content\":\"prefers coffee at 93C\",\"confidence\":0.9}]}\n```",
+                ))
+            }),
+        ))
+        .await;
+
+        let p = RemoteLlmProvider::new(cfg_for(RemoteBackend::OpenAI, &base, "k")).unwrap();
+        let facts = p
+            .distill_facts(&[EpisodeRef {
+                id: uuid::Uuid::nil(),
+                content: "coffee".into(),
+                topic: None,
+                entities: Vec::new(),
+                when: None,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "prefers coffee at 93C");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_timeout_is_reported_as_a_timeout_not_an_upstream_error() {
+        let (base, jh) = stub(axum::Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                axum::Json(openai_reply("{}"))
+            }),
+        ))
+        .await;
+
+        let mut cfg = cfg_for(RemoteBackend::OpenAI, &base, "k");
+        cfg.extract_timeout_ms = 150;
+        let p = RemoteLlmProvider::new(cfg).unwrap();
+        let err = p
+            .extract("x", &ExtractContext::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Timeout(150)), "{err}");
+        jh.abort();
+    }
+
+    #[test]
+    fn the_base_url_falls_back_to_the_backend_default() {
+        for (backend, expected) in [
+            (RemoteBackend::OpenRouter, "https://openrouter.ai/api/v1"),
+            (RemoteBackend::Anthropic, "https://api.anthropic.com"),
+            (RemoteBackend::OpenAI, "https://api.openai.com/v1"),
+        ] {
+            let mut cfg = cfg_for(backend, "unused", "k");
+            cfg.api_base = None;
+            let p = RemoteLlmProvider::new(cfg).unwrap();
+            assert_eq!(p.base_url(), expected);
+        }
+    }
+
     #[test]
     fn parses_clean_json() {
         let raw = r#"{"topic":"deploy target","intent":"update","entities":["deploy target"]}"#;

@@ -24,7 +24,7 @@ uuid.workspace = true
 # rmcp uses axum 0.8 internally; we match it in this crate so nest_service
 # composes correctly. (crates/server stays on axum 0.7.)
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.7", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 schemars = "1.0"
 rmcp = { version = "3.1", features = [
     "server",
@@ -32,3 +32,6 @@ rmcp = { version = "3.1", features = [
     "transport-streamable-http-server",
     "schemars",
 ] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
