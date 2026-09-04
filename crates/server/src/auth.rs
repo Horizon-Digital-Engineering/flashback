@@ -330,6 +330,17 @@ pub async fn mint_token(
     name: Option<&str>,
     role: TokenRole,
 ) -> anyhow::Result<MintedToken> {
+    // ALL_USERS is the scope an operator gets, and a service principal's scope
+    // is its user_id verbatim. Minting one AS the wildcard therefore hands a
+    // service token the whole estate — the reservation was documented but never
+    // enforced.
+    if user_id.trim() == ALL_USERS {
+        anyhow::bail!("user_id {ALL_USERS:?} is reserved and cannot be minted");
+    }
+    if user_id.trim().is_empty() {
+        anyhow::bail!("user_id must not be empty");
+    }
+
     let plaintext = generate_token();
     let hash = sha256_hex(&plaintext);
     let prefix = token_prefix(&plaintext);
@@ -406,6 +417,79 @@ fn _arc_marker(_: Arc<()>) {}
 
 #[cfg(test)]
 mod tests {
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_service_token_cannot_be_minted_as_the_wildcard(pool: PgPool) {
+        // ALL_USERS is documented as reserved so "no real user_id can collide
+        // with it". scope() returns a service token's user_id verbatim, and
+        // every admin query is `$1 = '*' OR user_id = $1` — so a service token
+        // minted as "*" reads every user's records.
+        let minted = mint_token(&pool, ALL_USERS, Some("sneaky"), TokenRole::Service).await;
+        assert!(
+            minted.is_err(),
+            "minting a service token as the wildcard must be refused"
+        );
+    }
+
+    #[test]
+    fn scope_separates_an_operator_from_a_service_principal() {
+        let op = AuthUser {
+            user_id: "leslie".into(),
+            role: TokenRole::Operator,
+        };
+        let svc = AuthUser {
+            user_id: "leslie".into(),
+            role: TokenRole::Service,
+        };
+        assert_eq!(op.scope(), ALL_USERS, "an operator sees the estate");
+        assert_eq!(
+            svc.scope(),
+            "leslie",
+            "a service principal sees only itself"
+        );
+    }
+
+    #[test]
+    fn a_minted_token_is_unguessable_and_prefixed() {
+        let a = generate_token();
+        let b = generate_token();
+        assert_ne!(a, b, "two mints must not collide");
+        assert!(a.starts_with(TOKEN_PREFIX));
+        assert_eq!(token_prefix(&a).len(), 11);
+        assert!(a.len() > 20, "a short credential is a guessable one");
+        // The alphabet deliberately drops O/0/I/1/l so a human can read one back.
+        assert!(!a[TOKEN_PREFIX.len()..].contains(['O', '0', 'I', 'l']));
+    }
+
+    #[test]
+    fn hashing_is_stable_and_not_the_plaintext() {
+        let t = generate_token();
+        assert_eq!(sha256_hex(&t), sha256_hex(&t));
+        assert_ne!(sha256_hex(&t), t);
+        assert_eq!(sha256_hex(&t).len(), 64);
+        assert_ne!(sha256_hex("a"), sha256_hex("b"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_revoked_token_stops_validating(pool: PgPool) {
+        let m = mint_token(&pool, "alice", Some("t"), TokenRole::Service)
+            .await
+            .unwrap();
+        assert!(validate_token(&pool, &m.plaintext).await.is_ok());
+        assert!(revoke_token(&pool, m.id).await.unwrap());
+        assert!(
+            validate_token(&pool, &m.plaintext).await.is_err(),
+            "a revoked token must stop working immediately"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_token_that_was_never_minted_is_rejected(pool: PgPool) {
+        assert!(validate_token(&pool, "fb_notarealtokenatall")
+            .await
+            .is_err());
+        assert!(validate_token(&pool, "").await.is_err());
+    }
     use super::*;
 
     #[test]
