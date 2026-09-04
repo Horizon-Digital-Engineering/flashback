@@ -719,18 +719,22 @@ mod tests {
             .unwrap();
         assert_eq!(stored, 2);
 
-        // The claim about what preceded it is kept as the writer stated it, and
-        // the link derived from it points at the right row.
-        let linked: Option<String> = sqlx::query_scalar(
-            "SELECT p.content FROM raw_records r
-             JOIN derived_link l ON l.record_id = r.id
-             JOIN raw_records p ON p.id = l.prev_id
-             WHERE r.source_ref = 'turn-2'",
+        // The writer's claim about what preceded a turn is kept verbatim on the
+        // raw row. Import does not resolve it into derived_link — that is the
+        // rebuild's job, and the test below is what proves the rebuild does it.
+        let claim: Option<String> = sqlx::query_scalar(
+            "SELECT prev_source_ref FROM raw_records WHERE source_ref = 'turn-2'",
         )
-        .fetch_optional(&pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(linked.as_deref(), Some("the first turn"));
+        assert_eq!(claim.as_deref(), Some("turn-1"));
+
+        let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM derived_link")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(links, 0, "import resolves no edges; a rebuild does");
 
         let (code, verify) = api(pool, "alice", "GET", "/records/verify", None).await;
         assert_eq!(code, StatusCode::OK);
