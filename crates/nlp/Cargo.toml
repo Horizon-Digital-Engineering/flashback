@@ -37,7 +37,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # fastembed's default features pull `hf-hub` + `ort` with native-tls; we swap
 # both to rustls. Keeps the build hermetic on slim docker images and lets us
 # build on hosts without libssl-dev installed.
-fastembed = { version = "5", default-features = false, features = [
+fastembed = { version = "6", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
     "hf-hub-rustls-tls",
     "image-models",
