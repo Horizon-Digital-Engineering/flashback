@@ -450,6 +450,83 @@ async fn probe(url: &str) -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn check_database_passes_on_a_migrated_database(pool: PgPool) {
+        let mut r = Report::new();
+        let mut cfg = crate::testsupport::test_config();
+        cfg.database_url = std::env::var("DATABASE_URL").unwrap_or_default();
+        let _ = pool;
+        cfg.database_url = "postgres://nobody@127.0.0.1:1/none".to_string();
+        let out = check_database(&mut r, &cfg).await;
+        assert!(out.is_none(), "an unreachable database yields no pool");
+        assert!(r.failures > 0, "and is reported as a failure");
+    }
+
+    #[test]
+    fn check_embedding_cache_distinguishes_unset_empty_and_populated() {
+        let mut cfg = crate::testsupport::test_config();
+
+        let mut r = Report::new();
+        cfg.fastembed_cache_dir = None;
+        check_embedding_cache(&mut r, &cfg);
+        assert_eq!(r.failures, 0);
+        assert_eq!(r.warnings, 0, "unset is information, not a warning");
+
+        let empty = std::env::temp_dir().join(format!("fb-doctor-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let mut r = Report::new();
+        cfg.fastembed_cache_dir = Some(empty.clone());
+        check_embedding_cache(&mut r, &cfg);
+        assert_eq!(
+            r.warnings, 1,
+            "an empty cache means a download on first start"
+        );
+
+        std::fs::write(empty.join("model.onnx"), b"x").unwrap();
+        let mut r = Report::new();
+        check_embedding_cache(&mut r, &cfg);
+        assert_eq!(r.warnings, 0, "a populated cache is fine");
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    #[test]
+    fn dir_is_populated_is_false_for_missing_and_empty() {
+        let missing = std::env::temp_dir().join(format!("fb-none-{}", uuid::Uuid::new_v4()));
+        assert!(
+            !dir_is_populated(&missing),
+            "a missing directory is not populated"
+        );
+
+        let empty = std::env::temp_dir().join(format!("fb-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(!dir_is_populated(&empty));
+        std::fs::write(empty.join("f"), b"x").unwrap();
+        assert!(dir_is_populated(&empty));
+        std::fs::remove_dir_all(&empty).ok();
+    }
+
+    #[test]
+    fn the_report_counts_only_warnings_and_failures() {
+        let mut r = Report::new();
+        r.line(Level::Ok, "a", "fine");
+        r.line(Level::Info, "b", "noted");
+        assert_eq!((r.warnings, r.failures), (0, 0));
+        r.line(Level::Warn, "c", "hmm");
+        assert_eq!((r.warnings, r.failures), (1, 0));
+        r.line(Level::Fail, "d", "broken");
+        assert_eq!((r.warnings, r.failures), (1, 1));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn check_server_port_reports_rather_than_fails(pool: PgPool) {
+        let _ = pool;
+        let mut r = Report::new();
+        let cfg = crate::testsupport::test_config();
+        check_server_port(&mut r, &cfg).await;
+        assert_eq!(r.failures, 0);
+        assert_eq!(r.warnings, 0);
+    }
     use super::*;
     use crate::config::ProviderConfig;
 

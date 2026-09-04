@@ -789,6 +789,165 @@ pub async fn save_settings(
 mod tests {
     use super::*;
 
+    async fn public_row_counts(pool: &PgPool) -> Vec<(String, i64)> {
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'
+               AND tablename <> '_sqlx_migrations' ORDER BY tablename",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mut out = Vec::new();
+        for t in tables {
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM public.{t}"
+            )))
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            out.push((t, n));
+        }
+        out
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_seeded_and_curated_sandbox_writes_nothing_into_public(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        let before = public_row_counts(&pool).await;
+
+        let seeded = seed_lines(
+            &state.playground,
+            &*state.nlp,
+            "alice",
+            "2025-11-02 | switched the backup drive\nprefers coffee at 93C\n\nthe billing service moved clusters",
+        )
+        .await
+        .unwrap();
+        assert_eq!(seeded, 3);
+
+        crate::curation::curate(&state.playground, &*state.nlp, "alice")
+            .await
+            .unwrap();
+
+        let after = public_row_counts(&pool).await;
+        let changed: Vec<(String, i64, i64)> = before
+            .iter()
+            .zip(after.iter())
+            .filter(|(b, a)| b.1 != a.1)
+            .map(|(b, a)| (b.0.clone(), b.1, a.1))
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "the sandbox reached public tables: {changed:?}"
+        );
+
+        let scratch: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM playground.raw_records WHERE user_id='alice'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(scratch, 3);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn every_table_the_sandbox_writes_has_a_twin(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        seed_lines(&state.playground, &*state.nlp, "alice", "one\ntwo")
+            .await
+            .unwrap();
+        crate::curation::curate(&state.playground, &*state.nlp, "alice")
+            .await
+            .unwrap();
+
+        let written: Vec<String> = sqlx::query_scalar(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'playground' ORDER BY tablename",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        for t in &written {
+            let public_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_tables WHERE schemaname='public' AND tablename=$1)",
+            )
+            .bind(t)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                public_exists,
+                "playground.{t} has no production counterpart"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_sandbox_cannot_see_real_memories(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        crate::routes::records::ingest_record(
+            &state.pool,
+            &*state.nlp,
+            "alice",
+            crate::routes::records::IngestRecordRequest {
+                r#type: "document".into(),
+                content: "the real passphrase is in the safe".into(),
+                event_time: None,
+                source: "test".into(),
+                source_ref: None,
+                topic_id: None,
+                thread_id: None,
+                mode: None,
+                supersedes: None,
+                prev_source_ref: None,
+                payload: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM raw_records WHERE user_id = 'alice'")
+                .fetch_all(&state.playground)
+                .await
+                .unwrap();
+        assert!(seen.is_empty(), "sandbox read real memory: {seen:?}");
+
+        let via_real: Vec<String> =
+            sqlx::query_scalar("SELECT content FROM raw_records WHERE user_id = 'alice'")
+                .fetch_all(read_pool(&state, true))
+                .await
+                .unwrap();
+        assert_eq!(via_real.len(), 1, "include_real reads production");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn seed_and_distill_refuse_the_operator_wildcard(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool).await;
+        let wildcard = AuthUser {
+            user_id: crate::auth::ALL_USERS.to_string(),
+            role: crate::auth::TokenRole::Operator,
+        };
+        let err = seed(
+            State(state.clone()),
+            wildcard.clone(),
+            Json(SeedRequest { text: "x".into() }),
+        )
+        .await
+        .expect_err("wildcard seeding has no owner to write as");
+        assert!(matches!(err, AppError::BadRequest(_)));
+
+        let err = distill_now(
+            State(state),
+            wildcard,
+            Json(DistillNowRequest {
+                thread_id: "c1".into(),
+            }),
+        )
+        .await
+        .expect_err("wildcard distillation has no owner");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
     #[test]
     fn context_block_is_verbatim_and_numbered() {
         let items = vec![RetrievedItem {

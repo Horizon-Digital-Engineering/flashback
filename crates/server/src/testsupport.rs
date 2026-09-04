@@ -97,3 +97,34 @@ pub fn state_from(pool: PgPool) -> AppState {
         cfg: Arc::new(test_config()),
     }
 }
+
+/// A second pool over the same database whose connections default to the
+/// `playground` schema — the sandbox as it is actually wired in `main`.
+/// Unqualified names resolve through `playground` first and fall through to
+/// `public`, which is the whole risk this exists to exercise.
+pub async fn playground_pool_from(pool: &PgPool) -> PgPool {
+    let opts = (*pool.connect_options()).clone();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET search_path TO playground, public")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect_with(opts)
+        .await
+        .expect("playground pool")
+}
+
+pub async fn state_with_playground(pool: PgPool) -> AppState {
+    let playground = playground_pool_from(&pool).await;
+    AppState {
+        pool,
+        playground,
+        nlp: Arc::new(TestNlp),
+        cfg: Arc::new(test_config()),
+    }
+}

@@ -166,7 +166,6 @@ pub async fn save(
     settings::save(&state.pool, &s).await?;
 
     let cfg = settings::resolve(&state.cfg.provider, &s);
-    let wanted_remote = cfg.kind == ProviderKind::Remote;
     let applied = state.nlp.reconfigure_provider(&cfg).await;
 
     let warnings = provider_warnings(&cfg, &applied).await;
