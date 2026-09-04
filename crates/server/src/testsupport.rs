@@ -147,3 +147,14 @@ pub fn authed_router(state: AppState, user_id: &str, role: crate::auth::TokenRol
         },
     ))
 }
+
+/// Serve `app` on a loopback port and return its base URL. The handle aborts
+/// the server when dropped by the test.
+pub async fn spawn_stub(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let jh = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), jh)
+}

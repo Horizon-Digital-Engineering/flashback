@@ -82,7 +82,6 @@ async fn remove(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::testsupport::{authed_router, state_from};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
