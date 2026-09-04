@@ -240,6 +240,46 @@ fn render_context_block(items: &[RetrievedItem]) -> String {
 /// content deltas as they arrive. Returns the full accumulated text plus stats.
 /// Usage numbers come from the final chunk when the server sends them
 /// (`stream_options.include_usage`); absent is fine — they're display-only.
+/// One `data:` frame from the model's SSE stream. Deltas are appended and
+/// forwarded; a usage object overwrites the token counts. Anything unparseable
+/// is skipped rather than failing the turn — a malformed frame should not lose
+/// the text that already arrived.
+async fn consume_sse_frame(
+    frame: &str,
+    text: &mut String,
+    stats: &mut LlmStats,
+    tx: &tokio::sync::mpsc::Sender<Event>,
+) {
+    for line in frame.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+            continue;
+        };
+        if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+            if !delta.is_empty() {
+                text.push_str(delta);
+                // Forward as JSON so newlines and quotes survive SSE framing.
+                let _ = tx
+                    .send(
+                        Event::default().event("delta").data(
+                            serde_json::to_string(&json!({ "t": delta })).unwrap_or_default(),
+                        ),
+                    )
+                    .await;
+            }
+        }
+        if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+            stats.prompt_tokens = u["prompt_tokens"].as_u64();
+            stats.completion_tokens = u["completion_tokens"].as_u64();
+        }
+    }
+}
+
 async fn call_llm_stream(
     cfg: &LlmSettings,
     messages: &[PromptMessage],
@@ -287,32 +327,7 @@ async fn call_llm_stream(
         while let Some(pos) = buf.find("\n\n") {
             let frame = buf[..pos].to_string();
             buf.drain(..pos + 2);
-            for line in frame.lines() {
-                let Some(data) = line.strip_prefix("data: ") else {
-                    continue;
-                };
-                if data.trim() == "[DONE]" {
-                    continue;
-                }
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
-                    continue;
-                };
-                if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
-                    if !delta.is_empty() {
-                        text.push_str(delta);
-                        // Forward as JSON so newlines and quotes survive SSE framing.
-                        let _ = tx
-                            .send(Event::default().event("delta").data(
-                                serde_json::to_string(&json!({ "t": delta })).unwrap_or_default(),
-                            ))
-                            .await;
-                    }
-                }
-                if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                    stats.prompt_tokens = u["prompt_tokens"].as_u64();
-                    stats.completion_tokens = u["completion_tokens"].as_u64();
-                }
-            }
+            consume_sse_frame(&frame, &mut text, &mut stats, &tx).await;
         }
     }
     stats.latency_ms = started.elapsed().as_millis() as u64;
