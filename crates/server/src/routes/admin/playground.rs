@@ -320,12 +320,16 @@ async fn call_llm_stream(
 
     let mut text = String::new();
     let mut stats = LlmStats::default();
-    let mut buf = String::new();
     // SSE from the model server: `data: {json}\n\n` frames, `data: [DONE]` last.
+    // Buffered as bytes, not as a string: a chunk boundary can fall inside a
+    // multi-byte character, and decoding each chunk on arrival turns that
+    // character into a replacement one. The frame delimiter is ASCII, so a
+    // complete frame is always safe to decode.
+    let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(pos) = buf.find("\n\n") {
-            let frame = buf[..pos].to_string();
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+            let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
             buf.drain(..pos + 2);
             consume_sse_frame(&frame, &mut text, &mut stats, &tx).await;
         }
@@ -788,6 +792,196 @@ pub async fn save_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn sse_stub(frames: Vec<Vec<u8>>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::response::IntoResponse;
+        let frames = std::sync::Arc::new(frames);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let frames = frames.clone();
+                async move {
+                    // Sent one at a time with a gap, so each lands in its own
+                    // read on the client side. Handed over as a single stream
+                    // the parts coalesce and the seam under test never exists.
+                    let (btx, brx) = tokio::sync::mpsc::channel(8);
+                    tokio::spawn(async move {
+                        for f in frames.iter() {
+                            if btx
+                                .send(Ok::<_, std::convert::Infallible>(f.clone()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                        }
+                    });
+                    let stream = ReceiverStream::new(brx);
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from_stream(stream))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let jh = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/v1"), jh)
+    }
+
+    fn frame(delta: &str) -> Vec<u8> {
+        format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content": delta}}]})
+        )
+        .into_bytes()
+    }
+
+    async fn drain(mut rx: tokio::sync::mpsc::Receiver<Event>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(format!("{ev:?}"));
+        }
+        rx.close();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_character_split_across_two_chunks_survives() {
+        // The model server has no obligation to align its writes to character
+        // boundaries, and decoding each chunk as it lands corrupts the one that
+        // straddles the seam.
+        let whole = frame("café ☕");
+        // Cut one byte into the emoji, so the first chunk ends on an incomplete
+        // character rather than anywhere convenient.
+        let emoji = "☕".as_bytes();
+        let cut = whole
+            .windows(emoji.len())
+            .position(|w| w == emoji)
+            .expect("emoji is in the frame")
+            + 1;
+        let (base, jh) = sse_stub(vec![whole[..cut].to_vec(), whole[cut..].to_vec()]).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cfg = LlmSettings {
+            base_url: base,
+            model: "m".into(),
+            api_key: None,
+        };
+        let (text, _stats) = call_llm_stream(&cfg, &[], &tx).await.unwrap();
+        assert_eq!(text, "café ☕", "a chunk boundary ate a character");
+        drop(tx);
+        let _ = drain(rx).await;
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn deltas_accumulate_and_usage_is_reported() {
+        let usage = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices":[{"delta":{}}],"usage":{"prompt_tokens":11,"completion_tokens":4}})
+        )
+        .into_bytes();
+        let (base, jh) = sse_stub(vec![frame("hello "), frame("world"), usage]).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cfg = LlmSettings {
+            base_url: base,
+            model: "m".into(),
+            api_key: None,
+        };
+        let (text, stats) = call_llm_stream(&cfg, &[], &tx).await.unwrap();
+        assert_eq!(text, "hello world");
+        assert_eq!(stats.prompt_tokens, Some(11));
+        assert_eq!(stats.completion_tokens, Some(4));
+        drop(tx);
+        let events = drain(rx).await;
+        assert_eq!(events.len(), 2, "one delta event per non-empty delta");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_says_nothing_is_an_error_not_an_empty_answer() {
+        let (base, jh) = sse_stub(vec![b"data: [DONE]\n\n".to_vec()]).await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let cfg = LlmSettings {
+            base_url: base,
+            model: "m".into(),
+            api_key: None,
+        };
+        assert!(call_llm_stream(&cfg, &[], &tx).await.is_err());
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stored_base_url_is_re_checked_before_the_request_goes_out() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        for bad in [
+            "http://169.254.169.254/v1",
+            "file:///etc/passwd",
+            "http://[fd00:ec2::254]/v1",
+        ] {
+            let cfg = LlmSettings {
+                base_url: bad.into(),
+                model: "m".into(),
+                api_key: None,
+            };
+            assert!(
+                call_llm_stream(&cfg, &[], &tx).await.is_err(),
+                "{bad} was dialled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upstream_refusal_is_reported_with_its_status() {
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                (axum::http::StatusCode::TOO_MANY_REQUESTS, "slow down")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let jh = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let cfg = LlmSettings {
+            base_url: format!("http://{addr}/v1"),
+            model: "m".into(),
+            api_key: Some("  ".into()),
+        };
+        let err = call_llm_stream(&cfg, &[], &tx).await.unwrap_err();
+        assert!(err.contains("429"), "{err}");
+        assert!(err.contains("slow down"), "{err}");
+        jh.abort();
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_is_not_json_is_skipped_rather_than_fatal() {
+        let mut text = String::new();
+        let mut stats = LlmStats::default();
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        consume_sse_frame(": keep-alive", &mut text, &mut stats, &tx).await;
+        consume_sse_frame("data: not json", &mut text, &mut stats, &tx).await;
+        consume_sse_frame("data: [DONE]", &mut text, &mut stats, &tx).await;
+        consume_sse_frame(
+            &format!("data: {}", json!({"choices":[{"delta":{"content":""}}]})),
+            &mut text,
+            &mut stats,
+            &tx,
+        )
+        .await;
+        assert!(text.is_empty());
+        assert_eq!(stats.prompt_tokens, None);
+    }
 
     async fn public_row_counts(pool: &PgPool) -> Vec<(String, i64)> {
         let tables: Vec<String> = sqlx::query_scalar(
