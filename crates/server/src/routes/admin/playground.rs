@@ -793,6 +793,269 @@ pub async fn save_settings(
 mod tests {
     use super::*;
 
+    fn user(id: &str) -> AuthUser {
+        AuthUser {
+            user_id: id.into(),
+            role: crate::auth::TokenRole::Operator,
+        }
+    }
+
+    fn turn_req(message: &str, thread: &str) -> TurnRequest {
+        TurnRequest {
+            message: message.into(),
+            thread_id: thread.into(),
+            mode: None,
+            limit: None,
+            api_key: None,
+            include_real: false,
+        }
+    }
+
+    async fn events_of(state: AppState, u: AuthUser, req: TurnRequest) -> Vec<(String, String)> {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        run_turn(state, u, req, tx).await;
+        let mut out = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            let s = format!("{ev:?}");
+            let kind = if s.contains("\"trace\"") || s.contains("event: trace") {
+                "trace"
+            } else if s.contains("delta") {
+                "delta"
+            } else if s.contains("done") {
+                "done"
+            } else {
+                "error"
+            };
+            out.push((kind.to_string(), s));
+        }
+        out
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_turn_with_no_model_still_writes_and_still_traces(pool: PgPool) {
+        // The memory system is what is under test here; the model is only the
+        // probe. Retrieval, the prompt and the write must all happen without one.
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        let evs = events_of(
+            state,
+            user("alice"),
+            turn_req("the report is due friday", "c1"),
+        )
+        .await;
+
+        assert!(
+            evs.iter().any(|(k, _)| k == "trace"),
+            "no trace event: {evs:?}"
+        );
+        assert!(
+            !evs.iter().any(|(k, _)| k == "delta"),
+            "there was no model to stream from"
+        );
+
+        let scratch: Vec<String> = sqlx::query_scalar(
+            "SELECT source FROM playground.raw_records WHERE user_id = 'alice' ORDER BY seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(scratch, vec![SOURCE_USER.to_string()]);
+
+        let real: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.raw_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(real, 0, "a sandbox turn reached real memory");
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_turn_against_a_model_writes_both_sides_of_the_exchange(pool: PgPool) {
+        let (base, jh) = sse_stub(vec![
+            frame("the report "),
+            frame("is due friday"),
+            b"data: [DONE]\n\n".to_vec(),
+        ])
+        .await;
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        save_settings(
+            State(state.clone()),
+            user("alice"),
+            Json(Settings {
+                base_url: Some(base),
+                model: Some("stub-model".into()),
+                system_prompt: None,
+                context_limit: Some(5),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let evs = events_of(
+            state,
+            user("alice"),
+            turn_req("when is the report due?", "c1"),
+        )
+        .await;
+        assert!(evs.iter().any(|(k, _)| k == "delta"), "{evs:?}");
+        assert!(evs.iter().any(|(k, _)| k == "done"), "{evs:?}");
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source, content FROM playground.raw_records WHERE user_id='alice' ORDER BY seq",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, SOURCE_USER);
+        assert_eq!(rows[1].0, SOURCE_ASSISTANT);
+        assert_eq!(rows[1].1, "the report is due friday");
+
+        let model: Option<String> = sqlx::query_scalar(
+            "SELECT payload->>'model' FROM playground.raw_records WHERE source = $1",
+        )
+        .bind(SOURCE_ASSISTANT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(model.as_deref(), Some("stub-model"));
+        jh.abort();
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_turn_that_cannot_start_says_so_and_writes_nothing(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+
+        for (u, req) in [
+            (user("alice"), turn_req("   ", "c1")),
+            (user(crate::auth::ALL_USERS), turn_req("hello", "c1")),
+        ] {
+            let evs = events_of(state.clone(), u, req).await;
+            assert_eq!(evs.len(), 1, "{evs:?}");
+            assert_eq!(evs[0].0, "error");
+        }
+
+        let written: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playground.raw_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(written, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_live_conversation_is_not_offered_back_as_memory(pool: PgPool) {
+        // Everything in this thread is already on screen; memory means the
+        // OTHER conversations.
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        seed_lines(
+            &state.playground,
+            &*state.nlp,
+            "alice",
+            "the backup drive is in the safe",
+        )
+        .await
+        .unwrap();
+
+        events_of(state.clone(), user("alice"), turn_req("first turn", "c1")).await;
+        let evs = events_of(state, user("alice"), turn_req("second turn", "c1")).await;
+        let trace = evs
+            .iter()
+            .find(|(k, _)| k == "trace")
+            .map(|(_, s)| s.clone())
+            .unwrap_or_default();
+        assert!(
+            !trace.contains("first turn"),
+            "the live thread was fed back as memory: {trace}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn settings_normalise_blanks_and_bound_the_context_limit(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        let out = save_settings(
+            State(state.clone()),
+            user("alice"),
+            Json(Settings {
+                base_url: Some("   ".into()),
+                model: Some("  m  ".into()),
+                system_prompt: Some(String::new()),
+                context_limit: Some(9999),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0.base_url, None, "cleared and never-set are one state");
+        assert_eq!(out.0.model.as_deref(), Some("m"));
+        assert_eq!(out.0.system_prompt, None);
+        assert_eq!(
+            out.0.context_limit, None,
+            "an unbounded limit is not a limit"
+        );
+
+        let err = save_settings(
+            State(state.clone()),
+            user("alice"),
+            Json(Settings {
+                base_url: Some("http://169.254.169.254/v1".into()),
+                model: Some("m".into()),
+                system_prompt: None,
+                context_limit: None,
+            }),
+        )
+        .await;
+        assert!(err.is_err(), "a metadata address was accepted for storage");
+
+        let round = load_settings(&state.pool, "alice").await.unwrap();
+        assert_eq!(round.model.as_deref(), Some("m"));
+        assert!(load_settings(&state.pool, "bob")
+            .await
+            .unwrap()
+            .model
+            .is_none());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn distilling_reports_what_the_conversation_taught(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        events_of(
+            state.clone(),
+            user("alice"),
+            turn_req("a first thing", "c1"),
+        )
+        .await;
+
+        let out = distill_now(
+            State(state),
+            user("alice"),
+            Json(DistillNowRequest {
+                thread_id: "c1".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0["provider"], "test");
+        assert!(out.0["facts"].is_array());
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn seeding_through_the_route_lands_in_the_sandbox_only(pool: PgPool) {
+        let state = crate::testsupport::state_with_playground(pool.clone()).await;
+        let out = seed(
+            State(state),
+            user("alice"),
+            Json(SeedRequest {
+                text: "one\n\ntwo\nthree".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.0["seeded"], 3);
+
+        let real: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM public.raw_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(real, 0);
+    }
+
     async fn sse_stub(frames: Vec<Vec<u8>>) -> (String, tokio::task::JoinHandle<()>) {
         use axum::response::IntoResponse;
         let frames = std::sync::Arc::new(frames);
