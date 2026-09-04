@@ -191,24 +191,42 @@ pub fn validate_base_url(raw: &str) -> Result<(), String> {
         }
         None => return Err("must start with http:// or https://".into()),
     };
-    let host = rest
+    let authority = rest
         .split(['/', '?', '#'])
         .next()
         .unwrap_or("")
         .rsplit('@') // strip any user:pass@
         .next()
         .unwrap_or("");
-    let hostname = host
-        .rsplit_once(':')
-        .map_or(host, |(h, _)| h)
-        .trim_matches(['[', ']']);
+    // A bracketed literal keeps its own colons; only the unbracketed form has a
+    // trailing :port to strip. Splitting on the last colon either way turned
+    // [fd00:ec2::254] into "fd00:ec2:" and walked straight past the check below.
+    let hostname = match authority.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((inside, _)) => inside,
+            None => return Err("unterminated [ in host".into()),
+        },
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
     if hostname.is_empty() {
         return Err("no host in URL".into());
     }
-    // Link-local: 169.254.0.0/16 and fd00:ec2::254 — the metadata endpoints on
-    // every major cloud. Nothing legitimate here ever lives there.
-    if hostname.starts_with("169.254.") || hostname.eq_ignore_ascii_case("metadata.google.internal")
-    {
+    if hostname.eq_ignore_ascii_case("metadata.google.internal") {
+        return Err(format!("{hostname} is a cloud metadata address"));
+    }
+    // Link-local 169.254.0.0/16 and fd00:ec2::254 — the metadata endpoints on
+    // every major cloud. Nothing legitimate ever lives there. Parsed as an
+    // address rather than matched as a prefix, so the IPv4-mapped and bracketed
+    // spellings of the same host are the same host.
+    let blocked = match hostname.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_link_local(),
+            None => v6 == std::net::Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254),
+        },
+        Err(_) => hostname.starts_with("169.254."),
+    };
+    if blocked {
         return Err(format!("{hostname} is a cloud metadata address"));
     }
     Ok(())
@@ -419,6 +437,21 @@ mod tests {
     #[test]
     fn credentials_in_the_url_cannot_disguise_the_host() {
         assert!(validate_base_url("http://evil@169.254.169.254/").is_err());
+    }
+
+    #[test]
+    fn a_bracketed_address_is_read_as_the_address_it_is() {
+        for bad in [
+            "http://[fd00:ec2::254]/latest/meta-data/",
+            "http://[::ffff:169.254.169.254]/latest/",
+            "http://[::ffff:a9fe:a9fe]/latest/",
+        ] {
+            assert!(validate_base_url(bad).is_err(), "{bad} should be refused");
+        }
+        for ok in ["http://[::1]:11434/v1", "http://[::1]/v1"] {
+            assert!(validate_base_url(ok).is_ok(), "{ok} should be allowed");
+        }
+        assert!(validate_base_url("http://[::1/v1").is_err());
     }
 
     #[sqlx::test(migrations = "../../migrations")]
