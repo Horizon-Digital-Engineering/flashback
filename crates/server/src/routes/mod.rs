@@ -149,6 +149,120 @@ mod tests {
         }
     }
 
+    async fn authed_get(pool: PgPool, user: &str, path: &str) -> (StatusCode, String) {
+        let r = crate::testsupport::authed_router(
+            state_from(pool),
+            user,
+            crate::auth::TokenRole::Operator,
+        )
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn no_route_breaks_on_an_empty_store(pool: PgPool) {
+        // A store with no records is the state every deployment starts in, and
+        // an empty-state crash is invisible until someone installs it.
+        for path in declared_paths() {
+            if path == "/admin/logout" {
+                continue;
+            }
+            let (code, body) = authed_get(pool.clone(), "alice", &path).await;
+            assert!(
+                !code.is_server_error(),
+                "{path} returned {code} on an empty store: {body}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn no_route_breaks_once_there_is_something_to_render(pool: PgPool) {
+        // An empty store never deserialises a row, so it cannot catch a column
+        // that stopped existing. Give every page something to draw first.
+        let state = state_from(pool.clone());
+        for (kind, content, payload) in [
+            (
+                "conversation",
+                "the billing service moved clusters",
+                serde_json::json!({}),
+            ),
+            (
+                "document",
+                "the quarterly report is due friday",
+                serde_json::json!({"origin": "test"}),
+            ),
+            (
+                "state_object",
+                "today's plan",
+                serde_json::json!({"kind": "plan", "key": "today"}),
+            ),
+        ] {
+            crate::routes::records::ingest_record(
+                &state.pool,
+                &*state.nlp,
+                "alice",
+                crate::routes::records::IngestRecordRequest {
+                    r#type: kind.into(),
+                    content: content.into(),
+                    event_time: None,
+                    source: "test".into(),
+                    source_ref: None,
+                    topic_id: Some("work".into()),
+                    thread_id: Some("c1".into()),
+                    mode: None,
+                    supersedes: None,
+                    prev_source_ref: None,
+                    payload: Some(payload),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        crate::curation::curate(&state.pool, &*state.nlp, "alice")
+            .await
+            .unwrap();
+
+        for path in declared_paths() {
+            if path == "/admin/logout" {
+                continue;
+            }
+            let (code, body) = authed_get(pool.clone(), "alice", &path).await;
+            assert!(
+                !code.is_server_error(),
+                "{path} returned {code} with records present: {body}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn no_route_leaks_an_internal_detail_in_its_body(pool: PgPool) {
+        // A stack path, a SQL fragment or a connection string in a response body
+        // is a disclosure whether or not the status code says error.
+        const NEVER: &[&str] = &[
+            "/home/",
+            "crates/server/src",
+            "SELECT ",
+            "postgres://",
+            "panicked",
+            "RUST_BACKTRACE",
+        ];
+        for path in declared_paths() {
+            let (_, body) = authed_get(pool.clone(), "alice", &path).await;
+            for needle in NEVER {
+                assert!(
+                    !body.contains(needle),
+                    "{path} put {needle:?} in its response body"
+                );
+            }
+        }
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn the_api_requires_a_token(pool: PgPool) {
         // Unauthenticated, so anything other than 401 here would mean the auth

@@ -1068,7 +1068,7 @@ const MAP_JS: &str = r##"<script>
         for (const n of nodes) {
             const p = (mode === '3d') ? project3D(n.x3, n.y3, n.z3) : project2D(n.x, n.y);
             n._sx = p.sx; n._sy = p.sy; n._depth = p.depth; n._sizeMul = p.sizeMul;
-            const baseR = 4 + Math.sqrt(n.deg) * 2.4 + (n.importance || 0.5) * 4;
+            const baseR = 6 + Math.sqrt(n.deg) * 2.4;
             n._r = Math.max(2.5, baseR * (mode === '3d' ? p.sizeMul * 0.8 : 1.0));
         }
     }

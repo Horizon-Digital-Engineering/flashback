@@ -128,3 +128,22 @@ pub async fn state_with_playground(pool: PgPool) -> AppState {
         cfg: Arc::new(test_config()),
     }
 }
+
+/// The real router with an already-authenticated principal injected the way
+/// `require_bearer` injects one, so a test can drive a handler end to end
+/// without minting a token or replaying the login flow.
+pub fn authed_router(state: AppState, user_id: &str, role: crate::auth::TokenRole) -> axum::Router {
+    let user = crate::auth::AuthUser {
+        user_id: user_id.to_string(),
+        role,
+    };
+    crate::routes::router(state).layer(axum::middleware::from_fn(
+        move |mut req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+            let user = user.clone();
+            async move {
+                req.extensions_mut().insert(user);
+                next.run(req).await
+            }
+        },
+    ))
+}

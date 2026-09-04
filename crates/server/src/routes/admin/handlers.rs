@@ -835,7 +835,6 @@ pub async fn map_data(
                 "type": n.type_,
                 "label": n.label,
                 "content": n.content,
-                "importance": n.importance,
                 "superseded": n.superseded,
                 "x": n.x,
                 "y": n.y,
@@ -940,7 +939,6 @@ pub(crate) struct MapNode {
     pub type_: String,
     pub label: String,
     pub content: String,
-    pub importance: f32,
     pub superseded: bool,
     pub x: f32,
     pub y: f32,
@@ -953,7 +951,6 @@ struct GraphRow {
     id: Uuid,
     r#type: String,
     content: String,
-    importance: f32,
     superseded: bool,
     thread_id: Option<String>,
     supersedes: Option<Uuid>,
@@ -1008,7 +1005,6 @@ async fn compute_graph_with_layout(
                 type_: r.r#type,
                 label,
                 content,
-                importance: r.importance,
                 superseded: r.superseded,
                 x,
                 y,
@@ -1031,7 +1027,6 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
         id: Uuid,
         r#type: String,
         content: String,
-        importance: Option<f32>,
         superseded: bool,
         thread_id: Option<String>,
         supersedes: Option<Uuid>,
@@ -1040,7 +1035,8 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
     }
     let rows = sqlx::query_as::<_, Row>(
         r#"
-        SELECT r.id, r.type, r.content, r.importance, r.thread_id, r.supersedes, r.state_key,
+        SELECT r.id, r.type, r.content, r.thread_id, r.supersedes,
+               r.payload->>'key' AS state_key,
                EXISTS (
                    SELECT 1 FROM derived_superseded d WHERE d.record_id = r.id
                ) AS superseded,
@@ -1063,7 +1059,6 @@ async fn fetch_for_graph(pool: &sqlx::PgPool, user_id: &str) -> Result<Vec<Graph
             id: r.id,
             r#type: r.r#type,
             content: r.content,
-            importance: r.importance.unwrap_or(0.5),
             superseded: r.superseded,
             thread_id: r.thread_id,
             supersedes: r.supersedes,
