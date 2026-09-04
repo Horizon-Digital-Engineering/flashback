@@ -47,7 +47,10 @@ pub struct Mode {
 }
 
 /// Idempotently clone the built-in registers from the `'*'` template into a
-/// user's own rows. Cheap and safe to call on every mode-touching path — a
+/// user's own rows. The source is the template user and only the template
+/// user: `$2` here is the constant `'*'`, so the wildcard-scope predicate the
+/// rest of this file uses would match every row in the table and hand each
+/// caller a copy of every other user's registers. Cheap and safe to call on every mode-touching path — a
 /// row that already exists is left untouched (so a user who renamed/re-pointed
 /// a built-in keeps their edit). Mirrors the catalog's `ensure_builtin_stores`.
 pub async fn ensure_builtin_modes(pool: &PgPool, user_id: &str) -> AppResult<()> {
@@ -60,7 +63,7 @@ pub async fn ensure_builtin_modes(pool: &PgPool, user_id: &str) -> AppResult<()>
             (user_id, name, embedder, embedding_dim, description, default_decay, prompt_overrides, is_default)
         SELECT $1, name, embedder, embedding_dim, description, default_decay, prompt_overrides, is_default
         FROM modes
-        WHERE ($2 = '*' OR user_id = $2)
+        WHERE user_id = $2
         ON CONFLICT (user_id, name) DO NOTHING
         "#,
     )

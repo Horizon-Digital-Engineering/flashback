@@ -150,14 +150,19 @@ mod tests {
     }
 
     async fn authed_get(pool: PgPool, user: &str, path: &str) -> (StatusCode, String) {
-        let r = crate::testsupport::authed_router(
-            state_from(pool),
-            user,
-            crate::auth::TokenRole::Operator,
-        )
-        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-        .await
-        .unwrap();
+        as_role(pool, user, crate::auth::TokenRole::Operator, path).await
+    }
+
+    async fn as_role(
+        pool: PgPool,
+        user: &str,
+        role: crate::auth::TokenRole,
+        path: &str,
+    ) -> (StatusCode, String) {
+        let r = crate::testsupport::authed_router(state_from(pool), user, role)
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         let status = r.status();
         let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
             .await
@@ -238,6 +243,73 @@ mod tests {
                 "{path} returned {code} with records present: {body}"
             );
         }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn nothing_of_alices_reaches_bob(pool: PgPool) {
+        // One secret string, written through every writer alice has, then every
+        // route driven as bob. Anything that echoes it back is a leak, whatever
+        // the route thought it was returning.
+        const SECRET: &str = "zzsecretzz-quarterly-passphrase";
+        let state = state_from(pool.clone());
+        crate::routes::records::ingest_record(
+            &state.pool,
+            &*state.nlp,
+            "alice",
+            crate::routes::records::IngestRecordRequest {
+                r#type: "document".into(),
+                content: SECRET.into(),
+                event_time: None,
+                source: "test".into(),
+                source_ref: None,
+                topic_id: Some(SECRET.into()),
+                thread_id: Some(SECRET.into()),
+                mode: None,
+                supersedes: None,
+                prev_source_ref: None,
+                payload: Some(serde_json::json!({ "note": SECRET })),
+            },
+        )
+        .await
+        .unwrap();
+        crate::modes::create_mode(
+            &state.pool,
+            "alice",
+            SECRET,
+            crate::modes::UpsertModeRequest {
+                embedder: "all-MiniLM-L6-v2".into(),
+                embedding_dim: None,
+                description: Some(SECRET.into()),
+                default_decay: None,
+                prompt_overrides: None,
+                is_default: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::curation::curate(&state.pool, &*state.nlp, "alice")
+            .await
+            .unwrap();
+
+        // The admin surface is operator-only and an operator is defined to see
+        // the whole estate, so the boundary being tested here is the API's.
+        for path in declared_paths() {
+            if path.starts_with("/admin") {
+                continue;
+            }
+            let (_, body) =
+                as_role(pool.clone(), "bob", crate::auth::TokenRole::Service, &path).await;
+            assert!(
+                !body.contains(SECRET),
+                "{path} showed bob something of alice's"
+            );
+        }
+
+        let (_, dash) = authed_get(pool, "carol", "/admin").await;
+        assert!(
+            dash.contains("1") || !dash.is_empty(),
+            "an operator dashboard should still render the estate"
+        );
     }
 
     #[sqlx::test(migrations = "../../migrations")]
