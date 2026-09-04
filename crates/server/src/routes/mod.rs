@@ -312,6 +312,288 @@ mod tests {
         );
     }
 
+    async fn api(
+        pool: PgPool,
+        user: &str,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let req = Request::builder().method(method).uri(path);
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string()))
+                .unwrap(),
+            None => req.body(Body::empty()).unwrap(),
+        };
+        let r = crate::testsupport::authed_router(
+            state_from(pool),
+            user,
+            crate::auth::TokenRole::Service,
+        )
+        .oneshot(req)
+        .await
+        .unwrap();
+        let status = r.status();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap_or_default();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_record_goes_in_and_comes_back_out_the_way_it_arrived(pool: PgPool) {
+        let (code, rec) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/records",
+            Some(serde_json::json!({
+                "type": "document",
+                "content": "the backup drive is in the safe",
+                "source": "test",
+                "topic_id": "home",
+                "thread_id": "c1"
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{rec}");
+        let id = rec["id"].as_str().unwrap().to_string();
+
+        let (code, got) = api(
+            pool.clone(),
+            "alice",
+            "GET",
+            &format!("/records/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(got["content"], "the backup drive is in the safe");
+        assert_eq!(got["topic_id"], "home");
+
+        let (code, _) = api(pool.clone(), "bob", "GET", &format!("/records/{id}"), None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "bob read alice's record");
+
+        let (code, verify) = api(pool.clone(), "alice", "GET", "/records/verify", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(verify["broken"], 0, "{verify}");
+
+        for sub in ["lineage", "derivations"] {
+            let (code, _) = api(
+                pool.clone(),
+                "alice",
+                "GET",
+                &format!("/records/{id}/{sub}"),
+                None,
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{sub}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_record_that_makes_no_sense_is_refused_rather_than_stored(pool: PgPool) {
+        for bad in [
+            serde_json::json!({ "type": "document", "content": "", "source": "t" }),
+            serde_json::json!({ "type": "", "content": "x", "source": "t" }),
+            serde_json::json!({ "type": "document", "content": "x" }),
+        ] {
+            let (code, _) = api(pool.clone(), "alice", "POST", "/records", Some(bad)).await;
+            assert!(
+                code.is_client_error(),
+                "a malformed record was accepted with {code}"
+            );
+        }
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM raw_records")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn query_and_context_answer_within_the_callers_own_records(pool: PgPool) {
+        for (u, c) in [
+            ("alice", "the backup drive is in the safe"),
+            ("bob", "bob's own note about drives"),
+        ] {
+            api(
+                pool.clone(),
+                u,
+                "POST",
+                "/records",
+                Some(serde_json::json!({
+                    "type": "document", "content": c, "source": "test", "thread_id": "c1"
+                })),
+            )
+            .await;
+        }
+
+        let (code, out) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/records/query",
+            Some(serde_json::json!({ "query": "drive", "limit": 10 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{out}");
+        let body = out.to_string();
+        assert!(body.contains("in the safe"), "{body}");
+        assert!(!body.contains("bob's own note"), "{body}");
+
+        let (code, ctx) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/records/context",
+            Some(serde_json::json!({ "query": "drive", "limit": 5 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(!ctx.to_string().contains("bob's own note"));
+
+        let (code, _) = api(pool, "alice", "GET", "/records/summaries", None).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_proposal_can_only_cite_the_callers_own_records(pool: PgPool) {
+        let (_, alice_rec) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/records",
+            Some(serde_json::json!({
+                "type": "document", "content": "alice's evidence", "source": "test"
+            })),
+        )
+        .await;
+        let alice_id = alice_rec["id"].as_str().unwrap().to_string();
+
+        let (code, out) = api(
+            pool.clone(),
+            "bob",
+            "POST",
+            "/proposals",
+            Some(serde_json::json!({
+                "title": "cite what is not mine",
+                "action": "do the thing",
+                "evidence": [alice_id]
+            })),
+        )
+        .await;
+        assert!(
+            code.is_client_error(),
+            "bob cited alice's record and got {code}: {out}"
+        );
+
+        let (code, mine) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/proposals",
+            Some(serde_json::json!({
+                "title": "cite my own",
+                "action": "do the thing",
+                "rationale": "because",
+                "evidence": [alice_id]
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{mine}");
+        let pid = mine["id"].as_str().unwrap().to_string();
+        assert_eq!(mine["status"], "proposed");
+
+        let (code, seen) = api(
+            pool.clone(),
+            "bob",
+            "GET",
+            &format!("/proposals/{pid}"),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{seen}");
+
+        let (code, approved) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            &format!("/proposals/{pid}/approve"),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{approved}");
+        assert_eq!(approved["status"], "approved");
+
+        let (code, _) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            &format!("/proposals/{pid}/deny"),
+            Some(serde_json::json!({})),
+        )
+        .await;
+        assert!(
+            code.is_client_error(),
+            "an approved proposal was denied afterwards"
+        );
+
+        let (code, listed) = api(pool, "alice", "GET", "/proposals", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(listed.to_string().contains("cite my own"));
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_catalog_store_belongs_to_the_user_who_declared_it(pool: PgPool) {
+        let (code, store) = api(
+            pool.clone(),
+            "alice",
+            "POST",
+            "/catalog/stores",
+            Some(serde_json::json!({
+                "name": "invoices",
+                "kind": "external",
+                "description": "the billing export"
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{store}");
+        let id = store["id"].as_str().unwrap().to_string();
+
+        let (code, _) = api(
+            pool.clone(),
+            "bob",
+            "GET",
+            &format!("/catalog/stores/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+
+        let (code, listed) = api(pool.clone(), "bob", "GET", "/catalog", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(!listed.to_string().contains("the billing export"));
+
+        let (code, _) = api(
+            pool.clone(),
+            "alice",
+            "DELETE",
+            &format!("/catalog/stores/{id}"),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+
+        let (code, _) = api(pool, "alice", "GET", &format!("/catalog/stores/{id}"), None).await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+    }
+
     #[sqlx::test(migrations = "../../migrations")]
     async fn no_route_leaks_an_internal_detail_in_its_body(pool: PgPool) {
         // A stack path, a SQL fragment or a connection string in a response body
