@@ -59,7 +59,7 @@ For those cases, use the droplet path below.
 
 1. **Create a Droplet** in the DigitalOcean dashboard:
    - **Image:** Ubuntu 22.04 LTS (or 24.04)
-   - **Plan:** Basic — Regular, **2 vCPU / 4 GB RAM** (`s-2vcpu-4gb`, $24/mo) recommended for the Python sidecar's model load. `s-2vcpu-2gb` works but boots slower.
+   - **Plan:** Basic — Regular, **2 vCPU / 4 GB RAM** (`s-2vcpu-4gb`, $24/mo) recommended — the in-process embedding model wants headroom. `s-2vcpu-2gb` works but boots slower.
    - **Authentication:** SSH key (don't use password)
    - **Hostname:** whatever you want (`flashback-prod`)
 
@@ -115,7 +115,7 @@ Point a DNS A record for `flashback.yourdomain.com` at the droplet IP — Caddy 
 | TLS (Let's Encrypt via Caddy)          | $0    |
 | **Total**                              | **~$24** |
 
-Smaller droplets work (`s-2vcpu-2gb` $18/mo, `s-1vcpu-2gb` $12/mo) but the Python sidecar's models eat ~600 MB RAM at idle, so go to 4 GB if you can.
+Smaller droplets work (`s-2vcpu-2gb` $18/mo, `s-1vcpu-2gb` $12/mo) but the embedding model plus Postgres want headroom, so go to 4 GB if you can.
 
 ## Generic Ubuntu / Debian VPS
 
@@ -138,7 +138,7 @@ curl -sSL https://raw.githubusercontent.com/Horizon-Digital-Engineering/flashbac
 2. Clones / fast-forwards `/opt/flashback` to the current `main`
 3. Generates a strong `POSTGRES_PASSWORD` into `/opt/flashback/.env` (chmod 600). On re-runs the existing password is preserved — the Postgres data volume is tied to it.
 4. `docker compose up -d --build`
-5. Waits for `/health` on the REST server (up to 5 min — first run downloads ~1 GB of Python sidecar models)
+5. Waits for `/health` on the REST server (up to 5 min — first run downloads the ONNX embedding model)
 6. Mints an initial admin token, writes it to `/root/FLASHBACK_TOKEN.txt` (chmod 600, only on first run)
 
 Re-running the installer pulls new commits and rebuilds without re-minting tokens or touching the database.
@@ -165,7 +165,6 @@ For DigitalOcean specifically: enable Droplet snapshots ($1–2/mo) for whole-VM
 ## Security notes
 
 - `POSTGRES_PASSWORD` is randomly generated on first install and stored in `/opt/flashback/.env` (chmod 600). The compose file binds Postgres to `127.0.0.1:5432`, so it's only reachable via the docker network or from localhost on the host.
-- The sidecar (`:8081`) is also localhost-only.
 - The REST server (`:8080`) and MCP server (`:8082`) bind to `0.0.0.0` and are protected by bearer-token auth. Front them with TLS in production.
 - Tokens are sha256-hashed at rest. The plaintext is only shown once at mint time. Rotate any token with `flashback token revoke <id>`.
 
@@ -253,7 +252,7 @@ cargo build --release --bin flashback \
 2. mistralrs downloads the model from HF (one-time, model-size + a tokenizer cache).
 3. Cold-loads the model into memory. CPU: 30-90s. Metal/CUDA: ~5s.
 4. `/health` flips from `extractor.provider=heuristic` to `extractor.provider=embedded-llm`.
-5. First `/memory/ingest` runs the model. Latency in the table above.
+5. First `POST /records` runs the model. Latency in the table above.
 
 ### Common pitfalls
 

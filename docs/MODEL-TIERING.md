@@ -129,4 +129,4 @@ None of these feel imminent.
 
 ## Status
 
-**Not built yet.** Wiring follows this doc. Implementation note will land as a PR description; if this doc still describes reality six months from now, promote to `ARCHITECTURE.md`.
+**Built.** `PROVIDER_REMOTE_EXTRACT_MODEL` / `PROVIDER_REMOTE_DISTILL_MODEL` (with per-role max-tokens and timeouts) wire exactly this split; unset, both roles fall back to the single-model config.

@@ -1,6 +1,6 @@
 # Modes — exploratory design
 
-*Status: **exploratory**. Not built. Not committed to. A design note capturing where the architecture is leaning.*
+*Status: **shipped in core**. Registers are per-user rows with a `/modes` CRUD API, each pinning an embedder; the register a record lands in is derived, so a rebuild can reclassify. Written as a design note first — details below may lag the code, and the code wins.*
 
 *Audience: people deciding whether to commit. If this turns out to be the right call, this doc moves to `ARCHITECTURE.md` as built. If it's wrong, this becomes the postmortem.*
 
@@ -262,6 +262,6 @@ Each step is independently shippable + reversible. The full thing lands incremen
 
 ## Status
 
-**Not built. Leaning yes.** This doc exists so the design is captured before any code is written. If we commit, this file becomes the spec. If we don't, it stays as an exploration of an idea we considered.
+**Committed and shipped.** This doc was written before any code existed; it became the spec, and the core of it is now built. Where this file and the code disagree, the code wins.
 
 The brain-mode metaphor is the conviction. Everything else is implementation detail.

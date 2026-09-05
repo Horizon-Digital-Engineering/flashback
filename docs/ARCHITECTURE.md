@@ -1,5 +1,14 @@
 # Episodic Memory System — Architecture
 
+> **Status: partially historical.** This is the original design document, and
+> the system has moved under it. The raw layer now holds only what a writer
+> sent (`importance` is gone, `mode`/`prev_id`/server-inferred supersedes are
+> derived tables), retrieval lives at `/records/context`, and the recall path
+> is being reworked into its own subsystem. Where this file and the code
+> disagree, the code and [CHANGELOG.md](../CHANGELOG.md) win. A ground-up
+> rewrite around the recall pipeline is planned; until it lands, read this for
+> the thinking, not the field names.
+
 ## The Central Metaphor: Memory Is Memory
 
 Human cognition and computer architecture solved the same problem independently: how do you give a system fast access to the things it uses most, while still being able to recall things it hasn't touched in years?

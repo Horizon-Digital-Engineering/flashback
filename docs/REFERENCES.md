@@ -137,13 +137,13 @@ The PATCH body declares an `op` whose verbs depend on the `kind`. For `todo_list
 
 Each PATCH is an O(1) write that produces a new terminal node. The previous value remains queryable via `/history`.
 
-**Prompt rendering:** when a state_object lands in `/context/assemble`, the renderer formats it as a structured block (e.g. `Project TODO: [✓] buy milk · [ ] fix bug`) rather than as embedded prose. This is what gives the LLM a clean current-state view instead of forcing it to reconstruct from history.
+**Prompt rendering:** when a state_object lands in `/records/context`, the renderer formats it as a structured block (e.g. `Project TODO: [✓] buy milk · [ ] fix bug`) rather than as embedded prose. This is what gives the LLM a clean current-state view instead of forcing it to reconstruct from history.
 
 ---
 
 ## Explicit vs Implicit Invocation
 
-In Phase 1, state_objects are invoked **explicitly**: the integrator (the app calling Flashback) decides "this is a todo update" and hits `PATCH /state/...`. We are not auto-classifying prose into state-update operations.
+In Phase 1, state_objects are invoked **explicitly**: the integrator (the app calling Flashback) decides "this is a todo update" and posts to `/records/state/...`. We are not auto-classifying prose into state-update operations.
 
 Auto-classification of stateful updates from raw conversation is tempting and dangerous. The worst failure mode of a memory system is *silently writing the wrong state* — an auto-classifier that misreads "I should probably buy milk tomorrow" as `{op: add, text: "buy milk"}` corrupts the user's working state in a way that is hard to detect and worse than no automation at all.
 
