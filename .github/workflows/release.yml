@@ -12,8 +12,31 @@ permissions:
   contents: read
 
 jobs:
+  # The tag names the release; Cargo.toml names what the binaries report about
+  # themselves through CARGO_PKG_VERSION — /health, the MCP handshake, the
+  # doctor. Nothing tied the two together, so tagging without bumping shipped
+  # a release called one thing containing binaries that answer another, and
+  # nothing anywhere would have said so. Fail here instead, before a draft
+  # release exists to clean up.
+  check-version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compare the tag against the workspace version
+        run: |
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)"
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "tag=$tag_version cargo=$cargo_version"
+          if [ "$cargo_version" != "$tag_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version — bump the workspace version and re-tag" >&2
+            exit 1
+          fi
+
   create-release:
     name: Create draft release
+    needs: check-version
     runs-on: ubuntu-22.04
     permissions:
       contents: write
