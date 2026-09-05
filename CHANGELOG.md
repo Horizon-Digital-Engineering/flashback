@@ -7,6 +7,15 @@ and Flashback adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-09-05
+
+### Fixed
+- The systemd installer aborted with "reason: unbound variable" on its
+  skip-build path — a checkout whose only change since the last build was
+  docs had nothing newer than the binary, and the one branch that never set
+  `reason` hit `set -u`. This is the first version whose installer can
+  upgrade a box end to end.
+
 ## [0.2.0] — 2026-09-04
 
 Breaking. The raw layer was cut back to what writers actually send, the schema
@@ -192,5 +201,6 @@ License 2.0 on **2030-05-23** (four years from this release).
 
 See [LICENSE](./LICENSE) for the full text.
 
+[0.2.1]: https://github.com/Horizon-Digital-Engineering/flashback/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Horizon-Digital-Engineering/flashback/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Horizon-Digital-Engineering/flashback/releases/tag/v0.1.0
