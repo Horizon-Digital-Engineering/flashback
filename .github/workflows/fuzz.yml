@@ -51,10 +51,24 @@ jobs:
         with:
           tool: cargo-fuzz
 
+      # Both values come through env rather than inline expansion. The duration
+      # is a workflow_dispatch input, which is arbitrary text a caller supplies
+      # — interpolated into the script text it would be a shell injection — and
+      # the digit check means a non-numeric one fails here rather than becoming
+      # part of the command line.
       - name: Fuzz ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+          SECONDS_INPUT: ${{ github.event.inputs.seconds || '300' }}
         run: |
-          cargo fuzz run ${{ matrix.target }} -- \
-            -max_total_time=${{ github.event.inputs.seconds || '300' }} \
+          case "$SECONDS_INPUT" in
+            ''|*[!0-9]*)
+              echo "::error::seconds must be a whole number" >&2
+              exit 1
+              ;;
+          esac
+          cargo fuzz run "$TARGET" -- \
+            -max_total_time="$SECONDS_INPUT" \
             -rss_limit_mb=4096
 
       # A crash is only useful with the input that caused it.
