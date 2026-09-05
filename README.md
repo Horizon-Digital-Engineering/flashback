@@ -145,14 +145,14 @@ Flashback never deletes. Old records are marked superseded; new records carry a 
                       ┌────────┴────────┐
                       ▼                 ▼
         ┌─────────────────────┐  ┌─────────────────────────┐
-        │  sidecar (port 8081)│  │  Postgres + pgvector    │
-        │  Embeddings (MiniLM)│  │  raw_records, curated_* │
-        │  Entity extraction  │  │  (recursive-CTE lineage)│
-        │  (Python, for now)  │  └─────────────────────────┘
+        │  crates/nlp         │  │  Postgres + pgvector    │
+        │  (in-process)       │  │  raw_records, derived_*,│
+        │  Embeddings (MiniLM)│  │  curated_*              │
+        │  Entity extraction  │  └─────────────────────────┘
         └─────────────────────┘
 ```
 
-**Stack:** Rust workspace (`crates/server` Axum + SQLx + Tokio, `crates/mcp` rmcp + Streamable-HTTP) · Python sidecar (FastAPI, sentence-transformers, spaCy — slated for Rust replacement via fastembed-rs) · PostgreSQL 16 + pgvector · Docker Compose
+**Stack:** Rust workspace (`crates/server` Axum + SQLx + Tokio, `crates/mcp` rmcp + Streamable-HTTP, `crates/nlp` fastembed-rs embeddings + rule-based entity extraction, all in-process) · PostgreSQL 16 + pgvector · Docker Compose
 
 ---
 
@@ -170,10 +170,12 @@ Four services come up:
 
 | Service       | Port | What it does                                          |
 |---------------|------|-------------------------------------------------------|
-| `flashback`   | 8080 | REST API (bearer auth)                                |
-| `flashback-mcp` | 8082 | MCP server (Streamable HTTP) for AI clients         |
-| `sidecar`     | 8081 | Embeddings + entity extraction (Python, for now)      |
+| `server`      | 8080 | REST API + admin UI (bearer auth)                     |
+| `mcp`         | 8082 | MCP server (Streamable HTTP) for AI clients           |
 | `db`          | 5432 | Postgres 16 + pgvector                                |
+| `ollama`      | 11434 | Local models for extraction/distillation (loopback)  |
+
+`pgweb`, a raw data browser on 8081, is opt-in: `docker compose --profile tools up`.
 
 Migrations run automatically on first boot (`AUTO_MIGRATE=1` in the included `docker-compose.yml`). Verify:
 
@@ -261,7 +263,7 @@ OpenRouter speaks OpenAI's API shape and routes to ~all hosted models, so one co
 
 **The 90% case is the remote provider — whether the model is in the cloud or on a box next to you.** A "sidecar Ollama container, an M-series Mac on your LAN, a DGX Spark over Tailscale, Claude over the public internet" — they're all the same code path from Flashback's perspective. Just a different URL. Set `PROVIDER=remote` plus the right `PROVIDER_REMOTE_API_BASE` and you're done.
 
-An *embedded* LLM provider (model running in-process inside the Flashback binary itself via mistral.rs — no HTTP at all) is on the Phase 2b roadmap. That path is narrower: it matters when Flashback IS the only service on a dedicated AI box, or in air-gapped deployments where no network egress is acceptable. For everyone else, the remote provider is the right pattern. **Running Ollama as a sidecar container today is already exactly this**:
+An *embedded* LLM provider (model running in-process inside the Flashback binary itself via mistral.rs — no HTTP at all) exists behind the `embedded-llm` build feature, off by default because the dependency is heavy. That path is narrower: it matters when Flashback IS the only service on a dedicated AI box, or in air-gapped deployments where no network egress is acceptable. For everyone else, the remote provider is the right pattern. **Running Ollama as a sidecar container today is already exactly this**:
 
 ```bash
 # Host: install Ollama and pull a small model
@@ -283,7 +285,7 @@ All of these environment values are the **bootstrap seed**. Once the server is u
 Hardware roadmap: DGX Spark, M-series 128 GB, Strix Halo will all run 70B+ comfortably. Two ways to use them:
 
 - **Remote provider pointing at the box** (recommended) — Ollama / vLLM / whatever runs there, Flashback elsewhere points at it via URL. Same `PROVIDER=remote`, just a different `PROVIDER_REMOTE_API_BASE`.
-- **Embedded provider on the box itself** (Phase 2b) — Flashback runs ON the AI box, owns the GPU directly via mistral.rs, ships as one binary. No HTTP boundary at all. Right answer when Flashback is the only service the box runs.
+- **Embedded provider on the box itself** (`--features embedded-llm`) — Flashback runs ON the AI box, owns the GPU directly via mistral.rs, ships as one binary. No HTTP boundary at all. Right answer when Flashback is the only service the box runs.
 
 ### Web admin UI
 
@@ -308,7 +310,7 @@ Two paths depending on what you're optimizing for.
 
 [![Deploy to DO](https://www.deploytodo.com/do-btn-blue.svg)](https://cloud.digitalocean.com/apps/new?repo=https://github.com/Horizon-Digital-Engineering/flashback/tree/main)
 
-App Platform reads [`.do/app.yaml`](.do/app.yaml) and provisions: a managed Postgres cluster, the sidecar (internal), the REST server (at `/`), and the MCP server (at `/mcp`). HTTPS is automatic. After deploy, mint your first bearer:
+App Platform reads [`.do/app.yaml`](.do/app.yaml) and provisions: a managed Postgres cluster, the REST server (at `/`), and the MCP server (at `/mcp`). HTTPS is automatic. After deploy, mint your first bearer:
 
 ```bash
 doctl apps list                                # find your app id
@@ -435,14 +437,23 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/records/{id}/deriva
 
 ## Memory Types
 
-| Type | Half | Analogy | Decay | Description |
-|------|------|---------|-------|-------------|
-| `working` | record | RAM | Fast (48h TTL) | Active session context; promotes to episodic on close |
-| `episodic` | record | Short-term recall | Medium (14d) | Conversation snapshots; raw material for consolidation |
-| `semantic` | record | Long-term facts | Slow (90d) | Distilled beliefs extracted from multiple episodes |
-| `document` | record | Reference shelf | Slow / versioned | Ingested files, chunked and re-indexed on change |
-| `procedural` | record | Muscle memory | Slow (90d) | Learned workflows extracted from repeated patterns |
-| `state_object` | **reference** | Variable in memory | None (pinned) | Named mutable cells (`todo_list`, `plan`, …) — see [docs/REFERENCES.md](docs/REFERENCES.md) |
+The raw layer accepts three record types — what a writer sends, stored verbatim:
+
+| Raw type | What it is |
+|----------|------------|
+| `conversation` | One turn of an exchange, user or assistant side |
+| `document` | Ingested reference material |
+| `state_object` | A write to a named mutable cell (`todo_list`, `plan`, …) — the **reference** half; see [docs/REFERENCES.md](docs/REFERENCES.md) |
+
+Everything cognitive is derived above raw by curation, and a rebuild is free to
+disagree with all of it:
+
+| Curated kind | Analogy | What it holds |
+|--------------|---------|---------------|
+| `episodic` | Short-term recall | Per-conversation episodes formed from raw turns |
+| `semantic` | Long-term facts | Distilled beliefs, dated by their newest evidence |
+| `summary` | The table of contents | Rolled-up view over episodes and facts |
+| `entity` | The index | Noun phrases linking records that mention the same thing |
 
 ---
 
@@ -462,28 +473,33 @@ Human conversations aren't transactions. They're journeys. Flashback is memory t
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — full system design: memory hierarchy, memory types, decay model, consolidation pipeline, hybrid retrieval, supersede chains, 3D visualization, database schema
 - [docs/REFERENCES.md](docs/REFERENCES.md) — the heap hypothesis: records vs references as the missing first-class split. Why a todo list is not a sequence of facts.
 - [docs/EMBEDDINGS.md](docs/EMBEDDINGS.md) — embedding model choice by use case. Code-heavy conversation, multilingual, dense technical text — different recommendations. "More dimensions = better" is a myth; pick deliberately.
-- [docs/MODES.md](docs/MODES.md) — **exploratory.** First-class cognitive registers (code / general / journal / research), each with their own embedder and retrieval geometry. The brain-mode metaphor — humans don't run parallel brains, they switch register. Not built yet; design captured for the commit-or-walk decision.
+- [docs/MODES.md](docs/MODES.md) — **shipped.** First-class cognitive registers (code / general / journal / research), each with their own embedder and retrieval geometry. The brain-mode metaphor — humans don't run parallel brains, they switch register. Registers are per-user rows with a `/modes` CRUD API; the register a record lands in is derived, so a rebuild can reclassify.
 - [docs/MODEL-TIERING.md](docs/MODEL-TIERING.md) — **exploratory, shipped.** Split the remote LLM model by role: a small fast model for `extract()` (write path, sub-2s) and a larger reasoning model for `distill_facts()` (background, minutes-OK). The trait was always designed for this; the config never followed.
-- [docs/TENANCY.md](docs/TENANCY.md) — **exploratory.** Multi-user + tenant + visibility design. Self-hosted households (operator IS a user) vs SaaS (operator must NOT see user content) are different problems. Schema sketch for tenants + groups + per-memory visibility; orthogonal to MODES. Not built.
-- [docs/PLAN-PHASE-2.md](docs/PLAN-PHASE-2.md) — the Phase 2 architecture decisions (AiProvider trait, remote vs embedded, etc.) and what landed when.
+- [docs/TENANCY.md](docs/TENANCY.md) — **schema shipped, enforcement deliberately cold.** Multi-user + tenant + visibility design. Self-hosted households (operator IS a user) vs SaaS (operator must NOT see user content) are different problems. The principals/grants tables exist; nothing enforces them until there is a second person.
 
 ---
 
 ## Status
 
-**Phase 1 — alpha, end-to-end functional.** The dynamic-RAG loop, supersede chains, state objects, bearer-token auth, the REST API, and the MCP server all work and have been smoke-tested under `docker compose up`. Not production-hardened; expect breaking changes on the API surface until a 0.2.0 tag.
+**Alpha, end-to-end functional, releases signed.** The dynamic-RAG loop, the
+append-only raw layer with its tamper-evident hash chain, curation
+(episodes, distilled facts, summaries), hybrid retrieval, state objects,
+cognitive registers, the REST API, the MCP server, and the admin UI all work.
+Rust-native NLP runs in-process — embeddings via fastembed-rs, rule-based
+entity extraction, and a pluggable LLM provider (remote / heuristic) for
+extraction and distillation. See [CHANGELOG.md](CHANGELOG.md) for what each
+release changed; 0.2.0 is breaking, and the changelog leads with why.
 
-**Deferred to Phase 2:**
-- Consolidation worker (daily working→episodic, weekly episodic→semantic)
-- Decay-based archival (decay only affects retrieval scores in Phase 1, no GC)
-- Automatic task extraction from conversation text
-- 3D memory visualization endpoint
-- Document chunking pipeline wired to `/document/ingest`
-- Noun-phrase entity extraction + cosine-similarity backup for the prose-supersede heuristic (the current spaCy NER misses domain concepts like "deploy target")
-- Replacement of the Python sidecar with a Rust-native NLP crate (fastembed-rs + a Rust noun-phrase extractor)
-- OAuth2 / OIDC auth (Phase 1 ships bearer tokens only)
+Still open, tracked and deliberate:
 
-If the thesis resonates, watch the repo. Contributions and feedback welcome — open an issue.
+- Retrieval quality: two-stage ANN retrieval, decay that rewards being
+  remembered instead of punishing it, and a synthesis-first recall contract
+- Decay-based archival (decay only affects ranking; nothing is GC'd)
+- Document chunking for large ingested files
+- OAuth2 / OIDC (bearer tokens only today)
+- Multi-user enforcement (schema shipped, cold until there is a second person)
+
+If the thesis resonates, watch the repo. Feedback welcome — open an issue.
 
 ---
 

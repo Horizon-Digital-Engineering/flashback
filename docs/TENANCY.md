@@ -237,6 +237,6 @@ Don't conflate them. Modes are about *how I think*; visibility is about *who get
 
 ## Status
 
-**Not built.** Captured so when single-user dev runs out of runway, the next architecture move has a frame instead of a blank canvas.
+**Schema shipped, enforcement deliberately cold.** The principals and grants tables exist so history starts now; nothing reads them until there is a second person. Captured so the next architecture move has a frame instead of a blank canvas.
 
 The current `user_id` field is the seed of all this — already in the schema, already filtered on. Tenants and visibility are additive layers, not a rewrite.
