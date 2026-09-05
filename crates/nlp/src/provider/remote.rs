@@ -328,7 +328,7 @@ fn map_http_error(e: reqwest::Error, timeout_ms: u32) -> ProviderError {
 
 /// Parse the model's JSON output into an Extraction. Tolerates a small set
 /// of common LLM quirks: code fences, leading "json", whitespace, etc.
-pub(crate) fn parse_distill(raw: &str) -> Result<Vec<DistilledFact>, ProviderError> {
+pub fn parse_distill(raw: &str) -> Result<Vec<DistilledFact>, ProviderError> {
     let cleaned = strip_fences(raw);
     let r: DistillResponse = serde_json::from_str(cleaned).map_err(|e| {
         ProviderError::BadOutput(format!(
@@ -339,7 +339,7 @@ pub(crate) fn parse_distill(raw: &str) -> Result<Vec<DistilledFact>, ProviderErr
     Ok(r.facts)
 }
 
-fn strip_fences(raw: &str) -> &str {
+pub fn strip_fences(raw: &str) -> &str {
     let trimmed = raw.trim();
     let no_fence = trimmed
         .strip_prefix("```json")
@@ -355,7 +355,7 @@ fn strip_fences(raw: &str) -> &str {
     }
 }
 
-pub(crate) fn parse_extraction(raw: &str) -> Result<Extraction, ProviderError> {
+pub fn parse_extraction(raw: &str) -> Result<Extraction, ProviderError> {
     let cleaned = raw
         .trim()
         .strip_prefix("```json")
