@@ -50,7 +50,7 @@ jobs:
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
                  --title "flashback $GITHUB_REF_NAME" \
-                 --notes "Binaries for macOS (Apple Silicon), Linux (x86_64 / aarch64), and Windows (experimental). Each tarball bundles flashback, flashback-mcp, flashback-nlp-prefetch, migrations, and the launchd/systemd deploy templates — see DEPLOY.md for install paths. Verify checksums with: openssl dgst -sha256 -r <file>."
+                 --notes "Binaries for macOS (Apple Silicon), Linux (x86_64 / aarch64, glibc 2.39 or newer), and Windows (experimental). Each tarball bundles flashback, flashback-mcp, flashback-nlp-prefetch, migrations, and the launchd/systemd deploy templates — see DEPLOY.md for install paths. Verify checksums with: openssl dgst -sha256 -r <file>."
 
   build:
     name: Build ${{ matrix.target }}
@@ -68,10 +68,12 @@ jobs:
           - os: macos-14 # Apple Silicon runner
             target: aarch64-apple-darwin
             experimental: false
-          - os: ubuntu-22.04
+          # Same floor as ci.yml's ubuntu-latest. 22.04 could not link the
+          # prebuilt ONNX Runtime, and released binaries need glibc 2.39+.
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             experimental: false
-          - os: ubuntu-22.04-arm
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             experimental: false
           - os: windows-2022
