@@ -98,7 +98,7 @@ newer_than_artifact() {
 }
 
 build_binaries() {
-    local artifact="$REPO_ROOT/target/release/flashback" reason newer
+    local artifact="$REPO_ROOT/target/release/flashback" reason="" newer=""
 
     if [ -n "${FLASHBACK_FORCE_BUILD:-}" ]; then
         reason="forced by FLASHBACK_FORCE_BUILD"
