@@ -1,9 +1,7 @@
 name: Release
 
-# Tag-triggered binary releases: build the workspace for each supported
-# target, attach tarballs + checksums to a draft release, then publish.
-# Publishing fires the `release: published` trigger, so sbom.yml attaches
-# SBOMs + provenance + cosign signatures to the same release.
+# Tag-triggered: build each target, attach tarballs, publish, then call
+# sbom.yml to attach SBOMs, provenance and signatures.
 on:
   push:
     tags: ["v*"]
@@ -135,3 +133,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$GITHUB_REF_NAME" --draft=false
+
+  # Called directly: publishing with GITHUB_TOKEN raises no events, so the
+  # `release: published` trigger this used to rely on never fired.
+  sbom:
+    name: SBOM + signatures
+    needs: publish
+    uses: ./.github/workflows/sbom.yml
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    with:
+      tag: ${{ github.ref_name }}
