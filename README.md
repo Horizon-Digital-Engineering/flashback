@@ -9,6 +9,7 @@
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Horizon-Digital-Engineering_flashback&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Horizon-Digital-Engineering_flashback)
 [![Coverage](https://sonarcloud.io/api/project_badges/measure?project=Horizon-Digital-Engineering_flashback&metric=coverage)](https://sonarcloud.io/component_measures?id=Horizon-Digital-Engineering_flashback&metric=coverage)
 [![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=Horizon-Digital-Engineering_flashback&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=Horizon-Digital-Engineering_flashback)
+[![Release](https://img.shields.io/github/v/release/Horizon-Digital-Engineering/flashback?sort=semver&color=8A2BE2)](https://github.com/Horizon-Digital-Engineering/flashback/releases)
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](https://www.rust-lang.org/)
 
