@@ -5,8 +5,10 @@
 [![CI](https://github.com/Horizon-Digital-Engineering/flashback/actions/workflows/ci.yml/badge.svg)](https://github.com/Horizon-Digital-Engineering/flashback/actions/workflows/ci.yml)
 [![Security](https://github.com/Horizon-Digital-Engineering/flashback/actions/workflows/security.yml/badge.svg)](https://github.com/Horizon-Digital-Engineering/flashback/actions/workflows/security.yml)
 [![CodeQL](https://github.com/Horizon-Digital-Engineering/flashback/actions/workflows/codeql.yml/badge.svg)](https://github.com/Horizon-Digital-Engineering/flashback/actions/workflows/codeql.yml)
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/Horizon-Digital-Engineering/flashback/badge)](https://scorecard.dev/viewer/?uri=github.com/Horizon-Digital-Engineering/flashback)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Horizon-Digital-Engineering/flashback/badge)](https://scorecard.dev/viewer/?uri=github.com/Horizon-Digital-Engineering/flashback)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Horizon-Digital-Engineering_flashback&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Horizon-Digital-Engineering_flashback)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=Horizon-Digital-Engineering_flashback&metric=coverage)](https://sonarcloud.io/component_measures?id=Horizon-Digital-Engineering_flashback&metric=coverage)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=Horizon-Digital-Engineering_flashback&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=Horizon-Digital-Engineering_flashback)
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](https://www.rust-lang.org/)
 
