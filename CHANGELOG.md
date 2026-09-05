@@ -7,15 +7,67 @@ and Flashback adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-04
+
+Breaking. The raw layer was cut back to what writers actually send, the schema
+is redeclared from scratch, and a database from 0.1.0 does not migrate forward
+— rebuild it. Everything derived is rebuilt from raw, so nothing derived is
+lost by doing so.
+
 ### Changed
-- **Token roles: `service` vs `operator`.** A service token reaches the REST/MCP
-  API only; an operator token reaches `/admin` only. The middleware enforces
-  the wall in both directions, and the admin login refuses service tokens.
-- **The admin UI is the operator plane** — it now shows every user's records,
+- **Raw holds arrived data only.** `mode` moved to `derived_record_mode`,
+  server-inferred `supersedes` to `derived_superseded`, and `prev_id` to
+  `derived_link` — a resolution re-run on every rebuild, so a late-arriving
+  parent gets linked instead of leaving a permanent gap. `importance` is gone:
+  a writer's judgement a rebuild could never disagree with.
+- **`project_id` → `topic_id`, `container_id` → `thread_id`.** A topic is where
+  a thread is filed — a filter, not a wall. A thread is one conversation.
+- **The tamper chain runs along arrival order**, so every record protects every
+  record that arrived after it. It used to chain along the causal link, which
+  meant an imported corpus produced thousands of one-record chains protecting
+  nothing.
+- **Token roles: `service` vs `operator`.** A service token reaches the
+  REST/MCP API only; an operator token reaches `/admin` only. The middleware
+  enforces the wall in both directions, and the admin login refuses service
+  tokens.
+- **The admin UI is the operator plane** — it shows every user's records,
   curated nodes, references, catalog, proposals, and map, instead of only the
   logged-in token's own rows.
 - Schema is declared from scratch in `migrations/` (one file per subsystem, all
   `CREATE`, no `ALTER` archaeology).
+- The server and the MCP wrapper bind loopback unless told otherwise.
+
+### Fixed
+- **Registers leaked between users.** The built-in clone matched every row in
+  the table rather than the template user's, so each caller received a copy of
+  every other user's registers, names and descriptions included.
+- **The mind map returned 500 on every request**, having outlived two columns
+  it still selected.
+- **Streamed replies lost characters at network chunk boundaries** — a chunk
+  ending mid-character had its bytes replaced before the next could complete
+  it, in the reply shown and in the record written from it.
+- **One unrecognised word discarded a whole extraction.** A model answering a
+  synonym for an enum value failed the parse outright and took the topic and
+  entities with it.
+- **The MCP wrapper granted any origin.** The API server carries no CORS layer
+  on purpose; the wrapper fronts the same memory and the same token.
+- **An unknown remote-provider name resolved to a default**, sending the
+  configured API key to a vendor the operator never named. Unrecognised
+  provider and backend values are now refused at startup.
+- **The admin session cookie is `Secure`** when the request arrived over TLS.
+- **Bracketed IPv6 hosts parsed wrongly**, so the cloud metadata address the
+  SSRF check names by hand was the one spelling it could not see.
+- Sandbox tables enforce the foreign keys their production counterparts do.
+- `RowNotFound` answers 404 rather than 500; unique and foreign-key violations
+  answer 409 and 400.
+- Service tokens can no longer be minted as the reserved wildcard user.
+- Two cross-site scripting holes in admin rendering.
+
+### Added
+- Fuzz targets over the parsers that read model output, run weekly and on
+  demand.
+- `CONTRIBUTING.md` and `CODE_OF_CONDUCT.md`.
+- A release check that refuses a tag disagreeing with the workspace version.
 
 ## [0.1.0] — 2026-05-23
 
@@ -140,4 +192,5 @@ License 2.0 on **2030-05-23** (four years from this release).
 
 See [LICENSE](./LICENSE) for the full text.
 
+[0.2.0]: https://github.com/Horizon-Digital-Engineering/flashback/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Horizon-Digital-Engineering/flashback/releases/tag/v0.1.0
