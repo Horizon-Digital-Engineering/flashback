@@ -103,7 +103,8 @@ jobs:
         with:
           name: sbom
           path: |
-            flashback-*-sbom.*.json
+            flashback-*-sbom.cdx.json
+            flashback-*-sbom.spdx.json
             flashback-*-sbom.*.json.sigstore.json
             flashback-*-provenance.intoto.jsonl
 
@@ -114,7 +115,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "$REF_NAME" \
-            flashback-*-sbom.*.json \
+            flashback-*-sbom.cdx.json flashback-*-sbom.spdx.json \
             flashback-*-sbom.*.json.sigstore.json \
             flashback-*-provenance.intoto.jsonl \
             --clobber
