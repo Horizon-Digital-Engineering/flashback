@@ -41,14 +41,14 @@ jobs:
       # syft natively understands Cargo.lock and emits CycloneDX + SPDX
       # from a single binary; faster than `cargo cyclonedx` (no compile).
       - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           format: cyclonedx-json
           artifact-name: flashback-${{ inputs.tag }}-sbom.cdx.json
           output-file: flashback-${{ inputs.tag }}-sbom.cdx.json
 
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           format: spdx-json
           artifact-name: flashback-${{ inputs.tag }}-sbom.spdx.json
@@ -99,7 +99,7 @@ jobs:
           done
           ls -la flashback-*-sbom.*
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom
           path: |
