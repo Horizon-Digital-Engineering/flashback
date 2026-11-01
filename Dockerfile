@@ -1,6 +1,6 @@
 # Build stage — builds the whole workspace, prefetches the embedding model,
 # and copies out the binaries we need.
-FROM rust:1.98-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27 AS builder
+FROM rust:1.98-slim@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS builder
 
 # g++ provides libstdc++ which `onig-sys` (a transitive dep of fastembed →
 # tokenizers) wants at link time. Cheaper than dropping the onig backend.
