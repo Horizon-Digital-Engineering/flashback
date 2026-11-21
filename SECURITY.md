@@ -84,6 +84,6 @@ These need a click in the GitHub UI or an additional setup step:
 
 ## Reporting
 
-Found something? Email `security@horizon-digital.dev`. No bounty program
+Found something? Email `security@horizondigital.dev`. No bounty program
 today; just a thanks and credit if you want it. Please don't open a public
 issue for vulnerabilities.

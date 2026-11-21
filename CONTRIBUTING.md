@@ -100,7 +100,7 @@ cargo-deny, semgrep, and both secret scanners.
 ## Security
 
 Don't file security issues publicly. See [SECURITY.md](SECURITY.md) — report
-to `security@horizon-digital.dev`.
+to `security@horizondigital.dev`.
 
 Two things the scanners will catch, so save yourself the round trip:
 
